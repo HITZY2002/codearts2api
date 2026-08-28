@@ -19,10 +19,10 @@ import (
 
 // Config 调度器配置。
 type Config struct {
-	Pool         *pool.Pool
-	Enabled      bool
-	PollInterval time.Duration // 默认 30m
-	RefreshSkew  time.Duration // 到期前多久刷新，默认 30m
+	Pool              *pool.Pool
+	Enabled           bool
+	PollInterval      time.Duration // 默认 30m
+	RefreshSkew       time.Duration // 到期前多久刷新，默认 30m
 	KeepaliveInterval time.Duration // 保活心跳间隔，默认 15m
 }
 
@@ -51,12 +51,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 		log.Printf("token watchdog disabled")
 		return
 	}
-	log.Printf("token watchdog enabled: poll=%s refresh_skew=%s keepalive=%s", 
+	log.Printf("token watchdog enabled: poll=%s refresh_skew=%s keepalive=%s",
 		s.cfg.PollInterval, s.cfg.RefreshSkew, s.cfg.KeepaliveInterval)
-	
+
 	// 立即执行一次
 	s.Tick(ctx)
-	
+
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -76,13 +76,15 @@ func (s *Scheduler) Tick(ctx context.Context) {
 		if ok {
 			remaining := acct.Auth.Remaining().Round(time.Minute)
 			log.Printf("token account=%s ok remaining=%s", acct.Name, remaining)
-			
-			// 主动保活：如果 token 快过期或长时间无活动，主动刷新
-			if err := s.cfg.Pool.CheckAndRefreshToken(acct.Name); err != nil {
-				log.Printf("proactive refresh failed account=%s err=%v", acct.Name, err)
-			} else if err == nil && remaining <= time.Hour {
-				log.Printf("token refreshed account=%s new_remaining=%s", acct.Name, 
-					acct.Auth.Remaining().Round(time.Minute))
+
+			// ticket 登录不返回 refresh_token；这种账号跳过无意义的周期刷新。
+			if acct.Auth.Refresh() != "" {
+				if err := s.cfg.Pool.CheckAndRefreshToken(acct.Name); err != nil {
+					log.Printf("proactive refresh failed account=%s err=%v", acct.Name, err)
+				} else if remaining <= time.Hour {
+					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,
+						acct.Auth.Remaining().Round(time.Minute))
+				}
 			}
 		} else {
 			log.Printf("token account=%s invalid/disabled", acct.Name)

@@ -42,8 +42,8 @@ type Config struct {
 
 var dynamicModelsCache struct {
 	sync.RWMutex
-	ids     []upstream.ModelInfo
-	fetched time.Time
+	ids      []upstream.ModelInfo
+	fetched  time.Time
 	lastFail time.Time
 }
 
@@ -169,10 +169,10 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	secret := r.URL.Query().Get("secret")
 	redirect := r.URL.Query().Get("redirect")
-	log.Printf("oauth callback hit: code=%q secret=%q redirect=%q", code, secret, redirect)
+	log.Printf("oauth callback hit: has_code=%t has_secret=%t has_redirect=%t", code != "", secret != "", redirect != "")
 	// portal 第一次回调：带 secret + redirect，要求 307 跳转（登录页链路的一部分）。
 	if secret != "" && redirect != "" {
-		log.Printf("oauth callback: secret=%s redirect=%s", secret, redirect)
+		log.Printf("oauth callback: received portal ticket secret")
 		// 用 redirect 里的 ticket_id 定位 pending login，并把华为云下发的 secret 换进去
 		// （ticket 轮询必须用 portal 的 secret，而不是本地生成的）。
 		if u, err := url.Parse(redirect); err == nil {
@@ -181,7 +181,7 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 				h.loginMu.Lock()
 				if p, ok := h.logins[tid]; ok {
 					p.Secret = secret
-					log.Printf("oauth callback: updated secret for ticket=%s", tid)
+					log.Printf("oauth callback: updated secret for ticket=%s", shortID(tid))
 				}
 				h.loginMu.Unlock()
 			}
@@ -213,7 +213,7 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := upstream.DefaultLoginConfig()
-	tok, err := upstream.New(15 * time.Second).ExchangeCode(r.Context(), cfg, code, verifier, port)
+	tok, err := upstream.New(15*time.Second).ExchangeCode(r.Context(), cfg, code, verifier, port)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("<h3>换取凭证失败：" + err.Error() + "</h3>"))
@@ -370,8 +370,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 仅当客户端显式传入 conversation_id / X-Codearts-Chat-Id 时续会话。
 	// 自动复用账号级 chat_id 会把无关历史拼进下一次独立请求（如测连 "hi"），
 	// 上游可能回 related_question_answer 或残留上下文，表现为「不相干 JSON」。
-		explicitChat := req.ConversationID != "" && validChatID(req.ConversationID)
-		msgs := buildUpstreamMessages(req, toolsOn, explicitChat)
+	explicitChat := req.ConversationID != "" && validChatID(req.ConversationID)
+	msgs := buildUpstreamMessages(req, toolsOn, explicitChat)
 
 	// 黏性路由：客户端带 conversation_id 续接时锁定原账号，减少上游并发会话占用。
 	stickyAcct := ""
@@ -422,96 +422,119 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-			// 检查是否需要保活
-			if h.cfg.Pool.NeedKeepalive(acct.Name) {
-				h.cfg.Pool.PingKeepalive(acct.Name)
-			}
+		// 检查是否需要保活
+		if h.cfg.Pool.NeedKeepalive(acct.Name) {
+			h.cfg.Pool.PingKeepalive(acct.Name)
+		}
 
-			chatID := req.ConversationID
-			// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
-			if !validChatID(chatID) {
-				chatID = randHex(32)
-			}
+		chatID := req.ConversationID
+		// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
+		if !validChatID(chatID) {
+			chatID = randHex(32)
+		}
 
-			cred := upstream.SignCredential{
-				AccessKeyID:     acct.Auth.AccessKeyID,
-				SecretAccessKey: acct.Auth.SecretAccessKey,
-				SecurityToken:   acct.Auth.CloudDragonTok,
+		token, accessKeyID, secretAccessKey := acct.Auth.Credentials()
+		cred := upstream.SignCredential{
+			AccessKeyID:     accessKeyID,
+			SecretAccessKey: secretAccessKey,
+			SecurityToken:   token,
+		}
+		chatOpts := upstream.ChatOptions{
+			ReasoningEffort: req.ReasoningEffort,
+			MaxTokens:       req.MaxTokens,
+			Temperature:     req.Temperature,
+			TopP:            req.TopP,
+		}
+		// 上游并发会话上限（TM.00001041）是瞬时的：已完成的会话槽位释放较慢
+		//（实测 >15s）。遇到时等待后重试同一账号，最多 10 次（每次 5s，共 50s）。
+		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
+		var rc io.ReadCloser
+		var serr error
+		authRetried := false
+		for retry := 0; retry < 10; retry++ {
+			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts)
+			if serr == nil {
+				break
 			}
-			// 上游并发会话上限（TM.00001041）是瞬时的：已完成的会话槽位释放较慢
-			//（实测 >15s）。遇到时等待后重试同一账号，最多 10 次（每次 5s，共 50s）。
-			// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
-			var rc io.ReadCloser
-			var serr error
-			for retry := 0; retry < 10; retry++ {
-				rc, serr = acct.Client.ChatStream(r.Context(), chatID, msgs, "", cred, acct.UserName, model)
-				if serr == nil {
+			var ae *upstream.ApiError
+			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && acct.Auth.Refresh() != "" {
+				if rerr := h.cfg.Pool.RefreshToken(acct.Name); rerr == nil {
+					token, accessKeyID, secretAccessKey = acct.Auth.Credentials()
+					cred = upstream.SignCredential{
+						AccessKeyID:     accessKeyID,
+						SecretAccessKey: secretAccessKey,
+						SecurityToken:   token,
+					}
+					authRetried = true
+					log.Printf("upstream 401 account=%s: token refreshed, retrying request once", acct.Name)
+					continue
+				} else {
+					log.Printf("upstream 401 account=%s: refresh before retry failed: %v", acct.Name, rerr)
+				}
+			}
+			if errors.As(serr, &ae) && ae.Status == 400 && isConcurrentLimitError(ae.Message) {
+				log.Printf("upstream concurrent limit retry=%d account=%s, waiting 5s", retry+1, acct.Name)
+				// 释放锁让其他请求有机会，等待后重新获取
+				h.cfg.Pool.ReleaseLock(acct.Name)
+				select {
+				case <-time.After(5 * time.Second):
+				case <-r.Context().Done():
+					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
+					return
+				}
+				if !h.cfg.Pool.AcquireLockWait(acct.Name, 30*time.Second) {
+					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
 					break
 				}
-				var ae *upstream.ApiError
-				if errors.As(serr, &ae) && ae.Status == 400 && isConcurrentLimitError(ae.Message) {
-					log.Printf("upstream concurrent limit retry=%d account=%s, waiting 5s", retry+1, acct.Name)
-					// 释放锁让其他请求有机会，等待后重新获取
-					h.cfg.Pool.ReleaseLock(acct.Name)
-					select {
-					case <-time.After(5 * time.Second):
-					case <-r.Context().Done():
-						writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
-						return
-					}
-					if !h.cfg.Pool.AcquireLockWait(acct.Name, 30*time.Second) {
-						lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
-						break
-					}
-					continue
-				}
-				break // 非并发错误，跳出重试
-			}
-			if serr != nil {
-				h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
-				lastErr = serr
-				h.handleUpstreamError(acct, serr)
 				continue
 			}
+			break // 非并发错误，跳出重试
+		}
+		if serr != nil {
+			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			lastErr = serr
+			h.handleUpstreamError(acct, serr)
+			continue
+		}
 
-			w.Header().Set("X-Codearts-Chat-Id", chatID)
+		w.Header().Set("X-Codearts-Chat-Id", chatID)
 
-			storeChat := func() {
-				// 仅缓存显式会话，便于同 conversation_id 续聊；不把一次性测连写进账号默认会话。
-				if !explicitChat {
-					return
-				}
-				h.convMu.Lock()
-				h.chats[acct.Name] = chatID
-				h.convAcct[req.ConversationID] = acct.Name // 黏性路由：续接锁定同账号
-				h.convMu.Unlock()
-				h.saveChats()
+		storeChat := func() {
+			// 仅缓存显式会话，便于同 conversation_id 续聊；不把一次性测连写进账号默认会话。
+			if !explicitChat {
+				return
 			}
-				if req.Stream && !toolsOn {
-					werr := upstream.StreamCapture(w, rc, model, func(comp *upstream.RawCompletion) {
-						storeChat()
-						// 流式传输中定期保活
-						h.cfg.Pool.PingKeepalive(acct.Name)
-					})
-					rc.Close()
-					h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
-					if werr != nil {
-						log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-						h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-					} else {
-						h.cfg.Pool.NoteSuccess(acct.Name)
-					}
-					return
-				}
-
-			comp, aerr := upstream.AggregateRaw(rc)
+			h.convMu.Lock()
+			h.chats[acct.Name] = chatID
+			h.convAcct[req.ConversationID] = acct.Name // 黏性路由：续接锁定同账号
+			h.convMu.Unlock()
+			h.saveChats()
+		}
+		if req.Stream && !toolsOn {
+			werr := upstream.StreamCapture(w, rc, model, func(comp *upstream.RawCompletion) {
+				storeChat()
+				// 流式传输中定期保活
+				h.cfg.Pool.PingKeepalive(acct.Name)
+			})
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
-			if aerr != nil {
-				lastErr = aerr
-				h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
-				continue
+			if werr != nil {
+				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
+				h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+			} else {
+				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
+			return
+		}
+
+		comp, aerr := upstream.AggregateRaw(rc)
+		rc.Close()
+		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+		if aerr != nil {
+			lastErr = aerr
+			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
+			continue
+		}
 
 		content, finish := comp.Content, comp.Finish
 		var calls []openAIToolCall
@@ -574,7 +597,7 @@ func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) ma
 	for _, m := range msgs {
 		pt += len([]rune(m.Text))/4 + 1
 	}
-	ct := (len([]rune(comp.Content)) + len([]rune(comp.Reasoning)))/4 + 1
+	ct := (len([]rune(comp.Content))+len([]rune(comp.Reasoning)))/4 + 1
 	return map[string]int{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 }
 

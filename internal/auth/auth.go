@@ -13,16 +13,16 @@ import (
 
 // Auth 单个账号凭证（登录 oauth2/tokens 返回）。
 type Auth struct {
-	UserID         string `json:"user_id"`
-	UserName       string `json:"user_name"`
-	DomainID       string `json:"domain_id"`
-	CloudDragonTok string `json:"cloud_dragon_token"` // = STS security_token，chat 用 x-auth-token
-	AccessKeyID    string `json:"access_key_id"`
+	UserID          string `json:"user_id"`
+	UserName        string `json:"user_name"`
+	DomainID        string `json:"domain_id"`
+	CloudDragonTok  string `json:"cloud_dragon_token"` // = STS security_token，chat 用 x-auth-token
+	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
-	Expiration     string `json:"expiration"` // RFC3339
-	RefreshToken   string `json:"refresh_token"`
-	CodeVerifier   string `json:"code_verifier"` // PKCE verifier，refresh 需要
-	UpdatedAt      int64  `json:"updated_at"`
+	Expiration      string `json:"expiration"` // RFC3339
+	RefreshToken    string `json:"refresh_token"`
+	CodeVerifier    string `json:"code_verifier"` // PKCE verifier，refresh 需要
+	UpdatedAt       int64  `json:"updated_at"`
 
 	path string
 	mu   sync.Mutex
@@ -72,6 +72,28 @@ func (a *Auth) Verifier() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.CodeVerifier
+}
+
+// Credentials 返回签名请求所需的 STS 凭据快照。
+func (a *Auth) Credentials() (token, accessKeyID, secretAccessKey string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.CloudDragonTok, a.AccessKeyID, a.SecretAccessKey
+}
+
+// UpdateCredentials 原子替换刷新后的 STS 凭据并写回磁盘。
+func (a *Auth) UpdateCredentials(token, accessKeyID, secretAccessKey, expiration, refreshToken string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.CloudDragonTok = token
+	a.AccessKeyID = accessKeyID
+	a.SecretAccessKey = secretAccessKey
+	a.Expiration = expiration
+	if refreshToken != "" {
+		a.RefreshToken = refreshToken
+	}
+	a.UpdatedAt = time.Now().Unix()
+	return saveLocked(a.path, a)
 }
 
 // ExpiresAt 返回 token 过期时间。

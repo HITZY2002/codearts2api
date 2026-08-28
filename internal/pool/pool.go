@@ -35,6 +35,7 @@ type Account struct {
 	Client *upstream.Client `json:"-"`
 
 	mu                sync.Mutex
+	refreshMu         sync.Mutex
 	lastValidated     time.Time
 	errCount          int
 	coolUntil         time.Time
@@ -42,8 +43,8 @@ type Account struct {
 	disabled          bool
 	disabledReason    string
 	lastErr           string
-	activeConcurrent  int // 当前活跃并发请求数
-	maxConcurrent     int // 最大允许并发数
+	activeConcurrent  int       // 当前活跃并发请求数
+	maxConcurrent     int       // 最大允许并发数
 	keepaliveLastPing time.Time // 最后保活心跳时间
 }
 
@@ -90,12 +91,12 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	p := &Pool{cfg: cfg, state: stateFile}
 	for _, a := range auths {
 		acct := &Account{
-			Name:            a.UserID,
-			UID:             a.UserID,
-			UserName:        a.UserName,
-			Auth:            a,
-			Client:          upstream.New(120 * time.Second),
-			maxConcurrent:   cfg.MaxConcurrent,
+			Name:              a.UserID,
+			UID:               a.UserID,
+			UserName:          a.UserName,
+			Auth:              a,
+			Client:            upstream.New(120 * time.Second),
+			maxConcurrent:     cfg.MaxConcurrent,
 			keepaliveLastPing: time.Now(),
 		}
 		p.accounts = append(p.accounts, acct)
@@ -126,17 +127,22 @@ func (p *Pool) Get(name string) *Account {
 // AddAccount 动态添加账号（WebUI 登录成功后调用）。
 func (p *Pool) AddAccount(a *auth.Auth) *Account {
 	acct := &Account{
-		Name:     a.UserID,
-		UID:      a.UserID,
-		UserName: a.UserName,
-		Auth:     a,
-		Client:   upstream.New(120 * time.Second),
+		Name:              a.UserID,
+		UID:               a.UserID,
+		UserName:          a.UserName,
+		Auth:              a,
+		Client:            upstream.New(120 * time.Second),
+		maxConcurrent:     p.cfg.MaxConcurrent,
+		keepaliveLastPing: time.Now(),
 	}
 	p.mu.Lock()
 	for i, existing := range p.accounts {
 		if existing.Name == acct.Name {
 			existing.mu.Lock()
 			existing.Auth = a
+			existing.UserName = a.UserName
+			existing.maxConcurrent = p.cfg.MaxConcurrent
+			existing.lastValidated = time.Time{}
 			existing.disabled = false
 			existing.disabledReason = ""
 			existing.lastErr = ""
@@ -172,22 +178,22 @@ func (p *Pool) List() []map[string]any {
 			reason = a.lastErr
 		}
 		out = append(out, map[string]any{
-			"name":             a.Name,
-			"uid":              a.UID,
-			"nickname":         a.UserName,
-			"user_name":        a.UserName,
-			"default_model":    a.DefaultModel,
-			"credits":          int64(0), // CodeArts 无积分字段；面板仍显示
-			"disabled":         a.disabled,
-			"cooling":          cooling,
-			"until":            until,
-			"err_count":        a.errCount,
-			"reason":           reason,
-			"last_error":       a.lastErr,
+			"name":              a.Name,
+			"uid":               a.UID,
+			"nickname":          a.UserName,
+			"user_name":         a.UserName,
+			"default_model":     a.DefaultModel,
+			"credits":           int64(0), // CodeArts 无积分字段；面板仍显示
+			"disabled":          a.disabled,
+			"cooling":           cooling,
+			"until":             until,
+			"err_count":         a.errCount,
+			"reason":            reason,
+			"last_error":        a.lastErr,
 			"active_concurrent": a.activeConcurrent,
-			"max_concurrent":   a.maxConcurrent,
-			"token_remaining":  a.Auth.Remaining().Round(time.Minute).String(),
-			"expires_at":       a.Auth.ExpiresAt().Format(time.RFC3339),
+			"max_concurrent":    a.maxConcurrent,
+			"token_remaining":   a.Auth.Remaining().Round(time.Minute).String(),
+			"expires_at":        a.Auth.ExpiresAt().Format(time.RFC3339),
 		})
 		a.mu.Unlock()
 	}
@@ -265,16 +271,19 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			existing.mu.Lock()
 			existing.Auth = a
 			existing.UserName = a.UserName
+			existing.maxConcurrent = p.cfg.MaxConcurrent
 			existing.mu.Unlock()
 			next = append(next, existing)
 			delete(byUID, a.UserID)
 		} else {
 			next = append(next, &Account{
-				Name:     a.UserID,
-				UID:      a.UserID,
-				UserName: a.UserName,
-				Auth:     a,
-				Client:   upstream.New(120 * time.Second),
+				Name:              a.UserID,
+				UID:               a.UserID,
+				UserName:          a.UserName,
+				Auth:              a,
+				Client:            upstream.New(120 * time.Second),
+				maxConcurrent:     p.cfg.MaxConcurrent,
+				keepaliveLastPing: time.Now(),
 			})
 		}
 	}
@@ -311,10 +320,14 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 	a.mu.Unlock()
 
 	authz := a.Auth
+	if authz.Expired() && authz.Refresh() == "" {
+		p.Disable(a.Name, "token expired; re-login required")
+		return false, nil
+	}
 	if authz.ExpiringSoon(p.cfg.RefreshSkew) || authz.Expired() {
 		if authz.Refresh() == "" {
 			// 没有 refresh_token（华为云 ticket 通道不返回），不立即 disable，
-			// 只打告警日志。token 过期后上游 401 会自然 disable。
+			// 未过期时只打告警；到期后由上面的分支明确标记为需重新登录。
 			log.Printf("pool token account=%s expiring soon (remaining=%s) but no refresh_token, re-login required",
 				a.Name, authz.Remaining().Round(time.Minute))
 			a.mu.Lock()
@@ -322,22 +335,10 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 			a.mu.Unlock()
 			return true, nil
 		}
-		cfg := upstream.DefaultLoginConfig()
-		resp, err := a.Client.RefreshToken(context.Background(), cfg, authz.Refresh(), authz.Verifier())
-		if err != nil {
+		if err := p.RefreshToken(a.Name); err != nil {
 			p.Disable(a.Name, "refresh failed: "+err.Error())
 			return false, nil
 		}
-		authz.CloudDragonTok = resp.Credentials.SecurityToken
-		authz.AccessKeyID = resp.Credentials.AccessKeyID
-		authz.SecretAccessKey = resp.Credentials.SecretAccessKey
-		authz.Expiration = resp.Credentials.Expiration
-		if resp.RefreshToken != "" {
-			authz.RefreshToken = resp.RefreshToken
-		}
-		authz.UpdatedAt = time.Now().Unix()
-		_ = authz.Save()
-		log.Printf("pool token refreshed account=%s", a.Name)
 	}
 	a.mu.Lock()
 	a.lastValidated = time.Now()
@@ -438,7 +439,7 @@ func (p *Pool) AcquireLock(name string) bool {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.activeConcurrent >= a.maxConcurrent {
-			log.Printf("pool concurrent limit reached account=%s current=%d max=%d", 
+			log.Printf("pool concurrent limit reached account=%s current=%d max=%d",
 				name, a.activeConcurrent, a.maxConcurrent)
 			return false
 		}
@@ -550,6 +551,9 @@ func (p *Pool) CheckAndRefreshToken(name string) error {
 
 	// 如果 token 剩余少于 1 小时，主动刷新
 	if remaining <= time.Hour {
+		if acct.Auth.Refresh() == "" {
+			return nil
+		}
 		log.Printf("pool proactive refresh account=%s remaining=%s", name, remaining)
 		return p.RefreshToken(name)
 	}
@@ -570,29 +574,36 @@ func (p *Pool) RefreshToken(name string) error {
 	if acct == nil {
 		return fmt.Errorf("account not found: %s", name)
 	}
+	acct.refreshMu.Lock()
+	defer acct.refreshMu.Unlock()
 
 	authz := acct.Auth
-	if authz.Refresh() == "" {
+	refreshToken := authz.Refresh()
+	if refreshToken == "" {
 		return fmt.Errorf("no refresh_token available")
 	}
 
 	cfg := upstream.DefaultLoginConfig()
-	resp, err := acct.Client.RefreshToken(context.Background(), cfg, authz.Refresh(), authz.Verifier())
+	resp, err := acct.Client.RefreshToken(context.Background(), cfg, refreshToken, authz.Verifier())
 	if err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
 
-	authz.CloudDragonTok = resp.Credentials.SecurityToken
-	authz.AccessKeyID = resp.Credentials.AccessKeyID
-	authz.SecretAccessKey = resp.Credentials.SecretAccessKey
-	authz.Expiration = resp.Credentials.Expiration
-	if resp.RefreshToken != "" {
-		authz.RefreshToken = resp.RefreshToken
-	}
-	authz.UpdatedAt = time.Now().Unix()
-	if err := authz.Save(); err != nil {
+	if err := authz.UpdateCredentials(
+		resp.Credentials.SecurityToken,
+		resp.Credentials.AccessKeyID,
+		resp.Credentials.SecretAccessKey,
+		resp.Credentials.Expiration,
+		resp.RefreshToken,
+	); err != nil {
 		return fmt.Errorf("save token: %w", err)
 	}
+	acct.mu.Lock()
+	acct.disabled = false
+	acct.disabledReason = ""
+	acct.lastErr = ""
+	acct.lastValidated = time.Now()
+	acct.mu.Unlock()
 	log.Printf("pool token refreshed manually account=%s", name)
 	return nil
 }
@@ -624,7 +635,7 @@ func (p *Pool) Acquire(name string) bool {
 	}
 	target.mu.Lock()
 	defer target.mu.Unlock()
-	
+
 	// 检查是否超过最大并发限制
 	if target.activeConcurrent >= target.maxConcurrent {
 		return false
@@ -676,7 +687,7 @@ func (p *Pool) CheckKeepalive(name string) bool {
 	}
 	target.mu.Lock()
 	defer target.mu.Unlock()
-	
+
 	// 如果超过保活窗口无活动，需要保活
 	needsKeepalive := time.Since(target.keepaliveLastPing) > p.cfg.KeepaliveWindow
 	if needsKeepalive {
@@ -708,7 +719,7 @@ func (p *Pool) SetKeepalive(name string) {
 func (p *Pool) GetConcurrentStats() []map[string]any {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	out := make([]map[string]any, 0, len(p.accounts))
 	now := time.Now()
 	for _, a := range p.accounts {
@@ -718,17 +729,17 @@ func (p *Pool) GetConcurrentStats() []map[string]any {
 		maxConc := a.maxConcurrent
 		lastPing := a.keepaliveLastPing
 		a.mu.Unlock()
-		
+
 		out = append(out, map[string]any{
-			"name":            a.Name,
-			"uid":             a.UID,
-			"user_name":       a.UserName,
+			"name":              a.Name,
+			"uid":               a.UID,
+			"user_name":         a.UserName,
 			"active_concurrent": concurrent,
-			"max_concurrent":  maxConc,
-			"utilization":     float64(concurrent) / float64(maxConc),
-			"last_keepalive":  lastPing.Format(time.RFC3339),
-			"cooling":         cooling,
-			"disabled":        a.disabled,
+			"max_concurrent":    maxConc,
+			"utilization":       float64(concurrent) / float64(maxConc),
+			"last_keepalive":    lastPing.Format(time.RFC3339),
+			"cooling":           cooling,
+			"disabled":          a.disabled,
 		})
 	}
 	return out

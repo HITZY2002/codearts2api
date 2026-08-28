@@ -37,23 +37,32 @@ type toolChoiceOpenAI struct {
 
 // chatRequest 完整请求体。
 type chatRequest struct {
-	Model          string
-	Stream         bool
-	Messages       []openAIMessage
-	Tools          []map[string]any
-	ToolChoice     toolChoiceOpenAI
-	ConversationID string
+	Model           string
+	Stream          bool
+	ReasoningEffort string
+	MaxTokens       *int
+	Temperature     *float64
+	TopP            *float64
+	Messages        []openAIMessage
+	Tools           []map[string]any
+	ToolChoice      toolChoiceOpenAI
+	ConversationID  string
 }
 
 // parseChatRequest 解析并校验请求体。
 func parseChatRequest(body []byte) (*chatRequest, error) {
 	var raw struct {
-		Model          string            `json:"model"`
-		Stream         bool              `json:"stream"`
-		ConversationID string            `json:"conversation_id"`
-		Messages       []json.RawMessage `json:"messages"`
-		Tools          []map[string]any  `json:"tools"`
-		ToolChoice     json.RawMessage   `json:"tool_choice"`
+		Model               string            `json:"model"`
+		Stream              bool              `json:"stream"`
+		ReasoningEffort     string            `json:"reasoning_effort"`
+		MaxTokens           *int              `json:"max_tokens"`
+		MaxCompletionTokens *int              `json:"max_completion_tokens"`
+		Temperature         *float64          `json:"temperature"`
+		TopP                *float64          `json:"top_p"`
+		ConversationID      string            `json:"conversation_id"`
+		Messages            []json.RawMessage `json:"messages"`
+		Tools               []map[string]any  `json:"tools"`
+		ToolChoice          json.RawMessage   `json:"tool_choice"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse request: %w", err)
@@ -62,11 +71,27 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		return nil, errors.New("messages is empty")
 	}
 	req := &chatRequest{
-		Model:          raw.Model,
-		Stream:         raw.Stream,
-		ConversationID: raw.ConversationID,
-		Tools:          raw.Tools,
-		ToolChoice:     parseToolChoice(raw.ToolChoice),
+		Model:           raw.Model,
+		Stream:          raw.Stream,
+		ReasoningEffort: strings.ToLower(strings.TrimSpace(raw.ReasoningEffort)),
+		MaxTokens:       raw.MaxTokens,
+		Temperature:     raw.Temperature,
+		TopP:            raw.TopP,
+		ConversationID:  raw.ConversationID,
+		Tools:           raw.Tools,
+		ToolChoice:      parseToolChoice(raw.ToolChoice),
+	}
+	if raw.MaxCompletionTokens != nil {
+		req.MaxTokens = raw.MaxCompletionTokens
+	}
+	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
+		return nil, errors.New("max_tokens must be greater than 0")
+	}
+	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
+		return nil, errors.New("temperature must be between 0 and 2")
+	}
+	if req.TopP != nil && (*req.TopP < 0 || *req.TopP > 1) {
+		return nil, errors.New("top_p must be between 0 and 1")
 	}
 	for i, rm := range raw.Messages {
 		m, err := parseMessage(rm)

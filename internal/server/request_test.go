@@ -52,6 +52,10 @@ func TestParseChatRequest(t *testing.T) {
 	body := `{
 		"model":"glm-5.2",
 		"stream":true,
+		"reasoning_effort":"high",
+		"max_completion_tokens":8192,
+		"temperature":0.3,
+		"top_p":0.8,
 		"conversation_id":"conv-1",
 		"messages":[
 			{"role":"system","content":"be nice"},
@@ -69,6 +73,12 @@ func TestParseChatRequest(t *testing.T) {
 	}
 	if req.Model != "glm-5.2" || !req.Stream || req.ConversationID != "conv-1" {
 		t.Fatalf("basic fields: %+v", req)
+	}
+	if req.ReasoningEffort != "high" || req.MaxTokens == nil || *req.MaxTokens != 8192 {
+		t.Fatalf("generation options: %+v", req)
+	}
+	if req.Temperature == nil || *req.Temperature != 0.3 || req.TopP == nil || *req.TopP != 0.8 {
+		t.Fatalf("sampling options: %+v", req)
 	}
 	if len(req.Messages) != 5 {
 		t.Fatalf("messages=%d", len(req.Messages))
@@ -93,6 +103,12 @@ func TestParseChatRequestErrors(t *testing.T) {
 	}
 	if _, err := parseChatRequest([]byte(`{"messages":[{"role":"assistant","content":"x"}]}`)); err == nil {
 		t.Fatal("expected error: no user/tool message")
+	}
+	if _, err := parseChatRequest([]byte(`{"max_tokens":0,"messages":[{"role":"user","content":"x"}]}`)); err == nil {
+		t.Fatal("expected error: invalid max_tokens")
+	}
+	if _, err := parseChatRequest([]byte(`{"top_p":2,"messages":[{"role":"user","content":"x"}]}`)); err == nil {
+		t.Fatal("expected error: invalid top_p")
 	}
 }
 

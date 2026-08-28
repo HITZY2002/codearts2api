@@ -232,6 +232,14 @@ type ChatMessage struct {
 	Text string `json:"text"`
 }
 
+// ChatOptions 是需要原样传给 OpenAI 兼容上游的可选生成参数。
+type ChatOptions struct {
+	ReasoningEffort string
+	MaxTokens       *int
+	Temperature     *float64
+	TopP            *float64
+}
+
 // CanonicalModel 把用户友好模型 ID 映射为 InferHub 注册的模型 ID（区分大小写）。
 // 旧版 /v1/chat/chat 用小写 id（glm-5.2 / snap-chat），新 /api/v2/chat/completions
 // 按 InferHub 注册名匹配（GLM-5.2 / deepseek-v4-flash / Qwen3-VL-235B）。
@@ -277,10 +285,27 @@ func ChatHeadersV2(token, traceID, language string) map[string]string {
 // ChatStream 发送 /api/v2/chat/completions（OpenAI 兼容，AK/SK 签名 + x-auth-token）
 // 并返回 SSE 流（调用方负责 Close）。
 func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string) (io.ReadCloser, error) {
+	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{})
+}
+
+// ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
+func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions) (io.ReadCloser, error) {
 	body := map[string]any{
 		"model":    CanonicalModel(model),
 		"stream":   true,
 		"messages": chatMessagesToOpenAI(messages),
+	}
+	if opts.ReasoningEffort != "" {
+		body["reasoning_effort"] = opts.ReasoningEffort
+	}
+	if opts.MaxTokens != nil {
+		body["max_tokens"] = *opts.MaxTokens
+	}
+	if opts.Temperature != nil {
+		body["temperature"] = *opts.Temperature
+	}
+	if opts.TopP != nil {
+		body["top_p"] = *opts.TopP
 	}
 	return c.SendChatV2(ctx, body, traceID, cred, cred.SecurityToken)
 }
