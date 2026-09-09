@@ -48,10 +48,16 @@ var dynamicModelsCache struct {
 }
 
 var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 131072},
-	{"id": "qwen3-vl-235b", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 131072},
+	// 内置（agent-center / /v1/model/builtin 实测，精确大小写）
+	{"id": "GLM-5.2", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
+	{"id": "GLM-5.2-ArkTS-SPARK", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
+	{"id": "OpenPangu-2.0-Pro", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 524288},
+	{"id": "OpenPangu-2.0-Flash", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 524288},
+	{"id": "Qwen3-VL-235B", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 131072},
+	// 限时福利（免费套餐，gateway/config 实测；聊天自动带 maas_type: benefit 头）
+	{"id": "deepseek-v4-flash-0731", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 1048576, "benefit": true},
+	{"id": "deepseek-v4-pro-0813", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 1048576, "benefit": true},
+	{"id": "glm-5.3-flash", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 1048576, "benefit": true},
 }
 
 const (
@@ -270,34 +276,46 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+// modelList 动态获取模型列表并包装成 OpenAI 格式。
+// 上游模型 ID 区分大小写：展示用精确 ID；含大写的 ID 额外附小写别名，
+// 聊天时经 CanonicalModel 回归精确 ID（大小写不敏感）。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		seen := map[string]bool{}
-		for _, mi := range infos {
-			// 展示统一用用户侧小写 ID（glm-5.2），与 CanonicalModel 映射一致。
-			displayID := strings.ToLower(mi.ID)
-			seen[displayID] = true
-			entry := map[string]any{
-				"id":                displayID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "codearts",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
+		addEntry := func(id string, ctx, maxOut int64, benefit bool) {
+			if id == "" || seen[id] {
+				return
 			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
+			seen[id] = true
+			entry := map[string]any{
+				"id":           id,
+				"object":       "model",
+				"created":      1753600000,
+				"owned_by":     "codearts",
+				"context_length": ctx,
+				"max_output_tokens": maxOut,
+			}
+			if ctx == 0 {
+				entry["context_length"] = int64(131072) // 兜底
+			}
+			if benefit {
+				entry["benefit"] = true
 			}
 			out = append(out, entry)
 		}
-		// 合并账号实际可用但不在默认 CodeAgent 列表中的模型（实测可用）。
+		for _, mi := range infos {
+			addEntry(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+			if lower := strings.ToLower(mi.ID); lower != mi.ID {
+				addEntry(lower, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+			}
+		}
+		// 合并静态兜底中动态缺失的模型（免费套餐变化时仍可用）。
 		for _, sm := range staticModels {
 			id, _ := sm["id"].(string)
-			if id != "" && !seen[id] {
-				out = append(out, sm)
-			}
+			ctxLen, _ := sm["context_length"].(int)
+			benefit, _ := sm["benefit"].(bool)
+			addEntry(id, int64(ctxLen), 0, benefit)
 		}
 		return out
 	}
