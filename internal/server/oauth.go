@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,31 +101,55 @@ func (s *oauthStore) complete(id string) {
 	}
 }
 
-// codeSession 在回调不带 ticket_id 时只接受唯一的活跃 OAuth 会话，
-// 避免共享回调端口把 authorization code 配给错误的 PKCE/DPoP 密钥。
-func (s *oauthStore) codeSession(ticketID string) *oauthSession {
+// codeSessionCandidates 返回该授权码可能属于的登录会话（按可信度排序）。
+//
+// 实测（2026-09-16）：本部署的 portal 第二次回调**只带 code**，
+// `has_code=true has_secret=false has_redirect=false` —— 既没有 secret 也没有
+// ticket_id。因此无法从回调本身确定配对，只能按下列顺序给出候选：
+//
+//  1. secret 命中（部分部署会带；带了但不命中即会话已失效，直接放弃）
+//  2. ticket_id 命中
+//  3. 没有可用判别键时，当前所有活跃会话（按创建时间倒序）
+//
+// 第 3 种情况由调用方逐个尝试换取：授权码与 PKCE verifier 一对一校验，用错
+// 只会得到 STS5.1805 且不消耗授权码，所以逐个试是安全的；而只挑其中一个
+// （旧实现）在服务重启过或同时开过两次登录时必然错配。
+func (s *oauthStore) codeSessionCandidates(ticketID, secret string) []*oauthSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
+	var out []*oauthSession
+	if secret != "" {
+		for _, sess := range s.byID {
+			if sess.Secret == secret && !sess.Done {
+				return []*oauthSession{sess}
+			}
+		}
+		return nil // 带了 secret 却不命中：会话已失效，不得再猜
+	}
 	if ticketID != "" {
 		for _, sess := range s.byID {
 			if sess.TicketID == ticketID && !sess.Done {
-				return sess
+				return []*oauthSession{sess}
 			}
 		}
 		return nil
 	}
-	var match *oauthSession
 	for _, sess := range s.byID {
-		if sess.Done {
-			continue
+		if !sess.Done {
+			out = append(out, sess)
 		}
-		if match != nil {
-			return nil
-		}
-		match = sess
 	}
-	return match
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+// codeSession 返回最可能的单个会话（兼容旧调用与测试）。
+func (s *oauthStore) codeSession(ticketID, secret string) *oauthSession {
+	if c := s.codeSessionCandidates(ticketID, secret); len(c) > 0 {
+		return c[0]
+	}
+	return nil
 }
 
 func (s *oauthStore) del(id string) {

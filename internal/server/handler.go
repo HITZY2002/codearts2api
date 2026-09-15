@@ -239,16 +239,37 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<h3>登录失败：缺少 code</h3><p>请回到 WebUI 重新发起登录。</p>"))
 		return
 	}
-	sess := h.oauth.codeSession(r.URL.Query().Get("ticket_id"))
-	if sess == nil {
+	candidates := h.oauth.codeSessionCandidates(r.URL.Query().Get("ticket_id"), secret)
+	if len(candidates) == 0 {
 		// 没有匹配（浏览器在远端时 code 通道不可用），提示用 ticket 通道
 		_, _ = w.Write([]byte("<h3>登录已提交，请回到 WebUI 等待结果。</h3>"))
 		return
 	}
-	tok, err := h.cfg.OAuthClient.ExchangeCode(r.Context(), h.cfg.LoginConfig, code, sess.Verifier, sess.Port, sess.DPoPPrivateKey)
-	if err != nil {
+	// portal 的回调可能不带任何配对信息（实测只带 code），因此逐个候选尝试。
+	// 授权码与 PKCE verifier 一对一校验：用错只会 STS5.1805，不会消耗授权码。
+	var (
+		tok     *upstream.TokenResponse
+		sess    *oauthSession
+		lastErr error
+	)
+	for _, cand := range candidates {
+		t, err := h.cfg.OAuthClient.ExchangeCode(r.Context(), h.cfg.LoginConfig, code, cand.Verifier, cand.Port, cand.DPoPPrivateKey)
+		if err == nil {
+			tok, sess, lastErr = t, cand, nil
+			break
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		// STS5.1805 = 授权码与服务端保存的 PKCE verifier 对不上，最常见的成因是
+		// 链接生成后服务重启过（会话只在内存里）或重复使用了旧链接。
+		hint := ""
+		if strings.Contains(lastErr.Error(), "STS5.1805") || strings.Contains(lastErr.Error(), "invalid authorization code") {
+			hint = "<p>授权码已失效：请回到 WebUI 重新点「登录」获取新链接，" +
+				"并确保从生成到完成授权期间服务没有重启。</p>"
+		}
 		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("<h3>换取凭证失败：" + err.Error() + "</h3>"))
+		_, _ = w.Write([]byte("<h3>换取凭证失败：" + lastErr.Error() + "</h3>" + hint))
 		return
 	}
 	if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
