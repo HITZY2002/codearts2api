@@ -13,7 +13,7 @@
     "err_threshold": 3,
     "err_cooldown": "10m"
   },
-  "benefit_auto_claim": false,   // 模型发现时自动领取限时福利（默认 false：属对账号的写操作）
+  "benefit_auto_claim": true,    // 模型发现时自动领取限时福利（幂等；关闭则福利模型调用必然失败）
   // "login_client_id": "codearts-agent",  // WebUI 登录用 OAuth client；留空自动沿用已有账号的取值
   "max_concurrent": 5,           // 单账号最大并发数（默认 5）
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）

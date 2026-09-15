@@ -152,8 +152,14 @@ Body：
   会话黏性锁定的账号若不能服务当前模型，同样换号而不是硬发。
 - **`maas_type` 由服务端注入并计入签名**：`SendChatV2` 在 `signRequest` 之前设置该头，
   SignedHeaders 覆盖它（与官方客户端行为一致）。
-- **领取默认关闭**：`POST benefit/claim` 是对账号的写操作，因此默认只读不领取；
-  需要领取时显式执行 `go run ./cmd/models -claim` 或打开 `benefit_auto_claim`。
+- **领取默认开启**：实测未领取时福利模型一律返回 `InferHub.4004.200 benefit not found`，
+  领取后同一模型立即可用（`glm-5.3-flash`/`deepseek-v4-flash-0731`/`deepseek-v4-pro-0813`
+  均验证通过）。领取是幂等操作，官方客户端打开模型菜单即调用，因此默认执行；
+  可用 `benefit_auto_claim=false` 关掉。
+- **发现结果 ≠ 真实可用**：agent-center 与 `/v1/model/builtin` 会列出当前账号未注册的
+  模型（实测 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro`、`OpenPangu-2.0-Flash` 全部
+  返回 `InferHub.002002009.404`），福利模型未领取时返回 `4004.200`。因此需要一次真实
+  可用性探测，不能只按发现结果列模型。
 - **福利来源失败时保留上一轮福利条目**：三路发现里福利网关可能临时不可用，此时若整体
   替换目录，非种子的福利模型会丢掉 `maas_type: benefit`，上游按未注册模型 404。因此
   `setAccountModels(keepBenefit=true)` 会保留上一轮成功发现的福利条目，只有内置来源

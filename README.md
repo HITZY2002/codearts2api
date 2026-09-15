@@ -69,9 +69,24 @@ go run ./cmd/models -json           # 机器可读
 go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，属写操作）
 ```
 
-`POST /api/v1/benefit/claim` 是对账号的写操作，**默认不会自动执行**：
-`/v1/models`、聊天都只读。需要让服务端在发现模型时顺便领取，才把
-`benefit_auto_claim` 设为 `true`（或 `CA2A_BENEFIT_AUTO_CLAIM=1`）。
+限时福利模型**必须先领取才能调用**：未领取时上游一律返回
+`InferHub.4004.200 benefit not found`（实测）。领取是幂等操作，官方客户端打开模型
+菜单时也会调用，因此服务默认会领取（`benefit_auto_claim: true`）。不想让服务写账号
+可显式关闭：
+
+```jsonc
+"benefit_auto_claim": false   // 或 CA2A_BENEFIT_AUTO_CLAIM=0
+```
+
+关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
+
+### 模型可用性探测
+
+`/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
+网关）会列出当前账号根本没注册的模型（实测 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro`
+等返回 `InferHub.002002009.404`）。服务会周期性用一条最小请求探测并缓存结论，
+真实请求失败也会被学习（`not registered` / `benefit not found` 记为账号能力问题，
+不会给健康账号记错误冷却）。探测结果缓存 30 分钟。
 
 ### API Key 必填
 
@@ -123,7 +138,7 @@ docker compose up -d --build
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
-| `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（写操作） | `false` |
+| `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
 
 ## 目录结构
