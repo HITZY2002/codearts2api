@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -22,7 +23,7 @@ import (
 func main() {
 	authDir := flag.String("auth-dir", "./auths", "auth dir")
 	jsonOut := flag.Bool("json", false, "raw JSON output")
-	claim := flag.Bool("claim", false, "先领取限时福利再查询（幂等写操作；默认只读不领取）")
+	claim := flag.Bool("claim", true, "领取限时福利再查询（幂等；-claim=false 可跳过）")
 	flag.Parse()
 
 	auths, err := auth.LoadDir(*authDir)
@@ -68,7 +69,8 @@ func main() {
 				tag, m.ID, m.ContextWindow, m.MaxTokens, m.Desc)
 		}
 	}
-	if !*claim {
-		fmt.Println("提示：福利模型为空时可加 -claim 领取限时福利后重试。")
+	if !*claim && !*jsonOut {
+		// 走 stderr：stdout 要保持机器可读（-json）。
+		fmt.Fprintln(os.Stderr, "提示：福利模型为空时可加 -claim 领取限时福利后重试。")
 	}
 }

@@ -582,9 +582,13 @@ func (p *Pool) RefreshToken(name string) error {
 	if refreshToken == "" {
 		return fmt.Errorf("no refresh_token available")
 	}
-
+	// refresh_token 同时与 client_id 和签发时的 DPoP 公钥绑定：两者都必须沿用
+	// 登录当时的取值，否则 STS 直接拒（invalid client id / InvalidDPoPHeader）。
 	cfg := upstream.DefaultLoginConfig()
-	resp, err := acct.Client.RefreshToken(context.Background(), cfg, refreshToken, authz.Verifier())
+	cfg.ClientID = authz.ClientIDOr(cfg.ClientID)
+	dpopJWK := upstream.DPoPPrivateJWK(authz.DPoPPrivateJWK())
+
+	resp, err := acct.Client.RefreshToken(context.Background(), cfg, refreshToken, authz.Verifier(), dpopJWK)
 	if err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
@@ -597,6 +601,13 @@ func (p *Pool) RefreshToken(name string) error {
 		resp.RefreshToken,
 	); err != nil {
 		return fmt.Errorf("save token: %w", err)
+	}
+	// 首次记录 client_id（旧凭证升级路径）。
+	if authz.ClientIDOr("") == "" {
+		authz.SetClientID(cfg.ClientID)
+		if err := authz.Save(); err != nil {
+			log.Printf("pool refresh account=%s: save client_id: %v", name, err)
+		}
 	}
 	acct.mu.Lock()
 	acct.disabled = false

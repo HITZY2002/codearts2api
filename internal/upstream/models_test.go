@@ -243,8 +243,10 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 	mu.Lock()
 	gotClaims := claims
 	mu.Unlock()
-	if gotClaims != 0 {
-		t.Fatalf("默认不得自动领取福利（写操作），claims=%d", gotClaims)
+	// 默认领取：不领取时福利模型在上游一律 benefit not found（实测 2026-09-15），
+	// 所以发现福利模型时必须顺手领取（幂等，与官方客户端行为一致）。
+	if gotClaims != 1 {
+		t.Fatalf("默认应自动领取一次福利（幂等），claims=%d", gotClaims)
 	}
 	if !IsBenefitModel("u-merge", "GLM-5.3-FLASH") {
 		t.Error("发现结果应写入该账号目录，供聊天路由判定")
@@ -253,8 +255,8 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 		t.Error("发现结果应可读回")
 	}
 
-	// 显式开启自动领取后才允许 POST。
-	c.SetBenefitAutoClaim(true)
+	// 显式关闭后不得再 POST（该开关是给「不想让服务写账号」的部署留的）。
+	c.SetBenefitAutoClaim(false)
 	if _, err := c.FetchModels(acct); err != nil {
 		t.Fatal(err)
 	}
@@ -262,6 +264,6 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 	gotClaims = claims
 	mu.Unlock()
 	if gotClaims != 1 {
-		t.Fatalf("开启自动领取后应提交一次 claim，claims=%d", gotClaims)
+		t.Fatalf("关闭自动领取后不应再提交 claim，claims=%d", gotClaims)
 	}
 }

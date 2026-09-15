@@ -19,6 +19,10 @@ type dpopKeyPair struct {
 	PublicJWK  map[string]string
 }
 
+// DPoPPrivateJWK 是 OAuth 登录与后续续期必须复用的 P-256 私钥。
+// 华为 STS 会把 refresh_token 绑定到首次换取时的 DPoP 公钥。
+type DPoPPrivateJWK map[string]string
+
 func newDpopKeyPair() (*dpopKeyPair, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -35,6 +39,59 @@ func newDpopKeyPair() (*dpopKeyPair, error) {
 	return &dpopKeyPair{PrivateKey: key, PublicJWK: jwk}, nil
 }
 
+// NewDPoPPrivateJWK 生成可持久化的 OAuth DPoP 私钥。
+func NewDPoPPrivateJWK() (DPoPPrivateJWK, error) {
+	kp, err := newDpopKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	return DPoPPrivateJWK{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   kp.PublicJWK["x"],
+		"y":   kp.PublicJWK["y"],
+		"d":   base64.RawURLEncoding.EncodeToString(padded(kp.PrivateKey.D, 32)),
+	}, nil
+}
+
+func dpopKeyPairFromPrivateJWK(jwk DPoPPrivateJWK) (*dpopKeyPair, error) {
+	if jwk["kty"] != "EC" || jwk["crv"] != "P-256" {
+		return nil, fmt.Errorf("invalid DPoP JWK curve")
+	}
+	decode := func(field string) ([]byte, error) {
+		raw, err := base64.RawURLEncoding.DecodeString(jwk[field])
+		if err != nil || len(raw) != 32 {
+			return nil, fmt.Errorf("invalid DPoP JWK %s", field)
+		}
+		return raw, nil
+	}
+	xRaw, err := decode("x")
+	if err != nil {
+		return nil, err
+	}
+	yRaw, err := decode("y")
+	if err != nil {
+		return nil, err
+	}
+	dRaw, err := decode("d")
+	if err != nil {
+		return nil, err
+	}
+	curve := elliptic.P256()
+	x, y, d := new(big.Int).SetBytes(xRaw), new(big.Int).SetBytes(yRaw), new(big.Int).SetBytes(dRaw)
+	if d.Sign() <= 0 || d.Cmp(curve.Params().N) >= 0 || !curve.IsOnCurve(x, y) {
+		return nil, fmt.Errorf("invalid DPoP JWK key material")
+	}
+	wantX, wantY := curve.ScalarBaseMult(dRaw)
+	if wantX.Cmp(x) != 0 || wantY.Cmp(y) != 0 {
+		return nil, fmt.Errorf("DPoP JWK public/private key mismatch")
+	}
+	return &dpopKeyPair{
+		PrivateKey: &ecdsa.PrivateKey{PublicKey: ecdsa.PublicKey{Curve: curve, X: x, Y: y}, D: d},
+		PublicJWK:  map[string]string{"kty": "EC", "crv": "P-256", "x": jwk["x"], "y": jwk["y"]},
+	}, nil
+}
+
 // signDpopProof 生成 DPoP JWT（htm=POST，htu=token 端点）。
 func signDpopProof(kp *dpopKeyPair, htu string) (string, error) {
 	header := map[string]any{
@@ -47,7 +104,7 @@ func signDpopProof(kp *dpopKeyPair, htu string) (string, error) {
 		"htm": "POST",
 		"htu": htu,
 		"iat": time.Now().Unix(),
-		"jti": randomHexLower(16),
+		"jti": randomHexLower(32),
 	}
 	payloadJSON, _ := json.Marshal(payload)
 	input := b64(headerJSON) + "." + b64(payloadJSON)

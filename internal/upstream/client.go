@@ -84,7 +84,7 @@ func DefaultLoginConfig() LoginConfig {
 		STSHost:       STSHost,
 		RedirectPath:  "/oauth/callback",
 		PluginName:    "snap_AIIDE",
-		PluginVersion: "5.1.0",
+		PluginVersion: "5.2.0",
 	}
 }
 
@@ -97,7 +97,10 @@ type Client struct {
 	snapBase    string
 	benefitBase string
 
-	// claimAuto 模型发现时是否自动领取限时福利（默认关闭：领取是对账号的写操作）。
+	// claimAuto 模型发现时是否自动领取限时福利。
+	// 默认开启：不领取时福利模型一律返回 InferHub.4004.200 benefit not found
+	// （实测 2026-09-15），服务商把「领取」做成幂等操作，官方客户端打开模型
+	// 菜单也会调用；关闭后福利模型列表仍在，但调用必然失败。
 	claimAuto atomic.Bool
 
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
@@ -120,13 +123,15 @@ func New(timeout time.Duration) *Client {
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
-	return &Client{
+	c := &Client{
 		http:        &http.Client{Timeout: timeout, Transport: tr},
 		streamHTTP:  &http.Client{Transport: tr},
 		snapBase:    SnapEngineApiHost,
 		benefitBase: BenefitHost,
 		srcFail:     map[string]time.Time{},
 	}
+	c.claimAuto.Store(true)
+	return c
 }
 
 // SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
@@ -196,33 +201,60 @@ func (c *Client) BuildAuthorizeURL(cfg LoginConfig, ticketID, codeChallenge, cod
 }
 
 // ExchangeCode 用授权码换 token（OAuth2 authorization_code）。
-func (c *Client) ExchangeCode(ctx context.Context, cfg LoginConfig, code, codeVerifier string, port int) (*TokenResponse, error) {
+//
+// dpopPrivateJWK 可传 nil：此时随机生成一对，并把公钥随请求发出。调用方必须把
+// 同一对私钥与 refresh_token 一起持久化，否则后续刷新会被 STS 拒
+// （refresh_token 与 DPoP 公钥绑定）。
+func (c *Client) ExchangeCode(ctx context.Context, cfg LoginConfig, code, codeVerifier string, port int, dpopPrivateJWK DPoPPrivateJWK) (*TokenResponse, error) {
 	form := url.Values{}
 	form.Set("client_id", cfg.ClientID)
 	form.Set("code", code)
 	form.Set("code_verifier", codeVerifier)
 	form.Set("grant_type", "authorization_code")
 	form.Set("redirect_uri", fmt.Sprintf("http://127.0.0.1:%d%s", port, cfg.RedirectPath))
-	return c.requestToken(ctx, cfg, form)
+	kp, err := dpopKeyPairFor(dpopPrivateJWK)
+	if err != nil {
+		return nil, err
+	}
+	return c.requestToken(ctx, cfg, form, kp)
 }
 
 // RefreshToken 用 refresh_token 换新凭证。
-func (c *Client) RefreshToken(ctx context.Context, cfg LoginConfig, refreshToken, codeVerifier string) (*TokenResponse, error) {
+//
+// 必须传签发该 refresh_token 时使用的 DPoP 私钥；传 nil 会退化为新密钥，
+// 在服务端校验 DPoP 绑定时会 400 invalid refresh token: InvalidDPoPHeader。
+func (c *Client) RefreshToken(ctx context.Context, cfg LoginConfig, refreshToken, codeVerifier string, dpopPrivateJWK DPoPPrivateJWK) (*TokenResponse, error) {
 	form := url.Values{}
 	form.Set("client_id", cfg.ClientID)
 	form.Set("code_verifier", codeVerifier)
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
-	return c.requestToken(ctx, cfg, form)
+	kp, err := dpopKeyPairFor(dpopPrivateJWK)
+	if err != nil {
+		return nil, err
+	}
+	return c.requestToken(ctx, cfg, form, kp)
 }
 
-// requestToken 向 STS 令牌端点发 form + DPoP 请求。
-func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Values) (*TokenResponse, error) {
-	url := cfg.STSHost + EpOAuthTokens
+// dpopKeyPairFor 用给定私钥恢复密钥对；未提供（旧凭证）时随机生成。
+func dpopKeyPairFor(jwk DPoPPrivateJWK) (*dpopKeyPair, error) {
+	if len(jwk) > 0 && jwk["d"] != "" {
+		kp, err := dpopKeyPairFromPrivateJWK(jwk)
+		if err != nil {
+			return nil, fmt.Errorf("restore dpop keypair: %w", err)
+		}
+		return kp, nil
+	}
 	kp, err := newDpopKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("dpop keypair: %w", err)
 	}
+	return kp, nil
+}
+
+// requestToken 向 STS 令牌端点发 form + DPoP 请求。
+func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Values, kp *dpopKeyPair) (*TokenResponse, error) {
+	url := cfg.STSHost + EpOAuthTokens
 	proof, err := signDpopProof(kp, url)
 	if err != nil {
 		return nil, fmt.Errorf("dpop proof: %w", err)
@@ -491,6 +523,73 @@ func truncateStr(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// CallerIdentity 用 STS 凭证查账号身份：GET {sts}/v5/caller-identity。
+// 返回 user_id(principal_id)、user_name(principal_urn 尾段)、domain_id(account_id)。
+func CallerIdentity(cred SignCredential) (uid, name, domain string, err error) {
+	raw, err := signedGet(STSHost+EpCallerIdentity, cred, "")
+	if err != nil {
+		return "", "", "", err
+	}
+	var out struct {
+		AccountID    string `json:"account_id"`
+		PrincipalID  string `json:"principal_id"`
+		PrincipalURN string `json:"principal_urn"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", "", "", fmt.Errorf("parse caller-identity: %w", err)
+	}
+	if i := strings.LastIndex(out.PrincipalURN, ":user:"); i >= 0 {
+		name = out.PrincipalURN[i+len(":user:"):]
+	}
+	return out.PrincipalID, name, out.AccountID, nil
+}
+
+// CurrentUser 用 STS 凭证查账号身份：GET {snap}/snap-manager/v1/current/user。
+func CurrentUser(cred SignCredential) (uid, name, domain string, err error) {
+	raw, err := signedGet(SnapEngineApiHost+EpCurrentUser, cred, "")
+	if err != nil {
+		return "", "", "", err
+	}
+	var out struct {
+		UserID   string `json:"user_id"`
+		UserName string `json:"user_name"`
+		DomainID string `json:"domain_id"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", "", "", fmt.Errorf("parse current/user: %w", err)
+	}
+	return out.UserID, out.UserName, out.DomainID, nil
+}
+
+// signedGet 发一个 AK/SK 签名 GET（可选 Agent-Type），返回响应体。
+func signedGet(urlStr string, cred SignCredential, agentType string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Language", "zh-cn")
+	if agentType != "" {
+		req.Header.Set("Agent-Type", agentType)
+	}
+	if cred.SecurityToken != "" {
+		req.Header.Set("X-Security-Token", cred.SecurityToken)
+	}
+	signRequest(req, []byte{}, cred)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: urlStr}
+	}
+	return raw, nil
 }
 
 // getSigned 发送带 Agent-Type 的 AK/SK 签名 GET（用于 agent-center 等管理接口）。

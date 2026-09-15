@@ -4,6 +4,7 @@ package server
 import (
 	crand "crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,10 @@ type Config struct {
 	WatchInfo     map[string]any
 	AuthDir       string
 	Listen        string
+	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
+	OAuthClient *upstream.Client
+	// LoginConfig WebUI 登录配置（client_id 以官方客户端为准）。
+	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
 	OAuthCallbackHost string
 }
@@ -116,6 +121,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
 	}
+	if cfg.Upstream == nil {
+		cfg.Upstream = upstream.New(120 * time.Second)
+	}
+	if cfg.OAuthClient == nil {
+		cfg.OAuthClient = upstream.New(15 * time.Second)
+	}
+	if cfg.LoginConfig.ClientID == "" {
+		cfg.LoginConfig = upstream.DefaultLoginConfig()
+	}
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
@@ -185,12 +199,12 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	log.Printf("oauth callback hit: has_code=%t has_secret=%t has_redirect=%t", code != "", secret != "", redirect != "")
 	// portal 第一次回调：带 secret + redirect，要求 307 跳转（登录页链路的一部分）。
 	if secret != "" && redirect != "" {
-		log.Printf("oauth callback: received portal ticket secret")
 		// 用 redirect 里的 ticket_id 定位 pending login，并把华为云下发的 secret 换进去
 		// （ticket 轮询必须用 portal 的 secret，而不是本地生成的）。
 		if u, err := url.Parse(redirect); err == nil {
 			tid := u.Query().Get("ticket_id")
 			if tid != "" {
+				h.oauth.enableTicketFallbackByTicket(tid, secret)
 				h.loginMu.Lock()
 				if p, ok := h.logins[tid]; ok {
 					p.Secret = secret
@@ -208,35 +222,24 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<h3>登录失败：缺少 code</h3><p>请回到 WebUI 重新发起登录。</p>"))
 		return
 	}
-	// 通过 secret 找到对应 pending login（取 verifier/port）
-	h.loginMu.Lock()
-	var verifier string
-	var port int
-	for _, p := range h.logins {
-		if p.Secret == secret {
-			verifier = p.Verifier
-			port = p.Port
-			break
-		}
-	}
-	h.loginMu.Unlock()
-	if verifier == "" {
+	sess := h.oauth.codeSession(r.URL.Query().Get("ticket_id"))
+	if sess == nil {
 		// 没有匹配（浏览器在远端时 code 通道不可用），提示用 ticket 通道
 		_, _ = w.Write([]byte("<h3>登录已提交，请回到 WebUI 等待结果。</h3>"))
 		return
 	}
-	cfg := upstream.DefaultLoginConfig()
-	tok, err := upstream.New(15*time.Second).ExchangeCode(r.Context(), cfg, code, verifier, port)
+	tok, err := h.cfg.OAuthClient.ExchangeCode(r.Context(), h.cfg.LoginConfig, code, sess.Verifier, sess.Port, sess.DPoPPrivateKey)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("<h3>换取凭证失败：" + err.Error() + "</h3>"))
 		return
 	}
-	if err := h.saveLoginResult(tok, verifier); err != nil {
+	if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("<h3>保存账号失败：" + err.Error() + "</h3>"))
 		return
 	}
+	h.oauth.complete(sess.ID)
 	_, _ = w.Write([]byte("<h3>登录成功，可关闭此页面并回到 WebUI。</h3>"))
 }
 
@@ -255,20 +258,95 @@ func tokToken(t *upstream.TokenResponse) string {
 }
 
 // saveLoginResult 落盘 auth 并加入账号池。
-func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string) error {
+func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier string, dpopPrivateJWK ...upstream.DPoPPrivateJWK) error {
 	if h.cfg.AuthDir == "" {
 		return errors.New("auth_dir not configured")
 	}
 	cred := tok.Credentials
+	var privateJWK map[string]string
+	if len(dpopPrivateJWK) > 0 {
+		privateJWK = map[string]string(dpopPrivateJWK[0])
+	}
 	a := auth.New(tok.UserID, tok.UserName, tok.DomainID,
 		cred.SecurityToken, cred.AccessKeyID, cred.SecretAccessKey,
 		cred.Expiration, tok.RefreshToken, codeVerifier)
+	a.SetClientID(h.cfg.LoginConfig.ClientID)
+	a.SetDPoPPrivateKey(privateJWK)
+
+	// portal 回调只回传 code，不带身份；user_id 为空会让 auth.FileName() 退化成
+	// codearts-unknown.json，账号池按 UserID 建索引就会加载不到（或与既有账号重复）。
+	// 因此落盘前用 STS 凭证把身份补全，补全失败也要保证 user_id 有值。
+	if a.UserID == "" || a.UserName == "" {
+		uid, uname, domain := lookupIdentity(a)
+		if uid == "" {
+			// 兜底：refresh_token 里的 sub 是唯一且稳定的，避免写出 unknown 文件
+			uid = identityFromRefreshToken(tok.RefreshToken)
+			log.Printf("webui login: identity lookup failed, fallback user_id=%q", uid)
+		}
+		if uid != "" {
+			a.UserID, a.UserName = uid, firstNonEmpty(uname, a.UserName)
+			if domain != "" {
+				a.DomainID = domain
+			}
+		}
+	}
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
 		return err
 	}
-	h.cfg.Pool.AddAccount(a)
-	log.Printf("webui login success user_id=%s name=%s", tok.UserID, tok.UserName)
+	if p := h.cfg.Pool.AddAccount(a); p != nil && p.Auth != nil {
+		log.Printf("webui login success user_id=%s name=%s", a.UserID, a.UserName)
+	} else {
+		log.Printf("webui login saved user_id=%s name=%s (pool add failed)", a.UserID, a.UserName)
+	}
 	return nil
+}
+
+// lookupIdentity 用刚拿到的 STS 凭证查身份（先 caller-identity，再 current/user）。
+func lookupIdentity(a *auth.Auth) (uid, name, domain string) {
+	cred := upstream.SignCredential{
+		AccessKeyID:     a.AccessKeyID,
+		SecretAccessKey: a.SecretAccessKey,
+		SecurityToken:   a.CloudDragonTok,
+	}
+	if uid, name, domain, err := upstream.CallerIdentity(cred); err == nil && uid != "" {
+		return uid, name, domain
+	} else if err != nil {
+		log.Printf("webui login: caller-identity: %v", err)
+	}
+	if uid, name, domain, err := upstream.CurrentUser(cred); err == nil && uid != "" {
+		return uid, name, domain
+	} else if err != nil {
+		log.Printf("webui login: current/user: %v", err)
+	}
+	return "", "", ""
+}
+
+// identityFromRefreshToken 从 JWT 形式的 refresh_token 里取 sub 作为兜底 user_id。
+func identityFromRefreshToken(tok string) string {
+	parts := strings.Split(tok, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return ""
+	}
+	return claims.Sub
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +363,35 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
-	return modelEntries(h.fetchDynamicModels())
+	infos := h.fetchDynamicModels()
+	// 过滤掉已知不可用的模型（探测或真实请求学到的结论）：这些条目在客户端
+	// 点开就是 404 / benefit not found，列出来只会误导。
+	if len(infos) > 0 {
+		kept := make([]upstream.ModelInfo, 0, len(infos))
+		for _, mi := range infos {
+			if h.modelUsableAnywhere(mi.ID) {
+				kept = append(kept, mi)
+			}
+		}
+		// 全被过滤时保留原列表，避免上游/探测异常导致列表空掉。
+		if len(kept) > 0 {
+			infos = kept
+		}
+	}
+	return modelEntries(infos)
+}
+
+// modelUsableAnywhere 报告池中是否至少有一个健康账号能用该模型。
+func (h *Handler) modelUsableAnywhere(model string) bool {
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if st, _ := modelAvailability(acct.UID, model); st == availUsable {
+			return true
+		}
+	}
+	return false
 }
 
 // modelEntries 把账号模型目录 + 静态兜底包装成 OpenAI /v1/models 条目。
@@ -398,15 +504,53 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 // 累计到阈值就冷却 10 分钟。所以按能力优先挑号。
 func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account {
 	want := strings.ToLower(upstream.CanonicalModel(model))
+	if acct := h.pickByCatalog(tried, want); acct != nil {
+		return acct
+	}
+	// 目录里没人登记这个模型。两种可能：① 谁都没有；② 目录还没发现
+	// （客户端只调 /v1/chat/completions、从没调过 /v1/models 就属于这种）。
+	// 直接退回轮转的话，混合池里没有该模型的账号会先吃一次 400，白耗 MaxRotate
+	// （默认 3 次，账号多于 3 个时可能永远轮不到有能力的那台），还会给健康账号
+	// 记错误、到阈值冷却 10 分钟。所以先补齐缺失的目录再挑一次。
+	h.discoverMissingCatalogs(tried)
+	if acct := h.pickByCatalog(tried, want); acct != nil {
+		return acct
+	}
+	return h.cfg.Pool.PickExcluding(tried)
+}
+
+// pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
+func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.Account {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
-		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, want) {
+		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, wantLower) {
+			if st, _ := modelAvailability(acct.UID, wantLower); st == availUnusable {
+				continue // 该账号实测调不通这个模型，别选它
+			}
 			return acct
 		}
 	}
-	return h.cfg.Pool.PickExcluding(tried)
+	return nil
+}
+
+// discoverMissingCatalogs 为「目录未知或已过期」的健康账号补一次模型发现。
+//
+// 只在聊天挑号失败时调用（不是热路径），且有 CatalogTTL 与失败退避兜底：
+// 刚发现过的账号不会被重复打，上游某一路挂了也不会每次请求都空等超时。
+func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || acct.Auth == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if !upstream.AccountCatalogStale(acct.UID) {
+			continue
+		}
+		if _, err := h.cfg.Upstream.FetchModels(acct.Auth); err != nil {
+			log.Printf("lazy model discovery failed for account %s: %v", acct.Name, err)
+		}
+	}
 }
 
 // accountCanServe 报告账号目录里是否登记了该模型；账号不存在或目录未知时乐观放行
@@ -590,9 +734,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
 			lastErr = serr
-			h.handleUpstreamError(acct, serr)
+			h.handleUpstreamError(acct, model, serr)
 			continue
 		}
+		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
+		markUsable(acct.UID, model)
 
 		w.Header().Set("X-Codearts-Chat-Id", chatID)
 
@@ -777,7 +923,7 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 	return resp
 }
 
-func (h *Handler) handleUpstreamError(acct *pool.Account, err error) {
+func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) {
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
 		switch {
@@ -792,6 +938,13 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, err error) {
 		case ae.Status >= 500:
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, ae.Error())
 		default:
+			// 「模型对这个账号不可用」是账号能力问题，不是账号故障：记下来用于
+			// /v1/models 过滤与路由避开，不能给它记错误冷却（否则健康账号被误伤）。
+			if reason := upstreamUnavailableReason(err); reason != "" {
+				markUnusable(acct.UID, model, reason)
+				log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
+				return
+			}
 			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 		}
 		return

@@ -73,14 +73,17 @@ func main() {
 			"max_concurrent":       cfg.MaxConcurrent,
 			"keepalive_window":     "10m",
 		},
-		AuthDir: cfg.AuthDir,
-		Listen:  cfg.Listen,
+		AuthDir:           cfg.AuthDir,
+		Listen:            cfg.Listen,
+		OAuthClient:       upstream.New(15 * time.Second),
+		LoginConfig:       loginConfig(cfg),
 		OAuthCallbackHost: cfg.OAuthCallbackHost,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	h.StartAvailabilityProber(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -99,4 +102,25 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// loginConfig 决定 WebUI 登录使用的 OAuth 配置。
+//
+// client_id 优先取已有账号记录的取值（refresh_token 与 client_id 绑定，混用会让
+// 老账号刷新失败），其次取配置项，最后才是内置默认值。其余字段必须来自
+// DefaultLoginConfig（否则 authorize 链接会缺 host / plugin 信息）。
+func loginConfig(cfg *Config) upstream.LoginConfig {
+	lc := upstream.DefaultLoginConfig()
+	if cfg.LoginClientID != "" {
+		lc.ClientID = cfg.LoginClientID
+	}
+	if auths, err := auth.LoadDir(cfg.AuthDir); err == nil {
+		for _, a := range auths {
+			if id := a.ClientIDOr(""); id != "" {
+				lc.ClientID = id
+				break
+			}
+		}
+	}
+	return lc
 }

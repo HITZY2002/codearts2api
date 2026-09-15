@@ -24,8 +24,68 @@ type Auth struct {
 	CodeVerifier    string `json:"code_verifier"` // PKCE verifier，refresh 需要
 	UpdatedAt       int64  `json:"updated_at"`
 
+	// ClientID 签发该 refresh_token 的 OAuth client。refresh_token 与 client_id
+	// 绑定，换 client_id 刷新会被 STS 拒（invalid client id）。留空表示旧凭证，
+	// 走 DefaultLoginConfig 的默认值。
+	ClientID string `json:"client_id,omitempty"`
+
+	// DPoPPrivateKey JWK（RFC 9449，ES256）。refresh_token 与签发时的 DPoP 公钥
+	// 绑定：刷新必须用同一密钥对，否则 STS 报 InvalidDPoPHeader。留空表示旧凭证
+	// （刷新时退化为临时密钥，仅在服务端不校验绑定时可用）。
+	DPoPPrivateKey map[string]string `json:"dpop_private_key,omitempty"`
+
 	path string
 	mu   sync.Mutex
+}
+
+// ClientIDOr 返回该凭证绑定的 OAuth client_id；未记录时返回 fallback。
+func (a *Auth) ClientIDOr(fallback string) string {
+	if a == nil {
+		return fallback
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ClientID != "" {
+		return a.ClientID
+	}
+	return fallback
+}
+
+// SetClientID 记录签发该 refresh_token 的 client_id。
+func (a *Auth) SetClientID(v string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ClientID = v
+}
+
+// DPoPPrivateJWK 返回该凭证绑定的 DPoP 私钥副本（可能为 nil，表示旧凭证）。
+func (a *Auth) DPoPPrivateJWK() map[string]string {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.DPoPPrivateKey) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(a.DPoPPrivateKey))
+	for k, v := range a.DPoPPrivateKey {
+		out[k] = v
+	}
+	return out
+}
+
+// SetDPoPPrivateKey 记录该凭证绑定的 DPoP 私钥。
+func (a *Auth) SetDPoPPrivateKey(jwk map[string]string) {
+	if len(jwk) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.DPoPPrivateKey = make(map[string]string, len(jwk))
+	for k, v := range jwk {
+		a.DPoPPrivateKey[k] = v
+	}
 }
 
 // New 构造 Auth（登录落盘用）。
@@ -94,6 +154,31 @@ func (a *Auth) UpdateCredentials(token, accessKeyID, secretAccessKey, expiration
 	}
 	a.UpdatedAt = time.Now().Unix()
 	return saveLocked(a.path, a)
+}
+
+// UpdateIdentity 回填登录身份字段（WebUI 回调可能拿不到 user_id/user_name）。
+func (a *Auth) UpdateIdentity(userID, userName, domainID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if userID != "" {
+		a.UserID = userID
+	}
+	if userName != "" {
+		a.UserName = userName
+	}
+	if domainID != "" {
+		a.DomainID = domainID
+	}
+	a.UpdatedAt = time.Now().Unix()
+	return saveLocked(a.path, a)
+}
+
+// SetPathAndSave 设置落盘路径并写出（WebUI 登录在拿到身份后才能确定文件名）。
+func (a *Auth) SetPathAndSave(path string) error {
+	a.mu.Lock()
+	a.path = path
+	a.mu.Unlock()
+	return a.Save()
 }
 
 // ExpiresAt 返回 token 过期时间。

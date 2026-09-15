@@ -69,8 +69,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("gen pkce: %v", err)
 	}
+	// DPoP 私钥必须与 refresh_token 一起持久化：refresh_token 与签发时的 DPoP
+	// 公钥绑定，换密钥刷新会被 STS 拒（invalid refresh token: InvalidDPoPHeader）。
+	dpopPrivateJWK, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		log.Fatalf("gen dpop: %v", err)
+	}
 
-	loginURL := client.BuildAuthorizeURL(cfg, ticketID, challenge, "S256", callbackPort)
+	loginURL := client.BuildAuthorizeURL(cfg, ticketID, challenge, "SHA-256", callbackPort)
 	fmt.Println("============================================================")
 	fmt.Println("  CodeArts Agent 登录（华为云账号）")
 	fmt.Println("============================================================")
@@ -99,7 +105,7 @@ loginLoop:
 		case <-timer.C:
 			log.Fatalf("登录超时（5 分钟）")
 		case code := <-codeCh:
-			tok, err = client.ExchangeCode(ctx, cfg, code, verifier, callbackPort)
+			tok, err = client.ExchangeCode(ctx, cfg, code, verifier, callbackPort, dpopPrivateJWK)
 			if err != nil {
 				log.Fatalf("exchange code: %v", err)
 			}
@@ -118,6 +124,8 @@ loginLoop:
 	a := auth.New(tok.UserID, tok.UserName, tok.DomainID,
 		cred.SecurityToken, cred.AccessKeyID, cred.SecretAccessKey,
 		cred.Expiration, tok.RefreshToken, verifier)
+	a.SetClientID(cfg.ClientID)
+	a.SetDPoPPrivateKey(dpopPrivateJWK)
 	if err := auth.SaveNew(*authDir, a); err != nil {
 		log.Fatalf("save auth: %v", err)
 	}

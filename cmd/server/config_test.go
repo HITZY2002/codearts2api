@@ -14,6 +14,8 @@ func TestLoadToleratesExampleConfigComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config.example.json: %v", err)
 	}
+	// 没有 api_key 现在会拒绝启动，示例配置的用例显式给一个（env 优先）。
+	t.Setenv("CA2A_API_KEY", "test-key")
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)

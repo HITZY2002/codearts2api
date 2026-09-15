@@ -145,7 +145,7 @@ func TestExchangeCodeEndpoint(t *testing.T) {
 	c := New(5 * time.Second)
 	cfg := DefaultLoginConfig()
 	cfg.STSHost = srv.URL
-	resp, err := c.ExchangeCode(context.Background(), cfg, "code", "verifier", 9999)
+	resp, err := c.ExchangeCode(context.Background(), cfg, "code", "verifier", 9999, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

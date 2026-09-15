@@ -73,6 +73,24 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 `/v1/models`、聊天都只读。需要让服务端在发现模型时顺便领取，才把
 `benefit_auto_claim` 设为 `true`（或 `CA2A_BENEFIT_AUTO_CLAIM=1`）。
 
+### API Key 必填
+
+服务没有 API Key 会**拒绝启动**（旧版本会回退到公开的 `dummy-key-for-codearts`，
+等于把接口暴露给任何人）。三选一：
+
+```bash
+# 1) env（推荐，配合 .env / systemd EnvironmentFile）
+export CA2A_API_KEY=$(openssl rand -hex 24)
+# 2) config.json 的 "api_key" 字段
+# 3) docker compose 的 .env
+```
+
+### 账号续期
+
+`refresh_token` 与登录时的 `client_id`、DPoP 私钥绑定，因此凭证文件会保存
+`client_id` 与 `dpop_private_key`；刷新时原样复用并写回轮转后的新 refresh_token。
+若手工换过 `login_client_id`，老账号仍按自己记录的 client_id 刷新。
+
 ## 部署（systemd / Docker）
 
 ```bash
@@ -106,6 +124,7 @@ docker compose up -d --build
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（写操作） | `false` |
+| `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
 
 ## 目录结构
 

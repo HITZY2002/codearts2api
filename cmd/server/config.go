@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -30,25 +29,29 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Watch struct {
-		Enabled           bool   `json:"enabled"`
-		PollMinutes       int    `json:"poll_minutes"`
-		RefreshSkewM      int    `json:"refresh_skew_minutes"`
-		KeepaliveInterval int    `json:"keepalive_interval_minutes"` // 保活心跳间隔（新增）
+		Enabled           bool `json:"enabled"`
+		PollMinutes       int  `json:"poll_minutes"`
+		RefreshSkewM      int  `json:"refresh_skew_minutes"`
+		KeepaliveInterval int  `json:"keepalive_interval_minutes"` // 保活心跳间隔（新增）
 	} `json:"watch"`
 
-	MaxConcurrent   int `json:"max_concurrent"`   // 单账号最大并发数（新增）
+	MaxConcurrent   int    `json:"max_concurrent"`   // 单账号最大并发数（新增）
 	KeepaliveWindow string `json:"keepalive_window"` // 保活窗口（新增）
 
-	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 false）。
-	// 领取是对账号的写操作，且 /v1/models 是公开读接口，默认只读不写。
+	// LoginClientID WebUI 登录使用的 OAuth client_id（留空用默认 codearts-agent）。
+	LoginClientID string `json:"login_client_id"`
+
+	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 true）。
+	// 领取是幂等操作（官方客户端打开模型菜单即调用），不领取时福利模型一律
+	// 返回 InferHub.4004.200 benefit not found。置 false 可关掉这个写操作。
 	BenefitAutoClaim bool `json:"benefit_auto_claim"`
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
 
-	SoftRateDur     time.Duration
-	ErrCooldownDur  time.Duration
+	SoftRateDur    time.Duration
+	ErrCooldownDur time.Duration
 }
 
 // Default 默认配置。
@@ -69,6 +72,7 @@ func Default() *Config {
 	c.MaxConcurrent = 1            // 上游单账号最多 3 并发会话但释放慢，串行最稳
 	c.KeepaliveWindow = "10m"      // 新增：保活窗口 10 分钟
 	c.Upstream.TimeoutSeconds = 120
+	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
 	return c
 }
 
@@ -86,10 +90,11 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	applyEnv(c)
+	// 没有 API Key 就拒绝启动：旧版本回退到公开的 dummy-key-for-codearts，
+	// 等于把 /v1/chat/completions 与 /v1/models 暴露给任何人（本机也可能被反代出去）。
 	if c.APIKey == "" {
-		c.APIKey = "dummy-key-for-codearts"
-		log.Printf("WARNING: 未设置 CA2A_API_KEY（config.json 的 api_key 与 env 均为空），"+
-			"正在使用公开默认 key %s，切勿对外暴露端口", c.APIKey)
+		return nil, fmt.Errorf("api_key 未设置：请在 config.json 写 api_key，" +
+			"或设置环境变量 CA2A_API_KEY 后再启动（生成示例：openssl rand -hex 24）")
 	}
 	if err := c.normalize(); err != nil {
 		return nil, err
@@ -195,6 +200,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CA2A_KEEPALIVE_WINDOW"); v != "" {
 		c.KeepaliveWindow = v
+	}
+	if v := os.Getenv("CA2A_LOGIN_CLIENT_ID"); v != "" {
+		c.LoginClientID = v
 	}
 	if v := os.Getenv("CA2A_BENEFIT_AUTO_CLAIM"); v != "" {
 		c.BenefitAutoClaim = v == "1" || strings.EqualFold(v, "true")

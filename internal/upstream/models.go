@@ -72,9 +72,13 @@ var seedBenefit = func() map[string]bool {
 // accountCatalog 一个账号的模型目录快照。
 type accountCatalog struct {
 	infos   []ModelInfo
-	benefit map[string]bool // lower(id) -> true（福利来源确认）
+	benefit map[string]bool // lower(id) -> true（本轮发现确认的福利）
 	knows   map[string]bool // lower(id) -> true（该账号目录里登记过的全部模型）
-	fetched time.Time
+	// lastBenefit 上一次福利来源成功时的福利条目。福利网关临时故障时用它兜底：
+	// 只在内置来源明确说「它不是福利」时才摘标记，否则保留，避免把
+	// maas_type: benefit 头弄丢（丢了就是 InferHub.002002009.404）。
+	lastBenefit map[string]ModelInfo
+	fetched     time.Time
 }
 
 var catalog = struct {
@@ -93,20 +97,36 @@ func init() {
 }
 
 // SetAccountModels 整体替换某账号的模型目录（不是增补：套餐轮换后旧模型不得残留）。
+// 等价于「本轮福利来源也成功」，因此不保留上一轮福利记忆。
 func SetAccountModels(accountID string, infos []ModelInfo) {
+	setAccountModels(accountID, infos, false)
+}
+
+// setAccountModels 写入账号目录。
+//
+// keepBenefit=true 表示本轮福利来源失败（内置来源成功）：此时保留上一次成功的
+// 福利条目，否则非种子的福利模型会瞬间丢掉 maas_type: benefit 标记，直到下一次
+// 刷新成功为止——这期间它们在上游按未注册模型 404。
+func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 	if accountID == "" {
 		return
 	}
 	ac := &accountCatalog{
-		infos:   append([]ModelInfo(nil), infos...),
-		benefit: make(map[string]bool),
-		knows:   make(map[string]bool),
-		fetched: time.Now(),
+		infos:       append([]ModelInfo(nil), infos...),
+		benefit:     make(map[string]bool),
+		knows:       make(map[string]bool),
+		lastBenefit: map[string]ModelInfo{},
+		fetched:     time.Now(),
 	}
 	catalog.Lock()
 	defer catalog.Unlock()
 	if catalog.known == nil {
 		catalog.known = map[string]string{}
+	}
+	if prev := catalog.accounts[accountID]; prev != nil {
+		for k, v := range prev.lastBenefit {
+			ac.lastBenefit[k] = v
+		}
 	}
 	for _, mi := range ac.infos {
 		if mi.ID == "" {
@@ -116,10 +136,32 @@ func SetAccountModels(accountID string, infos []ModelInfo) {
 		ac.knows[key] = true
 		if mi.Benefit {
 			ac.benefit[key] = true
+			ac.lastBenefit[key] = mi
 		}
 		if _, ok := catalog.known[key]; !ok || mi.ID != key {
 			catalog.known[key] = mi.ID
 		}
+	}
+	if keepBenefit {
+		// 本轮内置来源没有提到的福利模型：继续按福利路由（宁可多带，不可漏带）。
+		for key, mi := range ac.lastBenefit {
+			if ac.knows[key] {
+				continue // 内置来源明确登记了它 → 已转正，不保留标记
+			}
+			ac.benefit[key] = true
+			ac.knows[key] = true
+			ac.infos = append(ac.infos, mi)
+			if _, ok := catalog.known[key]; !ok || mi.ID != key {
+				catalog.known[key] = mi.ID
+			}
+		}
+		sort.Slice(ac.infos, func(i, j int) bool {
+			li, lj := strings.ToLower(ac.infos[i].ID), strings.ToLower(ac.infos[j].ID)
+			if li != lj {
+				return li < lj
+			}
+			return ac.infos[i].ID < ac.infos[j].ID
+		})
 	}
 	catalog.accounts[accountID] = ac
 }
@@ -263,21 +305,26 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	} else {
 		sets = append(sets, infos)
 	}
+	builtinOK := false
 	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
+		builtinOK = true
 		sets = append(sets, infos)
 	}
+	benefitOK := false
 	if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
 		Log("benefit models: %v", err)
 	} else {
+		benefitOK = true
 		sets = append(sets, infos)
 	}
 	out := MergeModels(sets...)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	SetAccountModels(accountID, out)
+	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
+	setAccountModels(accountID, out, builtinOK && !benefitOK)
 	return out, nil
 }
 

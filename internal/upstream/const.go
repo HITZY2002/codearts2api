@@ -13,18 +13,20 @@ const (
 	// STSHost 临时 AK/SK。
 	STSHost = "https://sts.cn-north-4.myhuaweicloud.com"
 
-	// CLIENT_ID OAuth client（auth 扩展 env.uriScheme，需实测确认）。
-	CLIENT_ID = "codearts"
+	// CLIENT_ID OAuth client（官方 CodeArts Agent 插件的 uri_scheme）。
+	// refresh_token 与该值绑定：换 client_id 刷新会被 STS 拒
+	// （invalid refresh token: 'invalid client id: xxx'）。实测 2026-09-15。
+	CLIENT_ID = "codearts-agent"
 
 	// 聊天端点（chatDomain 商业版 = snap-access.cn-north-4）。
-	EpChatV2          = "/api/v2/chat/completions"
-	EpChat            = "/v1/chat/chat"
-	EpStartChat       = "/v1/chat/start-chat"
-	EpChatAgents      = "/v1/chat/agents"
-	EpChatManagement  = "/v1/chat/management/event"
-	EpChatRecord      = "/v1/chat/record-request"
-	EpAgentList       = "/v1/agent-center/agents/useragents"
-	EpAgentDetail     = "/v1/agent-center/agents/detail"
+	EpChatV2         = "/api/v2/chat/completions"
+	EpChat           = "/v1/chat/chat"
+	EpStartChat      = "/v1/chat/start-chat"
+	EpChatAgents     = "/v1/chat/agents"
+	EpChatManagement = "/v1/chat/management/event"
+	EpChatRecord     = "/v1/chat/record-request"
+	EpAgentList      = "/v1/agent-center/agents/useragents"
+	EpAgentDetail    = "/v1/agent-center/agents/detail"
 	// 内置模型（与官方 ModelService.listBuiltinModels 一致，Agent-Type: PromptCenter）。
 	EpModelBuiltin = "/v1/model/builtin"
 
@@ -34,8 +36,8 @@ const (
 	EpBenefitClaim  = "/api/v1/benefit/claim"
 
 	// 登录/令牌
-	EpLoginTicket     = "/v1/login/ticket"
-	EpOAuthTokens     = "/v1/oauth2/tokens"
-	EpCurrentUser     = "/v1/current/user"
-	EpCallerIdentity  = "/v5/caller-identity"
+	EpLoginTicket    = "/v1/login/ticket"
+	EpOAuthTokens    = "/v1/oauth2/tokens"
+	EpCurrentUser    = "/v1/current/user"
+	EpCallerIdentity = "/v5/caller-identity"
 )

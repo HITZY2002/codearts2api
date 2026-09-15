@@ -1,5 +1,8 @@
 {
   // 本文件可直接 `cp config.example.json config.json` 使用：// 与 /* */ 注释会被忽略。
+  // api_key 必填（也可用环境变量 CA2A_API_KEY）：没有 key 服务会拒绝启动。
+  // 生成：openssl rand -hex 24
+  "api_key": "",
   "listen": ":7866",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
@@ -11,6 +14,7 @@
     "err_cooldown": "10m"
   },
   "benefit_auto_claim": false,   // 模型发现时自动领取限时福利（默认 false：属对账号的写操作）
+  // "login_client_id": "codearts-agent",  // WebUI 登录用 OAuth client；留空自动沿用已有账号的取值
   "max_concurrent": 5,           // 单账号最大并发数（默认 5）
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {

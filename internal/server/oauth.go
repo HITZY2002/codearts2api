@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,15 +22,17 @@ import (
 const oauthSessionTTL = 15 * time.Minute
 
 type oauthSession struct {
-	ID        string
-	TicketID  string
-	Secret    string
-	Verifier  string
-	Port      int
-	AuthURL   string
-	CreatedAt time.Time
-	Done      bool
-	Err       string
+	ID             string
+	TicketID       string
+	Secret         string
+	Verifier       string
+	DPoPPrivateKey upstream.DPoPPrivateJWK
+	Port           int
+	AuthURL        string
+	CreatedAt      time.Time
+	Done           bool
+	Err            string
+	TicketFallback bool
 }
 
 type oauthStore struct {
@@ -65,6 +68,63 @@ func (s *oauthStore) getByTicket(tid string) *oauthSession {
 		}
 	}
 	return nil
+}
+
+func (s *oauthStore) enableTicketFallbackByTicket(ticketID, secret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sess := range s.byID {
+		if sess.TicketID == ticketID {
+			sess.Secret = secret
+			sess.TicketFallback = true
+			return
+		}
+	}
+}
+
+func (s *oauthStore) enableTicketFallbackByID(id, secret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess := s.byID[id]; sess != nil {
+		sess.Secret = secret
+		sess.TicketFallback = true
+	}
+}
+
+func (s *oauthStore) complete(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess := s.byID[id]; sess != nil {
+		sess.Done = true
+		sess.Err = ""
+	}
+}
+
+// codeSession 在回调不带 ticket_id 时只接受唯一的活跃 OAuth 会话，
+// 避免共享回调端口把 authorization code 配给错误的 PKCE/DPoP 密钥。
+func (s *oauthStore) codeSession(ticketID string) *oauthSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcLocked()
+	if ticketID != "" {
+		for _, sess := range s.byID {
+			if sess.TicketID == ticketID && !sess.Done {
+				return sess
+			}
+		}
+		return nil
+	}
+	var match *oauthSession
+	for _, sess := range s.byID {
+		if sess.Done {
+			continue
+		}
+		if match != nil {
+			return nil
+		}
+		match = sess
+	}
+	return match
 }
 
 func (s *oauthStore) del(id string) {
@@ -119,9 +179,14 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
 		return
 	}
+	dpopPrivateJWK, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
 	port := h.listenPort()
-	cfg := upstream.DefaultLoginConfig()
-	authURL := upstream.New(10 * time.Second).BuildAuthorizeURL(cfg, ticketID, challenge, "S256", port)
+	cfg := h.cfg.LoginConfig
+	authURL := h.cfg.OAuthClient.BuildAuthorizeURL(cfg, ticketID, challenge, "SHA-256", port)
 	// 可选：把回调端口改写为公网反代地址的端口，让浏览器回调尽量命中 hub；
 	// 远端若仍无法回调则回退到 ticket 轮询通道，不影响登录完成。
 	if h.cfg.OAuthCallbackHost != "" {
@@ -133,7 +198,7 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	id := newSessionID()
 	h.oauth.put(&oauthSession{
 		ID: id, TicketID: ticketID, Secret: secret, Verifier: verifier, Port: port,
-		AuthURL: authURL, CreatedAt: time.Now(),
+		DPoPPrivateKey: dpopPrivateJWK, AuthURL: authURL, CreatedAt: time.Now(),
 	})
 	// 兼容旧 loginMu 回调路径（/oauth/callback 会更新 portal secret）
 	h.loginMu.Lock()
@@ -179,6 +244,15 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "done", "message": "登录成功"})
 		return
 	}
+	// 新式 OAuth 必须等待 authorization code；只有 Portal 明确回调
+	// secret 时才进入旧 ticket 回退。否则并行轮询会抢先保存一份
+	// 不含 refresh_token 的临时凭据。
+	if !sess.TicketFallback {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "status": "pending", "message": "等待浏览器返回 OAuth 授权码…",
+		})
+		return
+	}
 
 	// 同步 loginMu 里可能被 callback 更新的 portal secret
 	h.loginMu.Lock()
@@ -187,8 +261,7 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	h.loginMu.Unlock()
 
-	cfg := upstream.DefaultLoginConfig()
-	tok, err := upstream.New(15 * time.Second).PollTicket(context.Background(), cfg, sess.TicketID, sess.Secret)
+	tok, err := h.cfg.OAuthClient.PollTicket(context.Background(), h.cfg.LoginConfig, sess.TicketID, sess.Secret)
 	if err != nil || tok == nil || tok.UserName == "" || tok.Credentials.SecurityToken == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "status": "pending", "message": "等待浏览器完成登录…",
@@ -209,6 +282,84 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		"message": fmt.Sprintf("登录成功：%s (%s)", nonempty(tok.UserName, "未命名"), shortID(tok.UserID)),
 		"account": map[string]any{"uid": tok.UserID, "nickname": tok.UserName},
 	})
+}
+
+// adminOAuthImportCallback bridges the loopback callback used by the native
+// CodeArts OAuth flow when the browser is not running on the proxy host. The
+// operator pastes the failed 127.0.0.1 callback URL; the server validates it
+// against the active session, records the portal secret, and returns the next
+// Huawei URL for the browser to continue.
+func (h *Handler) adminOAuthImportCallback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"session_id"`
+		CallbackURL string `json:"callback_url"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	if err := json.Unmarshal(raw, &req); err != nil || strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.CallbackURL) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "session_id 和 callback_url 必填"})
+		return
+	}
+	sess := h.oauth.get(req.SessionID)
+	if sess == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "会话不存在或已过期，请重新发起授权"})
+		return
+	}
+	callback, err := url.Parse(strings.TrimSpace(req.CallbackURL))
+	if err != nil || callback.Scheme != "http" || callback.User != nil || callback.Path != "/oauth/callback" || !loopbackCallbackHost(callback.Hostname()) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "只接受华为返回的 127.0.0.1 OAuth 回调地址"})
+		return
+	}
+	if callback.Port() != strconv.Itoa(sess.Port) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "回调端口与当前授权会话不匹配"})
+		return
+	}
+	secret := callback.Query().Get("secret")
+	if code := callback.Query().Get("code"); code != "" {
+		tok, exchangeErr := h.cfg.OAuthClient.ExchangeCode(r.Context(), h.cfg.LoginConfig, code, sess.Verifier, sess.Port, sess.DPoPPrivateKey)
+		if exchangeErr != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "status": "error", "message": exchangeErr.Error()})
+			return
+		}
+		if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "status": "error", "message": err.Error()})
+			return
+		}
+		sess.Done = true
+		h.oauth.del(req.SessionID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "status": "done", "message": "OAuth 登录成功，已保存可自动续期凭据",
+			"account": map[string]any{"uid": tok.UserID, "nickname": tok.UserName},
+		})
+		return
+	}
+	nextURL := callback.Query().Get("redirect")
+	next, err := url.Parse(nextURL)
+	portal, portalErr := url.Parse(h.cfg.LoginConfig.PortalHost)
+	if secret == "" || err != nil || portalErr != nil || next.Scheme != "https" || next.User != nil ||
+		!strings.EqualFold(next.Host, portal.Host) || next.Query().Get("ticket_id") != sess.TicketID {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "回调地址缺少当前会话的授权信息"})
+		return
+	}
+
+	h.oauth.enableTicketFallbackByID(req.SessionID, secret)
+	h.loginMu.Lock()
+	if pending, ok := h.logins[sess.TicketID]; ok {
+		pending.Secret = secret
+	}
+	h.loginMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "status": "continue", "next_url": nextURL,
+		"message": "回调已接收，请继续打开华为授权页并等待自动检测",
+	})
+}
+
+func loopbackCallbackHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func nonempty(s, def string) string {

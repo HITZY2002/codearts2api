@@ -27,8 +27,15 @@ HTTP 服务），负责本地 agent 循环（会话/工具/文件），云端对
 | 记录请求 | POST /v1/chat/record-request | 同上 |
 | 换 token | POST /v1/oauth2/tokens（authorization_code / refresh_token） | client_id + code/refresh_token |
 | ticket 轮询 | GET /v1/login/ticket?ticket_id=&secret= | plugin-name/version 头 |
-| 当前用户 | GET /v1/current/user | AK/SK 签名 + X-Security-Token |
+| 当前用户 | GET /snap-manager/v1/current/user | AK/SK 签名 + X-Security-Token |
 | 账号信息 | GET /v5/caller-identity（sts.cn-north-4） | AK/SK 签名 + X-Security-Token |
+
+身份接口实测修正（2026-09-15，两个都踩过坑）：
+- `current/user` 必须带 `snap-manager` 前缀：漏掉返回 `APIG.0101 The API does not exist`。
+- `caller-identity` 只在 `sts.cn-north-4` 域可用：`iam.myhuaweicloud.com/v5/caller-identity`
+  返回 `APIGW.0101`。
+- 返回字段：caller-identity → `{account_id, principal_id, principal_urn}`；current/user →
+  `{user_id, user_name, domain_id, domain_name}`。
 
 域名表（product.json commercialVersionDomain.newFramework.productDomain）：
 `chatDomain = codeGenDomain = snapEngineDomain = snap-access.cn-north-4.myhuaweicloud.com`；
@@ -47,8 +54,16 @@ HTTP 服务），负责本地 agent 循环（会话/工具/文件），云端对
 6. 刷新：`POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens`
    `{client_id, code_verifier, grant_type:"refresh_token", refresh_token}`（同样带 DPoP）。
 
-`CLIENT_ID` = 应用 `uri_scheme`（默认 `codearts`，实测以登录链接为准，可在 login 工具
-用 `-client-id` 覆盖）。
+`CLIENT_ID` = 应用 `uri_scheme`，实测为 **`codearts-agent`**（官方 CodeArts Agent 插件）。
+
+**refresh_token 与 client_id、DPoP 公钥三者绑定**，实测两种失败：
+- client_id 不匹配 → `400 STS5.1806 invalid refresh token: 'invalid client id: codearts-agent'`
+- DPoP 私钥换新 → `400 STS5.1806 invalid refresh token: 'InvalidDPoPHeader'`
+- refresh_token 是一次性的，用旧值再刷 → `invalid refresh token: 'the refresh token has been used'`
+
+因此登录时的 client_id 与 DPoP 私钥必须随 refresh_token 一起落盘（`auths/*.json` 的
+`client_id` / `dpop_private_key` 字段），刷新时原样复用，并把响应里轮转后的新
+refresh_token 写回。
 
 ## 4. 聊天请求
 
@@ -137,9 +152,12 @@ Body：
   会话黏性锁定的账号若不能服务当前模型，同样换号而不是硬发。
 - **`maas_type` 由服务端注入并计入签名**：`SendChatV2` 在 `signRequest` 之前设置该头，
   SignedHeaders 覆盖它（与官方客户端行为一致）。
-- **领取默认关闭**：`POST benefit/claim` 是对账号的写操作，而 `/v1/models` 是可被任意
-  持 key 客户端调用的读接口，因此默认只读不领取；需要领取时显式执行
-  `go run ./cmd/models -claim` 或打开 `benefit_auto_claim`。
+- **领取默认关闭**：`POST benefit/claim` 是对账号的写操作，因此默认只读不领取；
+  需要领取时显式执行 `go run ./cmd/models -claim` 或打开 `benefit_auto_claim`。
+- **福利来源失败时保留上一轮福利条目**：三路发现里福利网关可能临时不可用，此时若整体
+  替换目录，非种子的福利模型会丢掉 `maas_type: benefit`，上游按未注册模型 404。因此
+  `setAccountModels(keepBenefit=true)` 会保留上一轮成功发现的福利条目，只有内置来源
+  明确登记了该模型（视为转正）才摘掉标记。
 - 冷启动种子（`seedBenefitModels`）：首次发现前也要带福利头，少带一次就是一次 404。
 
 ## 8. 脱敏
