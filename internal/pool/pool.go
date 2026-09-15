@@ -560,8 +560,15 @@ func (p *Pool) PingKeepalive(name string) {
 	}
 }
 
-// CheckAndRefreshToken 检查 token 是否快过期并主动刷新（比 scheduler 更积极）。
-func (p *Pool) CheckAndRefreshToken(name string) error {
+// CheckAndRefreshTokenWithin 在剩余有效期低于 skew 时主动刷新 token。
+//
+// skew 来自 scheduler 的 refresh_skew（配置项 watch.refresh_skew_minutes）。
+// 此前该配置从未生效：原实现硬编码 1 小时阈值，调度器传进来的 RefreshSkew
+// 只出现在日志里，README 写的「提前刷新时间」实际不起作用。
+func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error {
+	if skew <= 0 {
+		skew = time.Hour
+	}
 	p.mu.Lock()
 	var acct *Account
 	for _, a := range p.accounts {
@@ -577,17 +584,24 @@ func (p *Pool) CheckAndRefreshToken(name string) error {
 
 	acct.mu.Lock()
 	remaining := acct.Auth.Remaining()
+	hasRefresh := acct.Auth.Refresh() != ""
 	acct.mu.Unlock()
 
-	// 如果 token 剩余少于 1 小时，主动刷新
-	if remaining <= time.Hour {
-		if acct.Auth.Refresh() == "" {
-			return nil
-		}
-		log.Printf("pool proactive refresh account=%s remaining=%s", name, remaining)
-		return p.RefreshToken(name)
+	if remaining > skew {
+		return nil
 	}
-	return nil
+	if !hasRefresh {
+		// ticket 登录不返回 refresh_token，跳过无意义的周期刷新。
+		return nil
+	}
+	log.Printf("pool proactive refresh account=%s remaining=%s skew=%s",
+		name, remaining.Round(time.Minute), skew)
+	return p.RefreshToken(name)
+}
+
+// CheckAndRefreshToken 检查 token 是否快过期并主动刷新（比 scheduler 更积极）。
+func (p *Pool) CheckAndRefreshToken(name string) error {
+	return p.CheckAndRefreshTokenWithin(name, time.Hour)
 }
 
 // RefreshToken 手动刷新指定账号的 token。

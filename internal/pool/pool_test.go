@@ -67,3 +67,19 @@ func TestValidateKeepsAccountEnabledAfterRetryableRefreshFailure(t *testing.T) {
 		t.Fatalf("retryable refresh failure permanently disabled account: %#v", status)
 	}
 }
+
+// watch.refresh_skew_minutes 必须是有效的：此前 pool 硬编码 1 小时阈值，
+// 调度器传进来的 RefreshSkew 只用于日志，配置改了也不生效。
+func TestRefreshSkewControlsThreshold(t *testing.T) {
+	a := auth.New("u-skew", "n", "d", "tok", "ak", "sk",
+		time.Now().Add(2*time.Hour).Format(time.RFC3339), "refresh-token", "verifier")
+	p, err := New([]*auth.Auth{a}, Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 剩余 2h：skew=1h 时不刷新，skew=3h 时应命中刷新（这里只验证判定分支，
+	// 真刷新需要网络，故只检查不触发的那一侧不报错）。
+	if err := p.CheckAndRefreshTokenWithin("u-skew", time.Hour); err != nil {
+		t.Fatalf("剩余 2h、skew=1h 不应触发刷新: %v", err)
+	}
+}

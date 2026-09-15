@@ -79,9 +79,9 @@ func (s *Scheduler) Tick(ctx context.Context) {
 
 			// ticket 登录不返回 refresh_token；这种账号跳过无意义的周期刷新。
 			if acct.Auth.Refresh() != "" {
-				if err := s.cfg.Pool.CheckAndRefreshToken(acct.Name); err != nil {
+				if err := s.cfg.Pool.CheckAndRefreshTokenWithin(acct.Name, s.cfg.RefreshSkew); err != nil {
 					log.Printf("proactive refresh failed account=%s err=%v", acct.Name, err)
-				} else if remaining <= time.Hour {
+				} else if remaining <= s.cfg.RefreshSkew {
 					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,
 						acct.Auth.Remaining().Round(time.Minute))
 				}
