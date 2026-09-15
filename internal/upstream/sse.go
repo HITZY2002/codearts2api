@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -39,6 +40,7 @@ type RawCompletion struct {
 	Content   string
 	Reasoning string
 	Finish    string
+	ToolCalls []ChatToolCall
 }
 
 // scanLine 处理一行 SSE：CodeArts 是逐行 data:（无空行分隔），
@@ -78,39 +80,39 @@ func isValidStructuredQA(obj map[string]any) bool {
 	question, hasQ := obj["question"]
 	answer, hasA := obj["answer"]
 	_, hasOptions := obj["options"]
-	
+
 	// 必须同时有 question 和 answer 字段
 	if !hasQ || !hasA {
 		return false
 	}
-	
+
 	// 确保字段是字符串类型
 	qStr, qOk := question.(string)
 	aStr, aOk := answer.(string)
 	if !qOk || !aOk {
 		return false
 	}
-	
+
 	// 检查是否是典型的问答格式（避免代码块）
 	// Question should be a natural language question
 	if len(qStr) == 0 || len(qStr) > 500 { // 问题不应该太长
 		return false
 	}
-	
+
 	// Answer should be relatively short and not contain code-like structures
 	if len(aStr) == 0 || len(aStr) > 100 { // 答案不应该太长
 		return false
 	}
-	
+
 	// Check if it looks like code (contains common programming keywords)
 	lowerAns := strings.ToLower(aStr)
-	if strings.Contains(lowerAns, "import ") || strings.Contains(lowerAns, "def ") || 
-	   strings.Contains(lowerAns, "class ") || strings.Contains(lowerAns, "func ") ||
-	   strings.Contains(lowerAns, "package ") || strings.Contains(lowerAns, "module ") ||
-	   strings.Contains(lowerAns, "struct ") || strings.Contains(lowerAns, "interface ") {
+	if strings.Contains(lowerAns, "import ") || strings.Contains(lowerAns, "def ") ||
+		strings.Contains(lowerAns, "class ") || strings.Contains(lowerAns, "func ") ||
+		strings.Contains(lowerAns, "package ") || strings.Contains(lowerAns, "module ") ||
+		strings.Contains(lowerAns, "struct ") || strings.Contains(lowerAns, "interface ") {
 		return false
 	}
-	
+
 	// If options are present, they should be a slice
 	if hasOptions {
 		opts, optsOk := obj["options"].([]any)
@@ -122,7 +124,7 @@ func isValidStructuredQA(obj map[string]any) bool {
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -137,14 +139,69 @@ func deltaFromChunk(payload map[string]any) (delta map[string]any, finishReason 
 		return nil, ""
 	}
 	if c0, ok := choices[0].(map[string]any); ok {
-		if d, ok := c0["delta"].(map[string]any); ok {
-			return d, ""
-		}
 		if fr, ok := c0["finish_reason"].(string); ok {
-			return nil, fr
+			finishReason = fr
+		}
+		if d, ok := c0["delta"].(map[string]any); ok {
+			delta = d
 		}
 	}
-	return nil, ""
+	return delta, finishReason
+}
+
+type toolCallAccumulator map[int]*ChatToolCall
+
+// applyToolCallDeltas 聚合 OpenAI 流式 tool_calls 的 id/name/arguments 分片。
+func applyToolCallDeltas(delta map[string]any, calls toolCallAccumulator) {
+	rawCalls, ok := delta["tool_calls"].([]any)
+	if !ok {
+		return
+	}
+	for position, raw := range rawCalls {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		index := position
+		switch v := m["index"].(type) {
+		case float64:
+			index = int(v)
+		case int:
+			index = v
+		}
+		call := calls[index]
+		if call == nil {
+			call = &ChatToolCall{Index: index, Type: "function"}
+			calls[index] = call
+		}
+		if id, ok := m["id"].(string); ok && id != "" {
+			call.ID = id
+		}
+		if typ, ok := m["type"].(string); ok && typ != "" {
+			call.Type = typ
+		}
+		if fn, ok := m["function"].(map[string]any); ok {
+			if name, ok := fn["name"].(string); ok {
+				call.Function.Name += name
+			}
+			if arguments, ok := fn["arguments"].(string); ok {
+				call.Function.Arguments += arguments
+			}
+		}
+	}
+}
+
+func sortedToolCalls(calls toolCallAccumulator) []ChatToolCall {
+	indexes := make([]int, 0, len(calls))
+	for index := range calls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	out := make([]ChatToolCall, 0, len(indexes))
+	for _, index := range indexes {
+		out = append(out, *calls[index])
+	}
+	return out
 }
 
 // applyEvent 把单事件应用到聚合状态。
@@ -207,7 +264,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 			content.WriteString(t)
 			return
 		}
-		// 终态 output 数组：[{type:"output_text",text}] 
+		// 终态 output 数组：[{type:"output_text",text}]
 		if out, ok := payload["output"].([]any); ok && len(out) > 0 {
 			var sb strings.Builder
 			for _, item := range out {
@@ -341,6 +398,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		reason  strings.Builder
 		finish  = "stop"
 		upErr   error
+		calls   = make(toolCallAccumulator)
 	)
 	var pendingEvent string
 	for {
@@ -349,6 +407,11 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 			return nil, err
 		}
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
+			var payload map[string]any
+			if json.Unmarshal([]byte(data), &payload) == nil {
+				delta, _ := deltaFromChunk(payload)
+				applyToolCallDeltas(delta, calls)
+			}
 			applyEvent(&content, &reason, &finish, &upErr, ev, data)
 		}
 		if err == io.EOF {
@@ -362,6 +425,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		Content:   unwrapQAContent(content.String()),
 		Reasoning: reason.String(),
 		Finish:    finish,
+		ToolCalls: sortedToolCalls(calls),
 	}, nil
 }
 
@@ -374,6 +438,12 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 	message := map[string]any{"role": "assistant", "content": rc.Content}
 	if rc.Reasoning != "" {
 		message["reasoning_content"] = rc.Reasoning
+	}
+	if len(rc.ToolCalls) > 0 {
+		message["tool_calls"] = rc.ToolCalls
+		if rc.Content == "" {
+			message["content"] = nil
+		}
 	}
 	return map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
@@ -406,10 +476,11 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	sawDone := false
 	var (
-		content strings.Builder
-		reason  strings.Builder
-		finish  = "stop"
+		content   strings.Builder
+		reason    strings.Builder
+		finish    = "stop"
 		streamErr error
+		calls     = make(toolCallAccumulator)
 	)
 	var pendingEvent string
 
@@ -462,6 +533,20 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 			break
 		}
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
+			if strings.TrimSpace(data) == "[DONE]" {
+				if !sawDone {
+					if werr := writeDONE(); werr != nil {
+						streamErr = werr
+						break
+					}
+					sawDone = true
+				}
+				break
+			}
+			var payload map[string]any
+			_ = json.Unmarshal([]byte(data), &payload)
+			nativeDelta, nativeFinish := deltaFromChunk(payload)
+			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
 			beforeContent, beforeReason := content.Len(), reason.Len()
 			applyEvent(&content, &reason, &finish, &upErr, ev, data)
@@ -475,25 +560,34 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 					break
 				}
 				sawDone = true
-				continue
+				streamErr = upErr
+				break
 			}
 			delta := map[string]any{}
+			if role, ok := nativeDelta["role"].(string); ok && role != "" {
+				delta["role"] = role
+			}
 			if content.Len() > beforeContent {
 				delta["content"] = content.String()[beforeContent:]
 			}
 			if reason.Len() > beforeReason {
 				delta["reasoning_content"] = reason.String()[beforeReason:]
 			}
-			if len(delta) > 0 {
-				if werr := writeChunk(delta, ""); werr != nil {
+			if toolCalls, ok := nativeDelta["tool_calls"]; ok {
+				delta["tool_calls"] = toolCalls
+			}
+			if len(delta) > 0 || nativeFinish != "" {
+				if werr := writeChunk(delta, nativeFinish); werr != nil {
 					streamErr = werr
 					break
 				}
 			}
 			if strings.EqualFold(ev, "done") || strings.EqualFold(ev, "end") || strings.EqualFold(ev, "finish") {
-				if werr := writeChunk(map[string]any{}, finish); werr != nil {
-					streamErr = werr
-					break
+				if nativeFinish == "" {
+					if werr := writeChunk(map[string]any{}, finish); werr != nil {
+						streamErr = werr
+						break
+					}
 				}
 				if werr := writeDONE(); werr != nil {
 					streamErr = werr
@@ -501,6 +595,9 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 				}
 				sawDone = true
 			}
+		}
+		if sawDone {
+			break
 		}
 		if err == io.EOF {
 			break
@@ -514,6 +611,7 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 			Content:   unwrapQAContent(content.String()),
 			Reasoning: reason.String(),
 			Finish:    finish,
+			ToolCalls: sortedToolCalls(calls),
 		})
 	}
 	return streamErr

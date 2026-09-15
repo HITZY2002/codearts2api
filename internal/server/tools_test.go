@@ -20,6 +20,41 @@ func TestExtractToolCallsFenced(t *testing.T) {
 	}
 }
 
+func TestExtractToolCallsStripsGLMXMLWrapper(t *testing.T) {
+	text := "准备检查。\n<tool_call>\n```tool_call\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n```\n</tool_call>\n"
+	calls, rest, found := extractToolCalls(text)
+	if !found || len(calls) != 1 || calls[0].Name != "bash" {
+		t.Fatalf("found=%v calls=%+v rest=%q", found, calls, rest)
+	}
+	if strings.Contains(rest, "tool_call") || strings.Contains(rest, "</tool_call>") {
+		t.Fatalf("GLM tool protocol leaked into content: %q", rest)
+	}
+}
+
+func TestExtractToolCallsSkipsMalformedBlockAndKeepsLaterValidCall(t *testing.T) {
+	text := "<tool_call>\n```tool_call\nnot-json\n```\n</tool_call>\n" +
+		"<tool_call>\n```tool_call\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n```\n</tool_call>"
+	calls, rest, found := extractToolCalls(text)
+	if !found || len(calls) != 1 || calls[0].Name != "bash" {
+		t.Fatalf("found=%v calls=%+v rest=%q", found, calls, rest)
+	}
+	if strings.Contains(rest, "tool_call") || strings.Contains(rest, "not-json") {
+		t.Fatalf("malformed protocol block leaked into content: %q", rest)
+	}
+}
+
+func TestToolResponseHidesProtocolTranscriptWhenCallIsPresent(t *testing.T) {
+	text := "分析完成\n<tool_call>\n```tool_call\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n```\n</tool_call>" +
+		"\n[工具 call_1 返回结果]\n/a/very/large/internal/transcript"
+	calls, content, found := toolResponse(text)
+	if !found || len(calls) != 1 || calls[0].Name != "bash" {
+		t.Fatalf("found=%v calls=%+v content=%q", found, calls, content)
+	}
+	if content != "" {
+		t.Fatalf("tool protocol/history leaked into OpenAI content: %q", content)
+	}
+}
+
 func TestExtractToolCallsWrappedJSON(t *testing.T) {
 	text := `{"tool_calls":[{"name":"f1","arguments":{"a":1}},{"name":"f2","arguments":{"b":2}}]}`
 	calls, _, found := extractToolCalls(text)
@@ -60,7 +95,7 @@ func TestNormalizeTools(t *testing.T) {
 
 func TestToolsActive(t *testing.T) {
 	req := &chatRequest{
-		Tools: []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}},
+		Tools:      []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}},
 		ToolChoice: toolChoiceOpenAI{Mode: "auto"},
 	}
 	if !toolsActive(req) {

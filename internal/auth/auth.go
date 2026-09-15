@@ -89,8 +89,8 @@ func (a *Auth) SetDPoPPrivateKey(jwk map[string]string) {
 }
 
 // New 构造 Auth（登录落盘用）。
-func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, codeVerifier string) *Auth {
-	return &Auth{
+func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, codeVerifier string, dpopPrivateJWK ...map[string]string) *Auth {
+	a := &Auth{
 		UserID:          userID,
 		UserName:        userName,
 		DomainID:        domainID,
@@ -102,6 +102,13 @@ func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, co
 		CodeVerifier:    codeVerifier,
 		UpdatedAt:       time.Now().Unix(),
 	}
+	if len(dpopPrivateJWK) > 0 && len(dpopPrivateJWK[0]) > 0 {
+		a.DPoPPrivateKey = make(map[string]string, len(dpopPrivateJWK[0]))
+		for k, v := range dpopPrivateJWK[0] {
+			a.DPoPPrivateKey[k] = v
+		}
+	}
+	return a
 }
 
 // FileName 返回 auth 文件名。

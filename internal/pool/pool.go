@@ -4,6 +4,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -53,9 +54,10 @@ type Config struct {
 	ErrThreshold    int
 	ErrCooldown     time.Duration
 	SoftCooldown    time.Duration
-	RefreshSkew     time.Duration // token 到期前多久自动刷新
-	MaxConcurrent   int           // 单账号最大并发数（默认 5）
-	KeepaliveWindow time.Duration // 保活心跳窗口，超过此时间无活动则发送心跳
+	RefreshSkew     time.Duration        // token 到期前多久自动刷新
+	MaxConcurrent   int                  // 单账号最大并发数（默认 5）
+	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
+	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 }
 
 // Pool 账号池。
@@ -87,6 +89,9 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	}
 	if cfg.KeepaliveWindow <= 0 {
 		cfg.KeepaliveWindow = 10 * time.Minute // 10 分钟无活动则保活
+	}
+	if cfg.LoginConfig.ClientID == "" {
+		cfg.LoginConfig = upstream.DefaultLoginConfig()
 	}
 	p := &Pool{cfg: cfg, state: stateFile}
 	for _, a := range auths {
@@ -336,8 +341,14 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 			return true, nil
 		}
 		if err := p.RefreshToken(a.Name); err != nil {
-			p.Disable(a.Name, "refresh failed: "+err.Error())
-			return false, nil
+			var expired *upstream.RefreshTokenExpiredError
+			if errors.As(err, &expired) {
+				p.Disable(a.Name, "refresh_token expired; re-login required")
+				return false, nil
+			}
+			// 网络/5xx 属于可重试错误：保持账号可调度，由后续
+			// watchdog tick 重试，不得把短暂故障固化为永久禁用。
+			return false, err
 		}
 	}
 	a.mu.Lock()
@@ -582,13 +593,12 @@ func (p *Pool) RefreshToken(name string) error {
 	if refreshToken == "" {
 		return fmt.Errorf("no refresh_token available")
 	}
-	// refresh_token 同时与 client_id 和签发时的 DPoP 公钥绑定：两者都必须沿用
-	// 登录当时的取值，否则 STS 直接拒（invalid client id / InvalidDPoPHeader）。
-	cfg := upstream.DefaultLoginConfig()
-	cfg.ClientID = authz.ClientIDOr(cfg.ClientID)
-	dpopJWK := upstream.DPoPPrivateJWK(authz.DPoPPrivateJWK())
+	dpopPrivateJWK := authz.DPoPPrivateJWK()
+	if dpopPrivateJWK["d"] == "" {
+		return fmt.Errorf("no DPoP private key available; re-login required")
+	}
 
-	resp, err := acct.Client.RefreshToken(context.Background(), cfg, refreshToken, authz.Verifier(), dpopJWK)
+	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
 	if err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
@@ -601,13 +611,6 @@ func (p *Pool) RefreshToken(name string) error {
 		resp.RefreshToken,
 	); err != nil {
 		return fmt.Errorf("save token: %w", err)
-	}
-	// 首次记录 client_id（旧凭证升级路径）。
-	if authz.ClientIDOr("") == "" {
-		authz.SetClientID(cfg.ClientID)
-		if err := authz.Save(); err != nil {
-			log.Printf("pool refresh account=%s: save client_id: %v", name, err)
-		}
 	}
 	acct.mu.Lock()
 	acct.disabled = false

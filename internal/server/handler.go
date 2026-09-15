@@ -25,18 +25,23 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool          *pool.Pool
-	Upstream      *upstream.Client
-	APIKey        string
-	MaxRotate     int
-	SoftCooldown  time.Duration
-	ErrThreshold  int
-	ErrCooldown   time.Duration
-	DefaultModel  string
-	ConvStateFile string
-	WatchInfo     map[string]any
-	AuthDir       string
-	Listen        string
+	Pool         *pool.Pool
+	Upstream     *upstream.Client
+	APIKey       string
+	MaxRotate    int
+	SoftCooldown time.Duration
+	ErrThreshold int
+	ErrCooldown  time.Duration
+	// CodeArts 上游把并发会话/TPM 排队既可能返回 HTTP 400/429，
+	// 也可能嵌在 HTTP 200 SSE 内。默认对齐官方 IDE 参考实现：
+	// 每 10s 重试，最多 180 次（30min）。
+	QueueRetryDelay  time.Duration
+	QueueMaxAttempts int
+	DefaultModel     string
+	ConvStateFile    string
+	WatchInfo        map[string]any
+	AuthDir          string
+	Listen           string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
 	OAuthClient *upstream.Client
 	// LoginConfig WebUI 登录配置（client_id 以官方客户端为准）。
@@ -59,14 +64,19 @@ type staticModel struct {
 	Benefit       bool
 }
 
+// staticModels 静态兜底表：**只放实测确认可用的模型**。
+//
+// 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
+// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
+// 逐个调用验证（见 docs/reverse-engineering.md §7）：
+//
+//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
+//	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
 var staticModels = []staticModel{
-	// 内置（agent-center / /v1/model/builtin 实测，精确大小写）
 	{ID: "GLM-5.2", ContextWindow: 202752},
-	{ID: "GLM-5.2-ArkTS-SPARK", ContextWindow: 202752},
-	{ID: "OpenPangu-2.0-Pro", ContextWindow: 524288},
-	{ID: "OpenPangu-2.0-Flash", ContextWindow: 524288},
+	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
 	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
-	// 限时福利（免费套餐，福利网关实测；聊天自动带 maas_type: benefit 头）
+	// 限时福利（需领取；领取后实测可用，聊天自动带 maas_type: benefit）
 	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
 	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
 	{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
@@ -118,6 +128,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.ErrCooldown <= 0 {
 		cfg.ErrCooldown = 10 * time.Minute
 	}
+	if cfg.QueueRetryDelay <= 0 {
+		cfg.QueueRetryDelay = 10 * time.Second
+	}
+	if cfg.QueueMaxAttempts <= 0 {
+		cfg.QueueMaxAttempts = 180
+	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
 	}
@@ -155,6 +171,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/accounts/clear-cooldown", h.withAuth(h.adminClearCooldown))
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(h.adminOAuthStart))
 	h.mux.HandleFunc("POST /admin/api/oauth/poll", h.withAuth(h.adminOAuthPoll))
+	h.mux.HandleFunc("POST /admin/api/oauth/import-callback", h.withAuth(h.adminOAuthImportCallback))
 	h.mux.HandleFunc("GET /oauth/callback", h.oauthCallback)
 	return h
 }
@@ -628,9 +645,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if req.ConversationID == "" {
-		req.ConversationID = r.Header.Get("X-Codearts-Chat-Id")
+	affinity := r.Header.Get("X-Codearts-Chat-Id")
+	if affinity == "" {
+		affinity = r.Header.Get("X-Session-Affinity")
 	}
+	if affinity == "" {
+		affinity = r.Header.Get("X-Session-Id")
+	}
+	req.ConversationID = conversationIDFor(req, affinity)
 
 	toolsOn := toolsActive(req)
 	model := h.cfg.DefaultModel
@@ -638,36 +660,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		model = req.Model
 	}
 
-	// 仅当客户端显式传入 conversation_id / X-Codearts-Chat-Id 时续会话。
-	// 自动复用账号级 chat_id 会把无关历史拼进下一次独立请求（如测连 "hi"），
-	// 上游可能回 related_question_answer 或残留上下文，表现为「不相干 JSON」。
-	explicitChat := req.ConversationID != "" && validChatID(req.ConversationID)
-	msgs := buildUpstreamMessages(req, toolsOn, explicitChat)
-
-	// 黏性路由：客户端带 conversation_id 续接时锁定原账号，减少上游并发会话占用。
+	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
+	// 为整条 Agent 工具链固定 CodeArts 内置 chat_id 与账号亲和。V2 接口
+	// 不保留语义上下文，所以每轮仍重放完整 OpenAI 历史。
+	explicitChat := validChatID(req.ConversationID)
 	stickyAcct := ""
 	if explicitChat {
 		h.convMu.Lock()
 		stickyAcct = h.convAcct[req.ConversationID]
 		h.convMu.Unlock()
 	}
+	msgs := buildUpstreamMessages(req, toolsOn)
 
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
-			// 续接会话：锁定原账号（仍健康且目录里有这个模型）。
+			// 续接会话：锁定原账号（若仍健康）。
 			acct = h.cfg.Pool.Get(stickyAcct)
-			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) || !h.accountCanServe(acct, model) {
+			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
 				stickyAcct = ""
-				acct = h.pickAccount(tried, model)
+				acct = h.cfg.Pool.PickExcluding(tried)
 			} else {
 				tried[acct.Name] = true
 			}
 		}
 		if acct == nil {
-			acct = h.pickAccount(tried, model)
+			acct = h.cfg.Pool.PickExcluding(tried)
 		}
 		if acct == nil {
 			break
@@ -715,17 +735,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			MaxTokens:       req.MaxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
+			Tools:           req.Tools,
+			ToolChoice:      nativeToolChoice(req.ToolChoice),
 		}
-		// 上游并发会话上限（TM.00001041）是瞬时的：已完成的会话槽位释放较慢
-		//（实测 >15s）。遇到时等待后重试同一账号，最多 10 次（每次 5s，共 50s）。
+		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
+		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
 		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
-		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
-		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
-		benefit := upstream.IsBenefitModel(acct.UID, model)
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
-		for retry := 0; retry < 10; retry++ {
+		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
+		benefit := upstream.IsBenefitModel(acct.UID, model)
+		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
 			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
 			if serr == nil {
 				break
@@ -746,12 +767,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					log.Printf("upstream 401 account=%s: refresh before retry failed: %v", acct.Name, rerr)
 				}
 			}
-			if errors.As(serr, &ae) && ae.Status == 400 && isConcurrentLimitError(ae.Message) {
-				log.Printf("upstream concurrent limit retry=%d account=%s, waiting 5s", retry+1, acct.Name)
+			if errors.As(serr, &ae) && isQueueLimitError(ae) {
+				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
 				h.cfg.Pool.ReleaseLock(acct.Name)
 				select {
-				case <-time.After(5 * time.Second):
+				case <-time.After(h.cfg.QueueRetryDelay):
 				case <-r.Context().Done():
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
@@ -786,7 +807,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.convMu.Unlock()
 			h.saveChats()
 		}
-		if req.Stream && !toolsOn {
+		if req.Stream {
 			werr := upstream.StreamCapture(w, rc, model, func(comp *upstream.RawCompletion) {
 				storeChat()
 				// 流式传输中定期保活
@@ -813,23 +834,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		content, finish := comp.Content, comp.Finish
-		var calls []openAIToolCall
-		if toolsOn {
-			if c, rest, found := extractToolCalls(comp.Content); found {
+		calls := fromUpstreamToolCalls(comp.ToolCalls)
+		// 原生 tool_calls 是 GLM-5.2 的主路径。仅保留文本协议解析作为
+		// 旧模型/异常输出的兼容兜底，并同时检查 reasoning_content，
+		// 避免模型把工具 JSON 放到思考通道时错误以 stop 结束。
+		if toolsOn && len(calls) == 0 {
+			if c, cleanContent, found := toolResponse(comp.Content + "\n" + comp.Reasoning); found {
 				calls = c
 				assignCallIDs(calls)
-				content = rest
+				content = cleanContent
 				finish = "tool_calls"
 			}
+		}
+		if len(calls) > 0 {
+			finish = "tool_calls"
 		}
 		storeChat()
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
-		if req.Stream {
-			h.emitSyntheticStream(w, model, comp.Reasoning, content, calls, finish)
-		} else {
-			writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
-		}
+		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
 		return
 	}
 	msg := "all accounts unavailable (disabled/cooldown)"
@@ -839,91 +862,116 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 
-// buildUpstreamMessages 把 OpenAI 消息转成 CodeArts raw payload（content block 数组）。
-//
-// 核心修复：不再只发单条消息（prompt_tokens:0、上下文污染），
-// 而是发送完整的 raw JSON payload，让 upstream 正确接收消息和 system。
-// 这解决了 "底层请求就有问题" 的根本原因。
-// 修改版：使用更通用的客户端标识以避免被识别为测试请求
-func buildUpstreamMessages(req *chatRequest, toolsOn bool, continueChat bool) []upstream.ChatMessage {
-	var toolsBlock string
-	if toolsOn {
-		toolsBlock = buildToolsPrompt(normalizeTools(req.Tools), req.ToolChoice)
+// buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
+// Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
+func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessage {
+	_ = toolsOn // 保留参数以稳定内部调用面；工具 schema 由 ChatOptions 原生传递。
+	keepCalls, keepResults := pairedToolMessages(req.Messages)
+	out := make([]upstream.ChatMessage, 0, len(req.Messages))
+	for i, m := range req.Messages {
+		switch m.Role {
+		case "system", "user":
+			out = append(out, upstream.ChatMessage{Role: m.Role, Content: m.Text})
+		case "assistant":
+			reasoning := m.ReasoningContent
+			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
+			if keepCalls[i] {
+				for _, c := range m.ToolCalls {
+					wire.ToolCalls = append(wire.ToolCalls, upstream.ChatToolCall{
+						ID: c.ID, Type: "function",
+						Function: upstream.ChatToolFunction{Name: c.Name, Arguments: c.Arguments},
+					})
+				}
+				if m.Text == "" {
+					wire.Content = nil
+				}
+			}
+			out = append(out, wire)
+		case "tool":
+			if keepResults[i] {
+				content := m.Text
+				if content == "" {
+					content = "(no output)"
+				}
+				out = append(out, upstream.ChatMessage{
+					Role: "tool", Content: content, ToolCallID: m.ToolCallID, Name: m.Name,
+				})
+			}
+		}
 	}
+	return out
+}
 
-	var prompt string
-	if continueChat {
-		// 续接会话只发尾部增量（通常是 tool 结果 + 最新 user）
-		tail := req.Messages
-		for i := len(req.Messages) - 1; i >= 0; i-- {
-			if req.Messages[i].Role == "user" {
-				tail = req.Messages[i:]
+// pairedToolMessages 只保留完整成对的 assistant.tool_calls + tool results。
+// CodeArts 会对孤儿或部分成对的工具历史返回 400，并使后续每轮持续失败。
+func pairedToolMessages(messages []openAIMessage) (map[int]bool, map[int]bool) {
+	resultIndex := make(map[string]int)
+	for i, m := range messages {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			resultIndex[m.ToolCallID] = i
+		}
+	}
+	keepCalls := make(map[int]bool)
+	keepResults := make(map[int]bool)
+	for i, m := range messages {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		complete := true
+		for _, c := range m.ToolCalls {
+			if c.ID == "" {
+				complete = false
+				break
+			}
+			if _, ok := resultIndex[c.ID]; !ok {
+				complete = false
 				break
 			}
 		}
-		prompt = renderTailPrompt(tail, toolsBlock)
-	} else {
-		prompt = renderFullPrompt(req.Messages, toolsBlock)
+		if !complete {
+			continue
+		}
+		keepCalls[i] = true
+		for _, c := range m.ToolCalls {
+			keepResults[resultIndex[c.ID]] = true
+		}
 	}
-	return []upstream.ChatMessage{{Type: "text", Text: prompt}}
+	return keepCalls, keepResults
+}
+
+func nativeToolChoice(choice toolChoiceOpenAI) any {
+	switch choice.Mode {
+	case "none", "required":
+		return choice.Mode
+	case "function":
+		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Function}}
+	default:
+		return "auto"
+	}
+}
+
+func fromUpstreamToolCalls(calls []upstream.ChatToolCall) []openAIToolCall {
+	out := make([]openAIToolCall, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, openAIToolCall{ID: c.ID, Name: c.Function.Name, Arguments: c.Function.Arguments})
+	}
+	assignCallIDs(out)
+	return out
 }
 
 func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) map[string]int {
 	var pt int
 	for _, m := range msgs {
-		pt += len([]rune(m.Text))/4 + 1
+		switch content := m.Content.(type) {
+		case string:
+			pt += len([]rune(content))/4 + 1
+		default:
+			raw, _ := json.Marshal(content)
+			pt += len([]rune(string(raw)))/4 + 1
+		}
 	}
 	ct := (len([]rune(comp.Content))+len([]rune(comp.Reasoning)))/4 + 1
 	return map[string]int{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
-}
-
-// emitSyntheticStream 工具场景：聚合后合成 OpenAI SSE。
-func (h *Handler) emitSyntheticStream(w http.ResponseWriter, model, reasoning, content string, calls []openAIToolCall, finish string) {
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream")
-	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
-	header.Set("X-Accel-Buffering", "no")
-	fl, _ := w.(http.Flusher)
-	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-
-	writeChunk := func(delta map[string]any, fin string) {
-		choice := map[string]any{"index": 0, "delta": delta}
-		if fin != "" {
-			choice["finish_reason"] = fin
-		}
-		chunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   model,
-			"choices": []any{choice},
-		}
-		raw, _ := json.Marshal(chunk)
-		_, _ = io.WriteString(w, "data: "+string(raw)+"\n\n")
-		if fl != nil {
-			fl.Flush()
-		}
-	}
-	if reasoning != "" {
-		writeChunk(map[string]any{"reasoning_content": reasoning}, "")
-	}
-	if content != "" {
-		writeChunk(map[string]any{"content": content}, "")
-	}
-	for i, c := range calls {
-		writeChunk(map[string]any{"tool_calls": []any{
-			map[string]any{"index": i, "id": c.ID, "type": "function", "function": map[string]any{"name": c.Name, "arguments": ""}},
-		}}, "")
-		writeChunk(map[string]any{"tool_calls": []any{
-			map[string]any{"index": i, "function": map[string]any{"arguments": c.Arguments}},
-		}}, "")
-	}
-	writeChunk(map[string]any{}, finish)
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	if fl != nil {
-		fl.Flush()
-	}
 }
 
 // buildCompletion 组装非流式响应。
@@ -989,6 +1037,19 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 func isConcurrentLimitError(msg string) bool {
 	low := strings.ToLower(msg)
 	return strings.Contains(low, "tm.00001041") || strings.Contains(low, "并发会话")
+}
+
+func isQueueLimitError(err *upstream.ApiError) bool {
+	if err == nil {
+		return false
+	}
+	if err.Status == http.StatusTooManyRequests {
+		return true
+	}
+	low := strings.ToLower(err.Message)
+	return (err.Status == http.StatusBadRequest && isConcurrentLimitError(low)) ||
+		strings.Contains(low, "inferhub.modelarts.81111.429") ||
+		strings.Contains(low, "tpm limit")
 }
 
 func truncateMsg(s string, n int) string {

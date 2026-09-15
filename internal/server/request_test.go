@@ -15,15 +15,12 @@ func TestBuildUpstreamMessagesNewChat(t *testing.T) {
 			{Role: "user", Text: "again"},
 		},
 	}
-	msgs := buildUpstreamMessages(req, false, false)
-	if len(msgs) != 1 {
+	msgs := buildUpstreamMessages(req, false)
+	if len(msgs) != 4 {
 		t.Fatalf("msgs=%d", len(msgs))
 	}
-	if !strings.Contains(msgs[0].Text, "be nice") || !strings.Contains(msgs[0].Text, "again") {
-		t.Fatalf("full prompt missing pieces: %q", msgs[0].Text)
-	}
-	if !strings.Contains(msgs[0].Text, "[对话历史]") {
-		t.Fatalf("expected history fold for multi-turn: %q", msgs[0].Text)
+	if msgs[0].Role != "system" || msgs[0].Content != "be nice" || msgs[3].Role != "user" || msgs[3].Content != "again" {
+		t.Fatalf("native messages lost roles/content: %#v", msgs)
 	}
 }
 
@@ -35,16 +32,56 @@ func TestBuildUpstreamMessagesContinueChat(t *testing.T) {
 			{Role: "user", Text: "again"},
 		},
 	}
-	msgs := buildUpstreamMessages(req, false, true)
-	if len(msgs) != 1 {
+	msgs := buildUpstreamMessages(req, false)
+	if len(msgs) != 3 {
 		t.Fatalf("msgs=%d", len(msgs))
 	}
-	// 续聊只发尾部，不该再塞完整 system+历史
-	if strings.Contains(msgs[0].Text, "be nice") || strings.Contains(msgs[0].Text, "[对话历史]") {
-		t.Fatalf("continue should be tail-only: %q", msgs[0].Text)
+	// V2 不依赖服务端持续 Agent 语义状态：完整历史以原生 role 重放。
+	if msgs[0].Role != "system" || msgs[1].Content != "hi" || msgs[2].Content != "again" {
+		t.Fatalf("continue omitted native history: %#v", msgs)
 	}
-	if msgs[0].Text != "again" {
-		t.Fatalf("tail=%q", msgs[0].Text)
+}
+
+func TestBuildUpstreamMessagesContinueToolTurnReplaysStatelessHistory(t *testing.T) {
+	req := &chatRequest{
+		Messages: []openAIMessage{
+			{Role: "system", Text: "be nice"},
+			{Role: "user", Text: "inspect the repository"},
+			{Role: "assistant", ToolCalls: []openAIToolCall{{ID: "call_1", Name: "bash", Arguments: `{"command":"pwd"}`}}},
+			{Role: "tool", ToolCallID: "call_1", Name: "bash", Text: "/workspace"},
+		},
+	}
+	msgs := buildUpstreamMessages(req, true)
+	if len(msgs) != 4 {
+		t.Fatalf("msgs=%d", len(msgs))
+	}
+	if msgs[1].Role != "user" || msgs[1].Content != "inspect the repository" {
+		t.Fatalf("tool continuation omitted original task: %#v", msgs)
+	}
+	if msgs[2].Role != "assistant" || len(msgs[2].ToolCalls) != 1 || msgs[2].ToolCalls[0].Function.Name != "bash" {
+		t.Fatalf("assistant tool call was not native: %#v", msgs[2])
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "call_1" || msgs[3].Content != "/workspace" {
+		t.Fatalf("tool result was not native: %#v", msgs[3])
+	}
+}
+
+func TestBuildUpstreamMessagesDropsIncompleteToolBatch(t *testing.T) {
+	req := &chatRequest{Messages: []openAIMessage{
+		{Role: "user", Text: "inspect"},
+		{Role: "assistant", Text: "still useful", ToolCalls: []openAIToolCall{
+			{ID: "call_1", Name: "read", Arguments: `{}`},
+			{ID: "call_2", Name: "bash", Arguments: `{}`},
+		}},
+		{Role: "tool", ToolCallID: "call_1", Text: "partial"},
+		{Role: "user", Text: "continue"},
+	}}
+	msgs := buildUpstreamMessages(req, true)
+	if len(msgs) != 3 {
+		t.Fatalf("orphan tool result should be dropped: %#v", msgs)
+	}
+	if msgs[1].Role != "assistant" || len(msgs[1].ToolCalls) != 0 || msgs[1].Content != "still useful" {
+		t.Fatalf("incomplete tool call batch should be stripped: %#v", msgs[1])
 	}
 }
 
@@ -60,7 +97,7 @@ func TestParseChatRequest(t *testing.T) {
 		"messages":[
 			{"role":"system","content":"be nice"},
 			{"role":"user","content":"hi"},
-			{"role":"assistant","content":"hello"},
+			{"role":"assistant","content":"hello","reasoning_content":"thought"},
 			{"role":"user","content":[{"type":"text","text":"again"}]},
 			{"role":"tool","tool_call_id":"call_1","content":"ok"}
 		],
@@ -88,6 +125,9 @@ func TestParseChatRequest(t *testing.T) {
 	}
 	if req.Messages[3].Text != "again" {
 		t.Fatalf("fragmented content=%q", req.Messages[3].Text)
+	}
+	if req.Messages[2].ReasoningContent != "thought" {
+		t.Fatalf("reasoning content=%q", req.Messages[2].ReasoningContent)
 	}
 	if req.Messages[4].Role != "tool" || req.Messages[4].ToolCallID != "call_1" {
 		t.Fatalf("tool msg=%+v", req.Messages[4])
@@ -164,6 +204,38 @@ func TestFingerprintStableAndReplay(t *testing.T) {
 	replay = append(replay, assistant)
 	if fingerprintOf(replay) != after {
 		t.Fatalf("replay fingerprint mismatch: %s vs %s", fingerprintOf(replay), after)
+	}
+}
+
+func TestConversationIDStaysStableAsOpenAIHistoryGrows(t *testing.T) {
+	first := openAIMessage{Role: "user", Text: "开始一个长时间代码审计"}
+	round1 := &chatRequest{Messages: []openAIMessage{
+		{Role: "system", Text: "time=1"},
+		first,
+	}}
+	round2 := &chatRequest{Messages: []openAIMessage{
+		{Role: "system", Text: "time=2"},
+		first,
+		{Role: "assistant", ToolCalls: []openAIToolCall{{ID: "call_1", Name: "bash", Arguments: `{"command":"pwd"}`}}},
+		{Role: "tool", ToolCallID: "call_1", Text: "/workspace"},
+	}}
+
+	id1 := conversationIDFor(round1, "")
+	id2 := conversationIDFor(round2, "")
+	if id1 == "" || id1 != id2 || !validChatID(id1) {
+		t.Fatalf("conversation IDs are not stable valid chat IDs: %q vs %q", id1, id2)
+	}
+}
+
+func TestConversationIDSeparatesTitleChatFromToolAgent(t *testing.T) {
+	first := openAIMessage{Role: "user", Text: "inspect the repository"}
+	title := &chatRequest{Messages: []openAIMessage{first}}
+	agent := &chatRequest{
+		Messages: []openAIMessage{first},
+		Tools:    []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}},
+	}
+	if conversationIDFor(title, "") == conversationIDFor(agent, "") {
+		t.Fatal("title generation and tool agent must not share CodeArts built-in chat state")
 	}
 }
 

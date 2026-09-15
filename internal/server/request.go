@@ -22,11 +22,12 @@ type openAIToolCall struct {
 
 // openAIMessage 拍平后的一条消息。
 type openAIMessage struct {
-	Role       string
-	Text       string
-	ToolCalls  []openAIToolCall
-	ToolCallID string // role=tool 时对应的 call id
-	Name       string // role=tool 时的函数名（部分客户端会带）
+	Role             string
+	Text             string
+	ReasoningContent string
+	ToolCalls        []openAIToolCall
+	ToolCallID       string // role=tool 时对应的 call id
+	Name             string // role=tool 时的函数名（部分客户端会带）
 }
 
 // toolChoiceOpenAI 归一化后的 tool_choice。
@@ -117,20 +118,22 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 // parseMessage 解析单条消息：content 支持 string 与 [{type:text,text}] 分片。
 func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 	var probe struct {
-		Role       string          `json:"role"`
-		Content    json.RawMessage `json:"content"`
-		ToolCalls  json.RawMessage `json:"tool_calls"`
-		ToolCallID string          `json:"tool_call_id"`
-		Name       string          `json:"name"`
+		Role             string          `json:"role"`
+		Content          json.RawMessage `json:"content"`
+		ReasoningContent string          `json:"reasoning_content"`
+		ToolCalls        json.RawMessage `json:"tool_calls"`
+		ToolCallID       string          `json:"tool_call_id"`
+		Name             string          `json:"name"`
 	}
 	if err := json.Unmarshal(rm, &probe); err != nil {
 		return openAIMessage{}, err
 	}
 	m := openAIMessage{
-		Role:       strings.ToLower(strings.TrimSpace(probe.Role)),
-		Text:       flattenContent(probe.Content),
-		ToolCallID: probe.ToolCallID,
-		Name:       probe.Name,
+		Role:             strings.ToLower(strings.TrimSpace(probe.Role)),
+		Text:             flattenContent(probe.Content),
+		ReasoningContent: probe.ReasoningContent,
+		ToolCallID:       probe.ToolCallID,
+		Name:             probe.Name,
 	}
 	if len(probe.ToolCalls) > 0 && string(probe.ToolCalls) != "null" {
 		var calls []struct {
@@ -279,4 +282,33 @@ func fingerprintOf(msgs []openAIMessage) string {
 		fp = chainFingerprint(fp, m)
 	}
 	return fp
+}
+
+// conversationIDFor 为不带会话 ID 的 OpenAI 客户端提供稳定的 CodeArts chat_id。
+// Agent 工具链的历史会持续增长，但首条 user 消息不变，因此可作为会话锚点。
+func conversationIDFor(req *chatRequest, headerValue string) string {
+	for _, explicit := range []string{req.ConversationID, headerValue} {
+		explicit = strings.TrimSpace(explicit)
+		if explicit == "" {
+			continue
+		}
+		if validChatID(explicit) {
+			return strings.ToLower(explicit)
+		}
+		sum := sha256.Sum256([]byte(explicit))
+		return hex.EncodeToString(sum[:16])
+	}
+	for _, message := range req.Messages {
+		if message.Role == "user" {
+			anchor := canonical(message)
+			if len(req.Tools) > 0 {
+				// OpenCode 会用同一用户消息先请求无工具的会话标题，再启动工具 Agent。
+				// 两者必须分开，否则标题生成会污染内置 Agent 会话。
+				anchor += "\x00tools"
+			}
+			sum := sha256.Sum256([]byte(anchor))
+			return hex.EncodeToString(sum[:16])
+		}
+	}
+	return ""
 }

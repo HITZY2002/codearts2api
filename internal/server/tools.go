@@ -101,20 +101,20 @@ func extractToolCalls(text string) (calls []openAIToolCall, rest string, found b
 		block := rest[bodyStart : bodyStart+end]
 		if c, ok := parseCallBlock(block); ok {
 			calls = append(calls, c...)
-			rest = strings.TrimSpace(rest[:start] + " " + rest[bodyStart+end+3:])
-		} else {
-			break // 有围栏但解析失败，不硬吞，交给上层按纯文本处理
 		}
+		// 显式标记为 tool_call 的围栏属于内部协议。即使单个块损坏也丢弃该块
+		// 并继续查找后续有效调用，不得将协议原文作为 assistant content 泄漏。
+		rest = strings.TrimSpace(rest[:start] + " " + rest[bodyStart+end+3:])
 	}
 	if len(calls) > 0 {
-		return calls, rest, true
+		return calls, stripToolWrappers(rest), true
 	}
 	// 2. 兜底：找含 "tool_calls" 键的 JSON 对象（裸 JSON 回复）。
 	if idx := strings.Index(rest, "\"tool_calls\""); idx >= 0 {
 		if objStart := strings.LastIndex(rest[:idx], "{"); objStart >= 0 {
 			if obj, end := scanJSONObject(rest, objStart); obj != "" {
 				if c, ok := parseToolCallsJSON(obj); ok {
-					return c, strings.TrimSpace(rest[:objStart] + " " + rest[end:]), true
+					return c, stripToolWrappers(rest[:objStart] + " " + rest[end:]), true
 				}
 			}
 		}
@@ -124,10 +124,30 @@ func extractToolCalls(text string) (calls []openAIToolCall, rest string, found b
 		if objStart := strings.LastIndex(rest[:idx], "{"); objStart >= 0 {
 			if obj, end := scanJSONObject(rest, objStart); obj != "" {
 				if c, ok := parseCallBlock(obj); ok {
-					return c, strings.TrimSpace(rest[:objStart] + " " + rest[end:]), true
+					return c, stripToolWrappers(rest[:objStart] + " " + rest[end:]), true
 				}
 			}
 		}
+	}
+	return nil, text, false
+}
+
+func stripToolWrappers(text string) string {
+	replacer := strings.NewReplacer(
+		"<tool_call>", "",
+		"</tool_call>", "",
+		"<|tool_call|>", "",
+		"<|/tool_call|>", "",
+	)
+	return strings.TrimSpace(replacer.Replace(text))
+}
+
+// toolResponse 把提示词模拟的工具调用转为 OpenAI 结构。一旦存在调用，
+// 上游剩余文本不可信（可能是协议/工具历史复述），因此不作为 content 暴露。
+func toolResponse(text string) (calls []openAIToolCall, content string, found bool) {
+	calls, _, found = extractToolCalls(text)
+	if found {
+		return calls, "", true
 	}
 	return nil, text, false
 }

@@ -210,17 +210,23 @@ input{font:inherit}
       <div class="steps">
         <div><b>1.</b> 点击下方按钮在浏览器打开授权页</div>
         <div><b>2.</b> 使用目标账号完成登录 / 授权</div>
-        <div><b>3.</b> 回到本页，等待自动检测或点「我已授权」</div>
+        <div><b>3.</b> 若浏览器停在 127.0.0.1，把地址栏中的完整回调地址粘贴到下方</div>
+        <div><b>4.</b> 回到本页，等待自动检测或点「我已授权」</div>
       </div>
       <div>
         <div class="muted" style="font-size:12px;margin-bottom:6px">授权链接</div>
         <div class="urlbox" id="oauthUrl">（发起后显示）</div>
+      </div>
+      <div>
+        <div class="muted" style="font-size:12px;margin-bottom:6px">远程浏览器回调中转</div>
+        <input id="oauthCallbackUrl" type="url" placeholder="http://127.0.0.1:7866/oauth/callback?..." autocomplete="off"/>
       </div>
       <div class="status-line muted" id="oauthStatus">尚未开始</div>
     </div>
     <div class="modal-f">
       <button class="btn" id="oauthCopy" type="button" disabled>复制链接</button>
       <button class="btn" id="oauthOpen" type="button" disabled>打开授权页</button>
+      <button class="btn" id="oauthImport" type="button" disabled>提交回调地址</button>
       <button class="btn" id="oauthPoll" type="button" disabled>我已授权</button>
       <button class="btn primary" id="oauthStart" type="button">发起授权</button>
     </div>
@@ -432,8 +438,10 @@ function openOAuthModal(){
   oauthSessionId = "";
   stopOAuthPoll();
   $("oauthUrl").textContent = "（发起后显示）";
+  $("oauthCallbackUrl").value = "";
   $("oauthCopy").disabled = true;
   $("oauthOpen").disabled = true;
+  $("oauthImport").disabled = true;
   $("oauthPoll").disabled = true;
   setOAuthStatus("点击「发起授权」开始", null);
 }
@@ -455,6 +463,7 @@ async function startOAuth(){
     $("oauthUrl").textContent = data.auth_url;
     $("oauthCopy").disabled = false;
     $("oauthOpen").disabled = false;
+    $("oauthImport").disabled = false;
     $("oauthPoll").disabled = false;
     setOAuthStatus("已生成链接，请打开授权页完成登录。正在自动检测…", null);
     // 自动打开
@@ -469,6 +478,35 @@ async function startOAuth(){
   } finally {
     oauthBusy = false;
     $("oauthStart").disabled = false;
+  }
+}
+
+async function importOAuthCallback(){
+  const callbackUrl = $("oauthCallbackUrl").value.trim();
+  if (!oauthSessionId || !callbackUrl) {
+    setOAuthStatus("请先发起授权，再粘贴浏览器地址栏中的完整 127.0.0.1 回调地址", false);
+    return;
+  }
+  $("oauthImport").disabled = true;
+  setOAuthStatus('<span class="spin"></span>正在中转回调…', null);
+  try {
+    const data = await api("/admin/api/oauth/import-callback", {
+      method:"POST",
+      body: JSON.stringify({session_id: oauthSessionId, callback_url: callbackUrl})
+    });
+    if (!data.ok) throw new Error(data.message || "回调中转失败");
+    $("oauthCallbackUrl").value = "";
+    setOAuthStatus(data.message || "回调已接收，继续等待授权结果…", null);
+    if (data.next_url) {
+      $("oauthUrl").textContent = data.next_url;
+      try { window.open(data.next_url, "_blank", "noopener,noreferrer"); } catch {}
+    }
+    setTimeout(() => pollOAuth(true), 500);
+  } catch (e) {
+    setOAuthStatus("回调中转失败: " + e.message, false);
+    toast(e.message, false);
+  } finally {
+    $("oauthImport").disabled = false;
   }
 }
 
@@ -515,6 +553,7 @@ $("oauthClose").onclick = closeOAuthModal;
 $("oauthModal").addEventListener("click", (e) => { if (e.target === $("oauthModal")) closeOAuthModal(); });
 $("oauthStart").onclick = startOAuth;
 $("oauthPoll").onclick = () => pollOAuth(false);
+$("oauthImport").onclick = importOAuthCallback;
 $("oauthOpen").onclick = () => {
   const u = $("oauthUrl").textContent.trim();
   if (u && u.startsWith("http")) window.open(u, "_blank", "noopener,noreferrer");

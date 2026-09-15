@@ -8,6 +8,7 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	crand "crypto/rand"
@@ -62,7 +63,20 @@ type TokenResponse struct {
 	RefreshToken string           `json:"refresh_token"`
 	Credentials  Credentials      `json:"credentials"`
 	Credential   LegacyCredential `json:"credential"`
+	// 错误字段（refresh 失败时上游会返回 error_code/error_msg）。
+	Error        string `json:"error"`
+	ErrorCode    string `json:"error_code"`
+	ErrorMessage string `json:"error_msg"`
 }
+
+// RefreshTokenExpiredError 表示续期凭据已终态失效，需要重新登录；
+// 它与网络/5xx 等可重试错误分开，避免无限刷新。
+type RefreshTokenExpiredError struct {
+	Status  int
+	Message string
+}
+
+func (e *RefreshTokenExpiredError) Error() string { return e.Message }
 
 // LoginConfig 登录相关配置。
 type LoginConfig struct {
@@ -96,6 +110,8 @@ type Client struct {
 	// 上游主机，生产固定为华为云；测试可替换为 httptest 服务。
 	snapBase    string
 	benefitBase string
+	// chatURL chat-completions 完整地址覆盖（测试注入用，留空走 snapBase）。
+	chatURL string
 
 	// claimAuto 模型发现时是否自动领取限时福利。
 	// 默认开启：不领取时福利模型一律返回 InferHub.4004.200 benefit not found
@@ -132,6 +148,24 @@ func New(timeout time.Duration) *Client {
 	}
 	c.claimAuto.Store(true)
 	return c
+}
+
+// NewWithChatEndpoint 构造指向自定义 chat-completions 端点的客户端。
+// 主要用于端到端测试：仅替换外部 CodeArts HTTP 边界，其余请求链保持真实。
+func NewWithChatEndpoint(timeout time.Duration, endpoint string) *Client {
+	c := New(timeout)
+	if strings.TrimSpace(endpoint) != "" {
+		c.chatURL = endpoint
+	}
+	return c
+}
+
+// chatEndpoint 返回本次请求要用的 chat-completions 地址。
+func (c *Client) chatEndpoint() string {
+	if c.chatURL != "" {
+		return c.chatURL
+	}
+	return c.snapURL(EpChatV2)
 }
 
 // SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
@@ -186,14 +220,15 @@ func (c *Client) clearSrcFail(key string) {
 // BuildAuthorizeURL 构造 portal 登录链接（PKCE）。
 // ticketID 客户端生成的随机 hex；port 为本地回调端口。
 func (c *Client) BuildAuthorizeURL(cfg LoginConfig, ticketID, codeChallenge, codeChallengeMethod string, port int) string {
+	_ = codeChallengeMethod // Portal 只识别实际插件使用的 "SHA-256"。
 	q := url.Values{}
-	q.Set("theme", "dark")
+	q.Set("theme", "2")
 	q.Set("locale", "zh-cn")
 	q.Set("uri_scheme", cfg.ClientID)
 	q.Set("client_id", cfg.ClientID)
 	q.Set("port", fmt.Sprint(port))
 	q.Set("code_challenge", codeChallenge)
-	q.Set("code_challenge_method", codeChallengeMethod)
+	q.Set("code_challenge_method", "SHA-256")
 	q.Set("ticket_id", ticketID)
 	q.Set("plugin-name", cfg.PluginName)
 	q.Set("plugin-version", cfg.PluginVersion)
@@ -272,6 +307,21 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
+		// 刷新通道的「终态失效」要单独识别：继续重试没有意义，必须重新登录。
+		if form.Get("grant_type") == "refresh_token" {
+			var tokenErr TokenResponse
+			_ = json.Unmarshal(raw, &tokenErr)
+			code := tokenErr.ErrorCode
+			if tokenErr.Error == "invalid_grant" || strings.Contains(code, "ExpiredRefreshToken") ||
+				strings.Contains(code, "InvalidDPoPHeader") || strings.Contains(code, "invalid client id") ||
+				strings.Contains(strings.ToLower(tokenErr.ErrorMessage), "has been used") {
+				return nil, &RefreshTokenExpiredError{
+					Status: resp.StatusCode,
+					Message: fmt.Sprintf("refresh_token expired or rejected: http=%d error=%s code=%s msg=%s",
+						resp.StatusCode, tokenErr.Error, tokenErr.ErrorCode, truncateStr(tokenErr.ErrorMessage, 160)),
+				}
+			}
+		}
 		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpOAuthTokens}
 	}
 	var out TokenResponse
@@ -322,9 +372,32 @@ func (c *Client) PollTicket(ctx context.Context, cfg LoginConfig, ticketID, secr
 // ---------------------------------------------------------------------------
 
 // ChatMessage 单条消息（实测：Anthropic 风格内容块，无 role）。
+type ChatToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type ChatToolCall struct {
+	Index    int              `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function ChatToolFunction `json:"function"`
+}
+
+// ChatMessage 是 /api/v2/chat/completions 的原生 OpenAI 消息。
+//
+// Type/Text 只保留给 cmd/probe 等旧调试入口；服务请求使用
+// Role/Content/ReasoningContent/ToolCalls/ToolCallID，不再把多轮对话压成单条 user prompt。
 type ChatMessage struct {
-	Type string `json:"type"` // "text"
-	Text string `json:"text"`
+	Role             string         `json:"role,omitempty"`
+	Content          any            `json:"content"`
+	ReasoningContent *string        `json:"reasoning_content,omitempty"`
+	ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	Name             string         `json:"name,omitempty"`
+
+	Type string `json:"-"` // legacy debug input
+	Text string `json:"-"` // legacy debug input
 }
 
 // ChatOptions 是需要原样传给 OpenAI 兼容上游的可选生成参数。
@@ -333,6 +406,8 @@ type ChatOptions struct {
 	MaxTokens       *int
 	Temperature     *float64
 	TopP            *float64
+	Tools           []map[string]any
+	ToolChoice      any
 }
 
 // CanonicalModel 把用户友好模型 ID 映射为上游 InferHub 注册的模型 ID。
@@ -393,10 +468,21 @@ func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatM
 
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
 func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
+	body := chatBodyV2(chatID, messages, model, opts)
+	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit)
+}
+
+// chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
+func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOptions) map[string]any {
 	body := map[string]any{
-		"model":    CanonicalModel(model),
-		"stream":   true,
-		"messages": chatMessagesToOpenAI(messages),
+		"model":            CanonicalModel(model),
+		"stream":           true,
+		"messages":         chatMessagesToOpenAI(messages),
+		"prompt_cache_key": chatID,
+		"tool_stream":      true,
+	}
+	if chatID != "" {
+		body["chat_id"] = chatID
 	}
 	if opts.ReasoningEffort != "" {
 		body["reasoning_effort"] = opts.ReasoningEffort
@@ -410,16 +496,46 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messa
 	if opts.TopP != nil {
 		body["top_p"] = *opts.TopP
 	}
-	return c.SendChatV2(ctx, body, traceID, cred, cred.SecurityToken, benefit)
+	if len(opts.Tools) > 0 {
+		body["tools"] = opts.Tools
+		if opts.ToolChoice != nil {
+			body["tool_choice"] = opts.ToolChoice
+		}
+	}
+	return body
 }
 
-// chatMessagesToOpenAI 把上游消息折叠为 OpenAI user 消息。
+// chatMessagesToOpenAI 保留标准 role/tool_calls/tool 结果；只对旧调试
+// 入口的 Type/Text 消息降级为 user 文本。
 func chatMessagesToOpenAI(msgs []ChatMessage) []map[string]any {
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, map[string]any{"role": "user", "content": m.Text})
+		if m.Role == "" {
+			out = append(out, map[string]any{"role": "user", "content": m.Text})
+			continue
+		}
+		wire := map[string]any{"role": m.Role, "content": m.Content}
+		if m.ReasoningContent != nil {
+			wire["reasoning_content"] = *m.ReasoningContent
+		}
+		if len(m.ToolCalls) > 0 {
+			wire["tool_calls"] = m.ToolCalls
+		}
+		if m.ToolCallID != "" {
+			wire["tool_call_id"] = m.ToolCallID
+		}
+		if m.Name != "" {
+			wire["name"] = m.Name
+		}
+		out = append(out, wire)
 	}
 	return out
+}
+
+// sessionIDFor 由 chatID 派生的稳定会话标识（prompt cache 亲和）。
+func sessionIDFor(chatID string) string {
+	sum := sha256.Sum256([]byte("codearts-session:" + chatID))
+	return hex.EncodeToString(sum[:16])
 }
 
 // SendChatV2 发送自定义 OpenAI 兼容 body 到 /api/v2/chat/completions。
@@ -427,8 +543,16 @@ func chatMessagesToOpenAI(msgs []ChatMessage) []map[string]any {
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
 // 计入 SignedHeaders。
 func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
+	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
+}
+
+// sendChatV2 发送聊天请求并返回 SSE 流。
+//
+// chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
+// benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.snapURL(EpChatV2), bytes.NewReader(raw))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -439,6 +563,12 @@ func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID st
 		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
 	}
 	signRequest(httpReq, raw, cred)
+	if chatID != "" {
+		httpReq.Header.Set("Chat-Id", chatID)
+	}
+	if sessionID != "" {
+		httpReq.Header.Set("Session-Id", sessionID)
+	}
 	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -448,7 +578,65 @@ func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID st
 		resp.Body.Close()
 		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2}
 	}
-	return resp.Body, nil
+	return preflightSSE(resp.Body)
+}
+
+type replayReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// preflightSSE 只读到首个 data 事件：正常事件原样回放，不破坏流式；
+// HTTP 200 里内嵌的 CodeArts 排队/TPM 错误则在响应头发给客户端前
+// 转为 ApiError，让上层可以重试整个请求。
+func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
+	br := bufio.NewReaderSize(body, 1<<20)
+	var prefix bytes.Buffer
+	for prefix.Len() < 2<<20 {
+		line, err := br.ReadString('\n')
+		prefix.WriteString(line)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if apiErr := embeddedSSEError(data); apiErr != nil {
+				_ = body.Close()
+				return nil, apiErr
+			}
+			return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), br), Closer: body}, nil
+		}
+		if err != nil {
+			if err != io.EOF {
+				_ = body.Close()
+				return nil, err
+			}
+			return &replayReadCloser{Reader: bytes.NewReader(prefix.Bytes()), Closer: body}, nil
+		}
+	}
+	return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), br), Closer: body}, nil
+}
+
+// embeddedSSEError 识别 HTTP 200 里内嵌的上游业务错误。
+func embeddedSSEError(data string) *ApiError {
+	if data == "" || data == "[DONE]" {
+		return nil
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(data), &payload) != nil {
+		return nil
+	}
+	code, _ := payload["error_code"].(string)
+	if code == "" || code == "0" {
+		return nil
+	}
+	message, _ := payload["error_msg"].(string)
+	combined := strings.TrimSpace(code + " " + message)
+	status := http.StatusBadGateway
+	low := strings.ToLower(combined)
+	if strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
+		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话") {
+		status = http.StatusTooManyRequests
+	}
+	return &ApiError{Code: status, Status: status, Message: truncateStr(combined, 300), Path: EpChatV2}
 }
 
 // ---------------------------------------------------------------------------
