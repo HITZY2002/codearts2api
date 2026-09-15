@@ -4,6 +4,10 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"codearts2api/internal/auth"
+	"codearts2api/internal/pool"
+	"codearts2api/internal/upstream"
 )
 
 // 上游的「这个模型对这个账号不可用」必须被识别出来，而且不能被当成账号故障
@@ -57,5 +61,33 @@ func TestAvailabilityExpiry(t *testing.T) {
 	availability.Unlock()
 	if st, _ := modelAvailability("acct-exp", "m1"); st != availUnknown {
 		t.Error("过期结论应视为未知")
+	}
+}
+
+// 过滤语义：只有「所有健康账号都判定不可用」才下架；只要还有账号没结论，
+// 或者有一个账号可用，就必须保留（不能让探测没跑完把可用模型藏起来）。
+func TestModelKnownUnusable(t *testing.T) {
+	p, err := pool.New([]*auth.Auth{
+		{UserID: "u1", UserName: "u1"}, {UserID: "u2", UserName: "u2"},
+	}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+
+	if h.modelKnownUnusable("m-keep") {
+		t.Error("无结论时不应下架")
+	}
+	markUnusable("u1", "m-keep", "未注册")
+	if h.modelKnownUnusable("m-keep") {
+		t.Error("还有账号没结论时不应下架")
+	}
+	markUnusable("u2", "m-keep", "未注册")
+	if !h.modelKnownUnusable("m-keep") {
+		t.Error("全部账号都不可用时应下架")
+	}
+	markUsable("u2", "m-keep")
+	if h.modelKnownUnusable("m-keep") {
+		t.Error("有账号可用时不应下架")
 	}
 }

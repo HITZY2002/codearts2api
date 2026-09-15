@@ -363,25 +363,27 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
-	infos := h.fetchDynamicModels()
-	// 过滤掉已知不可用的模型（探测或真实请求学到的结论）：这些条目在客户端
-	// 点开就是 404 / benefit not found，列出来只会误导。
-	if len(infos) > 0 {
-		kept := make([]upstream.ModelInfo, 0, len(infos))
-		for _, mi := range infos {
-			if h.modelUsableAnywhere(mi.ID) {
-				kept = append(kept, mi)
+	entries := modelEntries(h.fetchDynamicModels())
+	// 过滤掉「已知不可用」的模型：这些条目在客户端点开就是 404 / benefit not
+	// found，列出来只会误导。必须作用在最终条目上——静态兜底表也会补位，
+	// 只在动态结果上过滤会让被下架的模型又从静态表冒出来。
+	// 未知（还没探测出结论）的保留：宁可让用户试，也别把可用模型藏起来。
+	if len(entries) > 0 {
+		kept := make([]map[string]any, 0, len(entries))
+		for _, e := range entries {
+			id, _ := e["id"].(string)
+			if !h.modelKnownUnusable(id) {
+				kept = append(kept, e)
 			}
 		}
-		// 全被过滤时保留原列表，避免上游/探测异常导致列表空掉。
 		if len(kept) > 0 {
-			infos = kept
+			entries = kept
 		}
 	}
 	// 刚发现到的模型还没有可用性结论：后台补一轮探测，供后续请求过滤。
 	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
 	h.probeUnknownAsync()
-	return modelEntries(infos)
+	return entries
 }
 
 // probeUnknownAsync 后台探测「还没有结论」的模型，不阻塞请求。
@@ -401,35 +403,28 @@ func (h *Handler) probeUnknownAsync() {
 			availability.sweeping = false
 			availability.Unlock()
 		}()
-		for _, acct := range h.cfg.Pool.Accounts() {
-			if acct == nil || acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
-				continue
-			}
-			models, ok := upstream.AccountModels(acct.UID)
-			if !ok {
-				continue
-			}
-			for _, mi := range models {
-				if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
-					continue
-				}
-				h.probeModel(acct, mi.ID)
-			}
-		}
+		h.runProbes(h.pendingProbes())
 	}()
 }
 
-// modelUsableAnywhere 报告池中是否至少有一个健康账号能用该模型。
-func (h *Handler) modelUsableAnywhere(model string) bool {
+// modelKnownUnusable 报告该模型是否在**所有**健康账号上都被判定为不可用。
+// 只要有一个账号没结论或可用，就返回 false（列表保留该模型）。
+func (h *Handler) modelKnownUnusable(model string) bool {
+	anyKnown, allUnusable := false, true
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
-		if st, _ := modelAvailability(acct.UID, model); st == availUsable {
-			return true
+		st, _ := modelAvailability(acct.UID, model)
+		if st == availUnknown {
+			return false // 还没结论，别急着下架
+		}
+		anyKnown = true
+		if st != availUnusable {
+			allUnusable = false
 		}
 	}
-	return false
+	return anyKnown && allUnusable
 }
 
 // modelEntries 把账号模型目录 + 静态兜底包装成 OpenAI /v1/models 条目。

@@ -32,6 +32,9 @@ const (
 	probeTimeout = 45 * time.Second
 	// probeInterval 后台批量探测间隔。
 	probeInterval = 15 * time.Minute
+	// probeConcurrency 并发探测数。探测本身会占上游会话槽位（单账号 3 个并发），
+	// 且账号并发锁默认 max_concurrent=1，所以这里也用 1：慢一点，但不能干扰真实请求。
+	probeConcurrency = 1
 )
 
 type availState int
@@ -107,10 +110,18 @@ func upstreamUnavailableReason(err error) string {
 }
 
 // probeModel 用一条最小请求真实试一次该模型，并记录结果。
+//
+// 探测会占用上游会话槽位（单账号只有 3 个并发会话），因此这里必须走账号的并发锁：
+// 拿不到锁就让位给真实请求，等下一轮再试——否则用户请求会被探测挤成
+// TM.00001041「并发会话数已达上限」。
 func (h *Handler) probeModel(acct *pool.Account, model string) {
 	if acct == nil || acct.Auth == nil {
 		return
 	}
+	if !h.cfg.Pool.AcquireLock(acct.Name) {
+		return // 账号正忙，让位给真实请求
+	}
+	defer h.cfg.Pool.ReleaseLock(acct.Name)
 	key := availKey(acct.UID, model)
 	availability.Lock()
 	if availability.probing[key] {
@@ -170,6 +181,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		return
 	}
 	markUsable(acct.UID, model)
+	log.Printf("probe %s/%s: 可用", acct.Name, model)
 }
 
 // upstreamUnavailableReasonText 同 upstreamUnavailableReason，作用于响应正文。
@@ -215,6 +227,20 @@ func (h *Handler) sweepAvailability() {
 	availability.lastSweep = time.Now()
 	availability.Unlock()
 
+	for _, acct := range h.pendingProbes() {
+		h.probeModel(acct.acct, acct.model)
+	}
+}
+
+// pendingProbe 一个待探测的「账号 + 模型」。
+type pendingProbe struct {
+	acct  *pool.Account
+	model string
+}
+
+// pendingProbes 列出所有「健康账号 × 已发现但还没有可用性结论」的组合。
+func (h *Handler) pendingProbes() []pendingProbe {
+	var out []pendingProbe
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
@@ -227,11 +253,27 @@ func (h *Handler) sweepAvailability() {
 			if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
 				continue
 			}
-			select {
-			case <-time.After(time.Second):
-			default:
-			}
-			h.probeModel(acct, mi.ID)
+			out = append(out, pendingProbe{acct: acct, model: mi.ID})
 		}
 	}
+	return out
+}
+
+// runProbes 并发执行待探测列表（上限 probeConcurrency）。
+func (h *Handler) runProbes(items []pendingProbe) {
+	if len(items) == 0 {
+		return
+	}
+	sem := make(chan struct{}, probeConcurrency)
+	var wg sync.WaitGroup
+	for _, it := range items {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(it pendingProbe) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.probeModel(it.acct, it.model)
+		}(it)
+	}
+	wg.Wait()
 }
