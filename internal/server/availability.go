@@ -32,6 +32,8 @@ const (
 	probeTimeout = 45 * time.Second
 	// probeInterval 后台批量探测间隔。
 	probeInterval = 15 * time.Minute
+	// probeStartDelay 启动后多久开始首轮探测（避开接入初期的真实请求）。
+	probeStartDelay = 2 * time.Minute
 	// probeConcurrency 并发探测数。探测本身会占上游会话槽位（单账号 3 个并发），
 	// 且账号并发锁默认 max_concurrent=1，所以这里也用 1：慢一点，但不能干扰真实请求。
 	probeConcurrency = 1
@@ -118,8 +120,13 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	if acct == nil || acct.Auth == nil {
 		return
 	}
+	// 账号一旦有真实请求在跑（或刚跑过），本轮探测整体让位：探测只是为了让
+	// /v1/models 说真话，绝不能因此让用户请求排队等锁。下一轮再试。
+	if h.cfg.Pool.Busy(acct.Name) {
+		return
+	}
 	if !h.cfg.Pool.AcquireLock(acct.Name) {
-		return // 账号正忙，让位给真实请求
+		return
 	}
 	defer h.cfg.Pool.ReleaseLock(acct.Name)
 	key := availKey(acct.UID, model)
@@ -203,6 +210,12 @@ func (h *Handler) StartAvailabilityProber(ctx context.Context) { h.startAvailabi
 // 只在有账号且拿到目录后才干活，避免空转打上游。
 func (h *Handler) startAvailabilityProber(ctx context.Context) {
 	go func() {
+		// 启动后先等服务预热：立刻探测会和刚接入的客户端抢账号槽位。
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(probeStartDelay):
+		}
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		h.sweepAvailability()

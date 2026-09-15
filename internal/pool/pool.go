@@ -425,6 +425,25 @@ func (p *Pool) Disable(name, reason string) {
 }
 
 // Healthy 查询账号可用。
+// Busy 报告账号当前是否有活跃请求占用并发槽位（供探测等后台任务让位）。
+func (p *Pool) Busy(name string) bool {
+	p.mu.Lock()
+	var target *Account
+	for _, a := range p.accounts {
+		if a.Name == name {
+			target = a
+			break
+		}
+	}
+	p.mu.Unlock()
+	if target == nil {
+		return false
+	}
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	return target.activeConcurrent > 0
+}
+
 func (p *Pool) Healthy(name string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()

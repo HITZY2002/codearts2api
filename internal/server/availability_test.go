@@ -91,3 +91,27 @@ func TestModelKnownUnusable(t *testing.T) {
 		t.Error("有账号可用时不应下架")
 	}
 }
+
+// 探测必须让位于真实请求：账号一忙就整体跳过，绝不能让用户请求排队等锁。
+func TestProbeSkipsBusyAccount(t *testing.T) {
+	a := &auth.Auth{UserID: "u-busy", UserName: "u-busy", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	upstream.SetAccountModels("u-busy", []upstream.ModelInfo{{ID: "m-busy"}})
+
+	// 占用并发槽位，模拟真实请求在跑
+	if !p.AcquireLock("u-busy") {
+		t.Fatal("应能获取锁")
+	}
+	defer p.ReleaseLock("u-busy")
+	if !p.Busy("u-busy") {
+		t.Fatal("Busy 应为 true")
+	}
+	h.probeModel(p.Get("u-busy"), "m-busy")
+	if st, _ := modelAvailability("u-busy", "m-busy"); st != availUnknown {
+		t.Error("账号忙时探测应直接跳过，不得留下结论")
+	}
+}
