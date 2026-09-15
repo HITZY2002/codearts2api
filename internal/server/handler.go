@@ -378,7 +378,45 @@ func (h *Handler) modelList() []map[string]any {
 			infos = kept
 		}
 	}
+	// 刚发现到的模型还没有可用性结论：后台补一轮探测，供后续请求过滤。
+	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
+	h.probeUnknownAsync()
 	return modelEntries(infos)
+}
+
+// probeUnknownAsync 后台探测「还没有结论」的模型，不阻塞请求。
+func (h *Handler) probeUnknownAsync() {
+	availability.Lock()
+	busy := availability.sweeping
+	if !busy {
+		availability.sweeping = true
+	}
+	availability.Unlock()
+	if busy {
+		return
+	}
+	go func() {
+		defer func() {
+			availability.Lock()
+			availability.sweeping = false
+			availability.Unlock()
+		}()
+		for _, acct := range h.cfg.Pool.Accounts() {
+			if acct == nil || acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
+				continue
+			}
+			models, ok := upstream.AccountModels(acct.UID)
+			if !ok {
+				continue
+			}
+			for _, mi := range models {
+				if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
+					continue
+				}
+				h.probeModel(acct, mi.ID)
+			}
+		}
+	}()
 }
 
 // modelUsableAnywhere 报告池中是否至少有一个健康账号能用该模型。

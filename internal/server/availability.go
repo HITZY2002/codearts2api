@@ -52,6 +52,7 @@ var availability = struct {
 	sync.Mutex
 	byKey     map[string]availEntry // accountID|modelLower -> 状态
 	probing   map[string]bool       // 正在探测的 key（去重）
+	sweeping  bool                  // 是否已有一轮后台批量探测在跑
 	lastSweep time.Time
 }{byKey: map[string]availEntry{}, probing: map[string]bool{}}
 
