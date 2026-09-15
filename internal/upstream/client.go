@@ -632,9 +632,14 @@ func embeddedSSEError(data string) *ApiError {
 	combined := strings.TrimSpace(code + " " + message)
 	status := http.StatusBadGateway
 	low := strings.ToLower(combined)
-	if strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
-		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话") {
+	switch {
+	case strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
+		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话"):
 		status = http.StatusTooManyRequests
+	case strings.Contains(low, "002002009") || strings.Contains(low, "not registered") ||
+		strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
+		// 模型级错误（该账号用不了这个模型）是客户端问题，不是上游故障。
+		status = http.StatusBadRequest
 	}
 	return &ApiError{Code: status, Status: status, Message: truncateStr(combined, 300), Path: EpChatV2}
 }

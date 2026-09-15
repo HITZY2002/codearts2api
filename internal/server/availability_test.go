@@ -138,3 +138,29 @@ func TestQueueRetryDefaultBounded(t *testing.T) {
 		t.Fatalf("排队重试上限 %s 过短，瞬时的上游排队会直接失败", total)
 	}
 }
+
+// 模型级错误（not registered / benefit not found）不得被当成账号故障：
+// 实测线上：调用未注册模型 → 错误被嵌入包装成 5xx → 健康账号被冷却 10 分钟，
+// 之后所有正常请求全部失败。
+func TestModelErrorDoesNotCoolAccount(t *testing.T) {
+	a := &auth.Auth{UserID: "u-cool", UserName: "u-cool", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
+
+	err404 := &upstream.ApiError{
+		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
+		Message: "InferHub.002002009.404 The model is not registered, please request other model",
+	}
+	h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404)
+
+	if !p.Healthy("u-cool") {
+		t.Error("模型级错误不得冷却账号")
+	}
+	st, reason := modelAvailability("u-cool", "GLM-5.2-ArkTS-SPARK")
+	if st != availUnusable || reason == "" {
+		t.Errorf("应记为模型不可用，got state=%v reason=%q", st, reason)
+	}
+}

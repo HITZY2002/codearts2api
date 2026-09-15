@@ -697,6 +697,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs := buildUpstreamMessages(req, toolsOn)
 
+	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
+	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
+	if h.modelKnownUnusable(model) {
+		writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+			"model "+model+" is not available on any configured account")
+		return
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -1034,6 +1042,15 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) {
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
+		// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
+		// **之前**判断：not registered / benefit not found 会被嵌入错误包装成
+		// 5xx，落到下面的 `ae.Status >= 500` 就把健康账号冷却 10 分钟——实测
+		// 调用一个未注册模型，整个账号被冷却，后续正常请求全部失败。
+		if reason := upstreamUnavailableReason(err); reason != "" {
+			markUnusable(acct.UID, model, reason)
+			log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
+			return
+		}
 		switch {
 		case ae.Status == 401 || ae.Code == 401:
 			h.cfg.Pool.Disable(acct.Name, "401 "+ae.Message)
@@ -1046,13 +1063,6 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		case ae.Status >= 500:
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, ae.Error())
 		default:
-			// 「模型对这个账号不可用」是账号能力问题，不是账号故障：记下来用于
-			// /v1/models 过滤与路由避开，不能给它记错误冷却（否则健康账号被误伤）。
-			if reason := upstreamUnavailableReason(err); reason != "" {
-				markUnusable(acct.UID, model, reason)
-				log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
-				return
-			}
 			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 		}
 		return
