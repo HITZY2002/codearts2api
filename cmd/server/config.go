@@ -18,8 +18,10 @@ type Config struct {
 	AuthDir      string `json:"auth_dir"`
 	StateFile    string `json:"state_file"`
 	DefaultModel string `json:"default_model"`
-	// OAuthCallbackHost 可选：远程授权时把回调指向公网地址（如 https://oneapi.example.com/codearts），
-	// 让浏览器回调经反向代理进入本服务，而不是 127.0.0.1。留空则用本机端口。
+	// OAuthCallbackHost 可选：远程授权时把回调指向公网地址，让浏览器回调经反向
+	// 代理进入本服务，而不是 127.0.0.1。只有**显式写了端口**才会改写授权链接里的
+	// port 参数（如 https://oneapi.example.com:443/codearts）；不写端口则保持本机
+	// 端口不变。远端回调不通时会自动回退到 ticket 轮询通道，不影响登录完成。
 	OAuthCallbackHost string `json:"oauth_callback_host,omitempty"`
 
 	Cooldown struct {

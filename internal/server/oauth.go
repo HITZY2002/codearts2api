@@ -377,13 +377,29 @@ func shortID(u string) string {
 }
 
 // portOfCallbackHost 从 host[:port] 提取端口，支持带 scheme 的地址。
+// portOfCallbackHost 取出 oauth_callback_host 里显式写出的端口，没有则返回 0。
+//
+// 只认显式端口、不按 scheme 推断 443/80：portal 的回调目标是 127.0.0.1:{port}，
+// 若在没写端口时擅自改成 443，本机浏览器的回调用例反而会失败（这是本仓库
+// 之前的实际行为：带路径的写法一律解析失败，配置静默失效）。
+// 需要走反代请在配置里写全端口，例如 https://example.com:443/codearts。
 func portOfCallbackHost(host string) int {
 	trimmed := strings.TrimSpace(host)
+	if trimmed == "" {
+		return 0
+	}
+	if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+		if p := u.Port(); p != "" {
+			if n, err := strconv.Atoi(p); err == nil && n > 0 {
+				return n
+			}
+		}
+		return 0
+	}
+	// 兼容 "example.com:8443" 这种没有 scheme 的写法。
 	if i := strings.LastIndex(trimmed, ":"); i >= 0 {
-		// 去掉可能存在的 scheme（https://）
-		s := trimmed[i+1:]
-		s = strings.TrimRight(s, "/")
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		seg := strings.TrimRight(trimmed[i+1:], "/")
+		if n, err := strconv.Atoi(seg); err == nil && n > 0 {
 			return n
 		}
 	}
