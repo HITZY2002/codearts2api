@@ -43,6 +43,11 @@ type Config struct {
 	// LoginClientID WebUI 登录使用的 OAuth client_id（留空用默认 codearts-agent）。
 	LoginClientID string `json:"login_client_id"`
 
+	// QueueRetrySeconds 上游并发/TPM 排队时的重试间隔（秒，默认 10）。
+	QueueRetrySeconds int `json:"queue_retry_seconds"`
+	// QueueMaxAttempts 排队重试次数上限（默认 30，约 5 分钟）。
+	QueueMaxAttempts int `json:"queue_max_attempts"`
+
 	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 true）。
 	// 领取是幂等操作（官方客户端打开模型菜单即调用），不领取时福利模型一律
 	// 返回 InferHub.4004.200 benefit not found。置 false 可关掉这个写操作。
@@ -205,6 +210,16 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CA2A_LOGIN_CLIENT_ID"); v != "" {
 		c.LoginClientID = v
+	}
+	if v := os.Getenv("CA2A_QUEUE_RETRY_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueRetrySeconds = n
+		}
+	}
+	if v := os.Getenv("CA2A_QUEUE_MAX_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueMaxAttempts = n
+		}
 	}
 	if v := os.Getenv("CA2A_BENEFIT_AUTO_CLAIM"); v != "" {
 		c.BenefitAutoClaim = v == "1" || strings.EqualFold(v, "true")

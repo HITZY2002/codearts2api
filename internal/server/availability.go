@@ -38,6 +38,10 @@ const (
 	// （成功 markUsable / 失败 markUnusable），探测只是空闲时补齐，避免与用户
 	// 抢上游那 3 个并发会话槽位（槽位释放实测 >15s）。
 	probeIdleBefore = 10 * time.Minute
+	// probeGap 两次探测之间的间隔。探针本身是串行的，但它占用的上游会话槽位
+	// 释放很慢（实测 >15s）：连续探 3 个就占满单账号的 3 个并发会话，紧随其后的
+	// 真实请求会被上游判为 TM.00001041 并开始排队。留出释放窗口再探下一个。
+	probeGap = 20 * time.Second
 	// probeConcurrency 并发探测数。探测本身会占上游会话槽位（单账号 3 个并发），
 	// 且账号并发锁默认 max_concurrent=1，所以这里也用 1：慢一点，但不能干扰真实请求。
 	probeConcurrency = 1
@@ -56,6 +60,9 @@ type availEntry struct {
 	reason string
 	at     time.Time
 }
+
+// probesStop 在服务退出时关闭，让带 sleep 的探测循环尽快结束。
+var probesStop = make(chan struct{})
 
 var availability = struct {
 	sync.Mutex
@@ -308,7 +315,17 @@ func (h *Handler) runProbes(items []pendingProbe) {
 	}
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
+	first := true
 	for _, it := range items {
+		// 让上一个探针占用的上游会话先释放，再探下一个。
+		if !first {
+			select {
+			case <-time.After(probeGap):
+			case <-probesStop:
+				return
+			}
+		}
+		first = false
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(it pendingProbe) {

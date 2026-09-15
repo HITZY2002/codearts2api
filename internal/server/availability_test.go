@@ -115,3 +115,26 @@ func TestProbeSkipsBusyAccount(t *testing.T) {
 		t.Error("账号忙时探测应直接跳过，不得留下结论")
 	}
 }
+
+// 探针占用的上游会话释放很慢（实测 >15s），连续探测会把单账号的 3 个并发会话
+// 占满，紧随其后的真实请求被上游判为 TM.00001041。两次探测之间必须留释放窗口。
+func TestProbeGapExists(t *testing.T) {
+	if probeGap < 15*time.Second {
+		t.Fatalf("probeGap=%s 太短，上游会话释放实测 >15s", probeGap)
+	}
+	if probeConcurrency != 1 {
+		t.Fatalf("probeConcurrency=%d，探测必须串行以免占满会话槽位", probeConcurrency)
+	}
+}
+
+// 排队重试不能无限等：默认值应远小于原来的 180×10s=30min。
+func TestQueueRetryDefaultBounded(t *testing.T) {
+	h := NewHandler(Config{})
+	total := time.Duration(h.cfg.QueueMaxAttempts) * h.cfg.QueueRetryDelay
+	if total > 10*time.Minute {
+		t.Fatalf("排队重试上限 %s 过长，交互式请求会像挂死", total)
+	}
+	if total < time.Minute {
+		t.Fatalf("排队重试上限 %s 过短，瞬时的上游排队会直接失败", total)
+	}
+}

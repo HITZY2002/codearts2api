@@ -33,8 +33,7 @@ type Config struct {
 	ErrThreshold int
 	ErrCooldown  time.Duration
 	// CodeArts 上游把并发会话/TPM 排队既可能返回 HTTP 400/429，
-	// 也可能嵌在 HTTP 200 SSE 内。默认对齐官方 IDE 参考实现：
-	// 每 10s 重试，最多 180 次（30min）。
+	// 也可能嵌在 HTTP 200 SSE 内。默认每 10s 重试一次、最多 30 次（约 5 分钟）。
 	QueueRetryDelay  time.Duration
 	QueueMaxAttempts int
 	DefaultModel     string
@@ -132,7 +131,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.QueueRetryDelay = 10 * time.Second
 	}
 	if cfg.QueueMaxAttempts <= 0 {
-		cfg.QueueMaxAttempts = 180
+		// 上游并发/TPM 排队是瞬时的，但 180×10s = 30 分钟对交互式调用等于挂死；
+		// 取 30 次（约 5 分钟）作为默认，可用 queue_max_attempts 调整。
+		cfg.QueueMaxAttempts = 30
 	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
@@ -332,6 +333,9 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 		return err
 	}
 	if p := h.cfg.Pool.AddAccount(a); p != nil && p.Auth != nil {
+		// 刚登录的账号先不探测：用户很可能马上就要用，探测占用的上游会话
+		// 槽位释放很慢，会把第一个真实请求挤到排队。
+		noteTraffic(a.UserID)
 		log.Printf("webui login success user_id=%s name=%s", a.UserID, a.UserName)
 	} else {
 		log.Printf("webui login saved user_id=%s name=%s (pool add failed)", a.UserID, a.UserName)

@@ -56,15 +56,22 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:          p,
-		Upstream:      c,
-		APIKey:        cfg.APIKey,
-		MaxRotate:     3,
-		SoftCooldown:  cfg.SoftRateDur,
-		ErrThreshold:  cfg.Cooldown.ErrThresh,
-		ErrCooldown:   cfg.ErrCooldownDur,
-		DefaultModel:  cfg.DefaultModel,
-		ConvStateFile: cfg.StateFile + ".chats.json",
+		Pool:         p,
+		Upstream:     c,
+		APIKey:       cfg.APIKey,
+		MaxRotate:    3,
+		SoftCooldown: cfg.SoftRateDur,
+		ErrThreshold: cfg.Cooldown.ErrThresh,
+		ErrCooldown:  cfg.ErrCooldownDur,
+		DefaultModel: cfg.DefaultModel,
+		QueueRetryDelay: func() time.Duration {
+			if cfg.QueueRetrySeconds > 0 {
+				return time.Duration(cfg.QueueRetrySeconds) * time.Second
+			}
+			return 10 * time.Second
+		}(),
+		QueueMaxAttempts: cfg.QueueMaxAttempts,
+		ConvStateFile:    cfg.StateFile + ".chats.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
 			"poll_minutes":         cfg.Watch.PollMinutes,
