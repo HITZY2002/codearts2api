@@ -34,6 +34,10 @@ const (
 	probeInterval = 15 * time.Minute
 	// probeStartDelay 启动后多久开始首轮探测（避开接入初期的真实请求）。
 	probeStartDelay = 2 * time.Minute
+	// probeIdleBefore 账号至少空闲这么久才探测。真实请求本身就会写可用性结论
+	// （成功 markUsable / 失败 markUnusable），探测只是空闲时补齐，避免与用户
+	// 抢上游那 3 个并发会话槽位（槽位释放实测 >15s）。
+	probeIdleBefore = 10 * time.Minute
 	// probeConcurrency 并发探测数。探测本身会占上游会话槽位（单账号 3 个并发），
 	// 且账号并发锁默认 max_concurrent=1，所以这里也用 1：慢一点，但不能干扰真实请求。
 	probeConcurrency = 1
@@ -59,7 +63,11 @@ var availability = struct {
 	probing   map[string]bool       // 正在探测的 key（去重）
 	sweeping  bool                  // 是否已有一轮后台批量探测在跑
 	lastSweep time.Time
-}{byKey: map[string]availEntry{}, probing: map[string]bool{}}
+	// lastTraffic accountID -> 最后一次真实请求时间。探测只为「补齐结论」，
+	// 有真实流量的账号不探测（真实请求本身就会写结论，且探测占用的上游会话
+	// 槽位释放很慢，会挤掉用户请求）。
+	lastTraffic map[string]time.Time
+}{byKey: map[string]availEntry{}, probing: map[string]bool{}, lastTraffic: map[string]time.Time{}}
 
 func availKey(accountID, model string) string {
 	return accountID + "|" + strings.ToLower(model)
@@ -96,6 +104,27 @@ func markUsable(accountID, model string) {
 	availability.byKey[availKey(accountID, model)] = availEntry{state: availUsable, at: time.Now()}
 }
 
+// noteTraffic 记录账号上一次真实请求时间（探测据此避让）。
+func noteTraffic(accountID string) {
+	if accountID == "" {
+		return
+	}
+	availability.Lock()
+	defer availability.Unlock()
+	availability.lastTraffic[accountID] = time.Now()
+}
+
+// trafficIdleFor 返回账号距上次真实请求的空闲时长；从未有流量返回极大值。
+func trafficIdleFor(accountID string) time.Duration {
+	availability.Lock()
+	defer availability.Unlock()
+	t, ok := availability.lastTraffic[accountID]
+	if !ok {
+		return time.Duration(1<<62 - 1)
+	}
+	return time.Since(t)
+}
+
 // upstreamUnavailableReason 把上游错误归类为「该模型对这个账号不可用」，否则返回空串。
 func upstreamUnavailableReason(err error) string {
 	if err == nil {
@@ -122,7 +151,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	}
 	// 账号一旦有真实请求在跑（或刚跑过），本轮探测整体让位：探测只是为了让
 	// /v1/models 说真话，绝不能因此让用户请求排队等锁。下一轮再试。
-	if h.cfg.Pool.Busy(acct.Name) {
+	if h.cfg.Pool.Busy(acct.Name) || trafficIdleFor(acct.UID) < probeIdleBefore {
 		return
 	}
 	if !h.cfg.Pool.AcquireLock(acct.Name) {

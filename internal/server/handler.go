@@ -746,6 +746,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		authRetried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
+		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
 			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
 			if serr == nil {
@@ -793,6 +794,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
 		markUsable(acct.UID, model)
+		noteTraffic(acct.UID)
 
 		w.Header().Set("X-Codearts-Chat-Id", chatID)
 
