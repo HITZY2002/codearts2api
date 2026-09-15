@@ -822,7 +822,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
 			lastErr = serr
-			h.handleUpstreamError(acct, model, serr)
+			if h.handleUpstreamError(acct, model, serr) {
+				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
+				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
+				return
+			}
 			continue
 		}
 		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
@@ -1039,7 +1044,10 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 	return resp
 }
 
-func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) {
+// handleUpstreamError 记录错误并决定是否处罚账号。
+// 返回 true 表示这是「模型对这个账号不可用」的模型级错误：调用方应立即结束
+// 轮转并向客户端返回明确错误（换账号也是同样的结果）。
+func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
 		// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
@@ -1049,7 +1057,7 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
 			log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
-			return
+			return true
 		}
 		switch {
 		case ae.Status == 401 || ae.Code == 401:
@@ -1065,9 +1073,10 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		default:
 			h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 		}
-		return
+		return false
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+	return false
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

@@ -154,7 +154,9 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.002002009.404 The model is not registered, please request other model",
 	}
-	h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404)
+	if !h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
+		t.Error("模型级错误应返回 true，让调用方立即结束轮转")
+	}
 
 	if !p.Healthy("u-cool") {
 		t.Error("模型级错误不得冷却账号")
