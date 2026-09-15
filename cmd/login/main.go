@@ -3,7 +3,8 @@
 // 流程（对齐 huaweicloud.authentication 扩展）：
 //  1. 本地起 127.0.0.1 回调服务
 //  2. 生成 ticket_id/secret + PKCE，构造 codearts.huaweicloud.com/authorize 链接
-//  3. 浏览器登录 → 本地回调收 authorization code，或轮询 snap-manager /v1/login/ticket
+//  3. 浏览器登录 → portal 回调本地服务两次（先 secret+redirect，再 code），
+//     或轮询 snap-manager /v1/login/ticket（用 portal 下发的 secret）
 //  4. oauth2/tokens 换 STS 临时 AK/SK + security_token + refresh_token → 落盘
 package main
 
@@ -19,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -43,13 +45,14 @@ func main() {
 	var err error
 	callbackPort := 0
 	codeCh := make(chan string, 1)
+	cb := &callbackState{}
 	if !*printOnly {
 		ln, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			log.Fatalf("loopback listen: %v", err)
 		}
 		callbackPort = ln.Addr().(*net.TCPAddr).Port
-		go serveCallback(ln, cfg.RedirectPath, codeCh)
+		go serveCallback(ln, cfg.RedirectPath, cb, codeCh)
 		defer ln.Close()
 	}
 
@@ -102,7 +105,7 @@ loginLoop:
 			}
 			break loginLoop
 		case <-ticker.C:
-			t, terr := client.PollTicket(ctx, cfg, ticketID, secret)
+			t, terr := client.PollTicket(ctx, cfg, ticketID, cb.pollSecret(secret))
 			if terr == nil && t != nil && t.UserName != "" {
 				tok = t
 				break loginLoop
@@ -125,11 +128,48 @@ loginLoop:
 	}
 }
 
-// serveCallback 处理本地回调（GET query: secret + code）。
-func serveCallback(ln net.Listener, redirectPath string, ch chan<- string) {
+// callbackState 保存 portal 回调里下发的 secret。
+//
+// portal 首次回调只带 secret + redirect（不含 code），而轮询 /v1/login/ticket 必须用
+// portal 下发的 secret（本地生成的那份上游不认），所以两边都要用回调里收到的值。
+type callbackState struct {
+	mu     sync.Mutex
+	secret string
+}
+
+func (s *callbackState) setSecret(v string) {
+	s.mu.Lock()
+	s.secret = v
+	s.mu.Unlock()
+}
+
+// pollSecret 返回 portal 下发的 secret；portal 没下发时退回本地生成的。
+func (s *callbackState) pollSecret(fallback string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.secret != "" {
+		return s.secret
+	}
+	return fallback
+}
+
+// serveCallback 处理本地回调（GET query 或 POST body 传 code）。
+//
+// portal 会回调两次：第一次带 secret + redirect，要求 307 跳回 redirect（登录页链路
+// 的一环）；在这一次报错会中断链路，带 code 的第二次回调永远不会到达。第二次带 code。
+func serveCallback(ln net.Listener, redirectPath string, st *callbackState, ch chan<- string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc(redirectPath, func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
+		secret := r.URL.Query().Get("secret")
+		redirect := r.URL.Query().Get("redirect")
+		if secret != "" {
+			st.setSecret(secret)
+		}
+		if code == "" && redirect != "" {
+			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
+			return
+		}
 		if code == "" {
 			// 兼容 POST body
 			body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))

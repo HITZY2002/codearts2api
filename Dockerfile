@@ -15,5 +15,4 @@ COPY --from=build /out/ /usr/local/bin/
 COPY config.example.json ./config.example.json
 VOLUME ["/app/auths", "/app/data"]
 EXPOSE 7866
-ENV CA2A_API_KEY=changeme
 CMD ["codearts2api", "-config", "config.json"]

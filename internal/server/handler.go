@@ -47,11 +47,24 @@ var dynamicModelsCache struct {
 	lastFail time.Time
 }
 
-var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 202752},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 131072},
-	{"id": "qwen3-vl-235b", "object": "model", "created": 1753600000, "owned_by": "codearts", "context_length": 131072},
+// staticModel 静态兜底模型：动态发现失败时 /v1/models 仍能列出实测可用模型。
+type staticModel struct {
+	ID            string
+	ContextWindow int64
+	Benefit       bool
+}
+
+var staticModels = []staticModel{
+	// 内置（agent-center / /v1/model/builtin 实测，精确大小写）
+	{ID: "GLM-5.2", ContextWindow: 202752},
+	{ID: "GLM-5.2-ArkTS-SPARK", ContextWindow: 202752},
+	{ID: "OpenPangu-2.0-Pro", ContextWindow: 524288},
+	{ID: "OpenPangu-2.0-Flash", ContextWindow: 524288},
+	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
+	// 限时福利（免费套餐，福利网关实测；聊天自动带 maas_type: benefit 头）
+	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
+	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
+	{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
 }
 
 const (
@@ -270,41 +283,62 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+// modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
-		seen := map[string]bool{}
-		for _, mi := range infos {
-			// 展示统一用用户侧小写 ID（glm-5.2），与 CanonicalModel 映射一致。
-			displayID := strings.ToLower(mi.ID)
-			seen[displayID] = true
-			entry := map[string]any{
-				"id":                displayID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "codearts",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			out = append(out, entry)
-		}
-		// 合并账号实际可用但不在默认 CodeAgent 列表中的模型（实测可用）。
-		for _, sm := range staticModels {
-			id, _ := sm["id"].(string)
-			if id != "" && !seen[id] {
-				out = append(out, sm)
-			}
-		}
-		return out
-	}
-	return staticModels
+	return modelEntries(h.fetchDynamicModels())
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表，缓存 1h。
+// modelEntries 把账号模型目录 + 静态兜底包装成 OpenAI /v1/models 条目。
+//
+// 上游模型 ID 区分大小写：既列精确 ID（GLM-5.2），也补一条小写别名（glm-5.2，
+// 老客户端习惯用小写），聊天时由 CanonicalModel 归一回精确 ID。
+// 静态表只在动态目录缺失该 ID 时补位，顺序固定（动态已排序，静态按表序）。
+func modelEntries(infos []upstream.ModelInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(infos)+len(staticModels))
+	seen := map[string]bool{}
+	add := func(id string, ctx, maxOut int64, benefit bool) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		if ctx == 0 {
+			ctx = 131072 // 兜底
+		}
+		entry := map[string]any{
+			"id":             id,
+			"object":         "model",
+			"created":        1753600000,
+			"owned_by":       "codearts",
+			"context_length": ctx,
+		}
+		if maxOut > 0 {
+			entry["max_output_tokens"] = maxOut
+		}
+		if benefit {
+			entry["benefit"] = true
+		}
+		out = append(out, entry)
+	}
+	// addAlias 精确 ID + 就近补一条小写别名（已是小写则跳过）。
+	addAlias := func(id string, ctx, maxOut int64, benefit bool) {
+		add(id, ctx, maxOut, benefit)
+		if lower := strings.ToLower(id); lower != id {
+			add(lower, ctx, maxOut, benefit)
+		}
+	}
+	for _, mi := range infos {
+		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+	}
+	for _, sm := range staticModels {
+		addAlias(sm.ID, sm.ContextWindow, 0, sm.Benefit)
+	}
+	return out
+}
+
+// fetchDynamicModels 刷新各账号模型目录并返回合并后的展示列表，缓存 1h。
+//
+// 目录按账号存放（限时福利按账号授予，账号之间不能互相污染），因此这里逐个健康
+// 账号发现并写入其目录；发现失败的账号沿用旧目录或冷启动种子。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -319,12 +353,30 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.PickExcluding(nil)
-	if acct == nil {
-		return nil
+	var sets [][]upstream.ModelInfo
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if !upstream.AccountCatalogStale(acct.UID) {
+			if infos, ok := upstream.AccountModels(acct.UID); ok {
+				sets = append(sets, infos)
+				continue
+			}
+		}
+		infos, err := h.cfg.Upstream.FetchModels(acct.Auth) // 成功即写入该账号目录
+		if err != nil {
+			log.Printf("model discovery failed for account %s: %v", acct.Name, err)
+			continue
+		}
+		if len(infos) == 0 {
+			log.Printf("model discovery returned no models for account %s", acct.Name)
+			continue
+		}
+		sets = append(sets, infos)
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct.Auth)
-	if err != nil || len(infos) == 0 {
+	infos := upstream.MergeModels(sets...)
+	if len(infos) == 0 {
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
@@ -336,6 +388,48 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	return infos
+}
+
+// pickAccount 挑一个「目录里登记了这个模型」的健康账号，没有则退回普通轮转。
+//
+// 混合账号池里各账号的套餐不同：/v1/models 展示的是并集，若把请求先发给目录里
+// 没有该模型的账号，上游会按「未注册模型」报 400，既浪费一次轮转（MaxRotate 只有
+// 3 次，池子超过 3 个账号时可能永远轮不到有能力的那台），又会给健康账号记错误、
+// 累计到阈值就冷却 10 分钟。所以按能力优先挑号。
+func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account {
+	want := strings.ToLower(upstream.CanonicalModel(model))
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, want) {
+			return acct
+		}
+	}
+	return h.cfg.Pool.PickExcluding(tried)
+}
+
+// accountCanServe 报告账号目录里是否登记了该模型；账号不存在或目录未知时乐观放行
+// （交给上游判定，不凭缺失的目录拒请求）。
+func (h *Handler) accountCanServe(acct *pool.Account, model string) bool {
+	if acct == nil {
+		return true
+	}
+	models, known := upstream.AccountModels(acct.UID)
+	if !known {
+		return true
+	}
+	return catalogHas(models, strings.ToLower(upstream.CanonicalModel(model)))
+}
+
+// catalogHas 按小写 ID 在模型目录里查模型。
+func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
+	for _, mi := range models {
+		if strings.ToLower(mi.ID) == wantLower {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -386,17 +480,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
-			// 续接会话：锁定原账号（若仍健康）。
+			// 续接会话：锁定原账号（仍健康且目录里有这个模型）。
 			acct = h.cfg.Pool.Get(stickyAcct)
-			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
+			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) || !h.accountCanServe(acct, model) {
 				stickyAcct = ""
-				acct = h.cfg.Pool.PickExcluding(tried)
+				acct = h.pickAccount(tried, model)
 			} else {
 				tried[acct.Name] = true
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.pickAccount(tried, model)
 		}
 		if acct == nil {
 			break
@@ -448,11 +542,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 上游并发会话上限（TM.00001041）是瞬时的：已完成的会话槽位释放较慢
 		//（实测 >15s）。遇到时等待后重试同一账号，最多 10 次（每次 5s，共 50s）。
 		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
+		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
+		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
+		benefit := upstream.IsBenefitModel(acct.UID, model)
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
 		for retry := 0; retry < 10; retry++ {
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts)
+			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
 			if serr == nil {
 				break
 			}

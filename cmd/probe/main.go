@@ -46,23 +46,23 @@ func main() {
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken)
+		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	case "raw-text":
 		body := map[string]any{
 			"model":    model,
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken)
+		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	case "raw-blocks":
 		body := map[string]any{
 			"model":    model,
 			"stream":   true,
 			"messages": []any{map[string]any{"role": "user", "content": msg}},
 		}
-		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken)
+		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	default:
-		rc, err = c.ChatStream(context.Background(), chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model)
+		rc, err = c.ChatStream(context.Background(), chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model, upstream.IsBenefitModel(a.UserID, model))
 	}
 	if err != nil {
 		panic(err)

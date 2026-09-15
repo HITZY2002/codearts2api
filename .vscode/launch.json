@@ -1,0 +1,46 @@
+{
+  // 需要安装 Go 扩展（golang.go）+ dlv（go install github.com/go-delve/delve/cmd/dlv@latest）
+  // 断点调试：F5 选下面的配置，默认停在 main.main。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug server",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/server",
+      "cwd": "${workspaceFolder}",
+      "args": ["-config", "${workspaceFolder}/config.json"],
+      // 本地调试不落盘真 key：任意字符串即可；调度器关掉，避免调试期间改动账号状态
+      "env": {
+        "CA2A_API_KEY": "devkey",
+        "CA2A_WATCH_ENABLED": "false"
+      }
+    },
+    {
+      "name": "Debug login",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/login",
+      "cwd": "${workspaceFolder}",
+      "args": ["-auth-dir", "${workspaceFolder}/auths"]
+    },
+    {
+      "name": "Debug models",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/models",
+      "cwd": "${workspaceFolder}",
+      "args": ["-json"]
+    },
+    {
+      "name": "Run tests (package under cursor)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}"
+    }
+  ]
+}

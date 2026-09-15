@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -14,7 +15,7 @@ import (
 // Config 顶层配置。
 type Config struct {
 	Listen       string `json:"listen"`
-	APIKey       string `json:"api_key"` // 只读 env CA2A_API_KEY
+	APIKey       string `json:"api_key"` // config.json 的 api_key 或 env CA2A_API_KEY（同时存在时 env 优先）
 	AuthDir      string `json:"auth_dir"`
 	StateFile    string `json:"state_file"`
 	DefaultModel string `json:"default_model"`
@@ -37,6 +38,10 @@ type Config struct {
 
 	MaxConcurrent   int `json:"max_concurrent"`   // 单账号最大并发数（新增）
 	KeepaliveWindow string `json:"keepalive_window"` // 保活窗口（新增）
+
+	// BenefitAutoClaim 模型发现时自动领取限时福利（默认 false）。
+	// 领取是对账号的写操作，且 /v1/models 是公开读接口，默认只读不写。
+	BenefitAutoClaim bool `json:"benefit_auto_claim"`
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -76,18 +81,74 @@ func Load(path string) (*Config, error) {
 			if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("read config: %w", err)
 			}
-		} else if err := json.Unmarshal(raw, c); err != nil {
+		} else if err := json.Unmarshal(stripJSONComments(raw), c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
 	applyEnv(c)
 	if c.APIKey == "" {
 		c.APIKey = "dummy-key-for-codearts"
+		log.Printf("WARNING: 未设置 CA2A_API_KEY（config.json 的 api_key 与 env 均为空），"+
+			"正在使用公开默认 key %s，切勿对外暴露端口", c.APIKey)
 	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// stripJSONComments 去掉配置里的 // 与 /* */ 注释。
+//
+// config.example.json 带注释（字段说明只在那一份里），README 又让人直接
+// `cp config.example.json config.json`；标准 encoding/json 不接受注释，
+// 因此这里先做一次剥离。字符串内的 // 与 /* 本身不动（oauth_callback_host
+// 这类值就是 URL）。
+func stripJSONComments(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inString {
+			out = append(out, ch)
+			switch ch {
+			case '\\':
+				if i+1 < len(raw) {
+					i++
+					out = append(out, raw[i])
+				}
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			out = append(out, ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(raw) {
+			if raw[i+1] == '/' {
+				for i < len(raw) && raw[i] != '\n' {
+					i++
+				}
+				// 保留换行，尽量不改变 offset。
+				if i < len(raw) {
+					out = append(out, '\n')
+				}
+				continue
+			}
+			if raw[i+1] == '*' {
+				i += 2
+				for i+1 < len(raw) && !(raw[i] == '*' && raw[i+1] == '/') {
+					i++
+				}
+				i++ // 跳过结尾的 '/'
+				continue
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
 }
 
 func applyEnv(c *Config) {
@@ -134,6 +195,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("CA2A_KEEPALIVE_WINDOW"); v != "" {
 		c.KeepaliveWindow = v
+	}
+	if v := os.Getenv("CA2A_BENEFIT_AUTO_CLAIM"); v != "" {
+		c.BenefitAutoClaim = v == "1" || strings.EqualFold(v, "true")
 	}
 }
 

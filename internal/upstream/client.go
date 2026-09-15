@@ -21,9 +21,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"codearts2api/internal/auth"
 )
 
 // ApiError 带业务 code 的上游错误。
@@ -92,7 +92,22 @@ func DefaultLoginConfig() LoginConfig {
 type Client struct {
 	http       *http.Client // 短请求，带总超时
 	streamHTTP *http.Client // SSE 长流，无总超时
+
+	// 上游主机，生产固定为华为云；测试可替换为 httptest 服务。
+	snapBase    string
+	benefitBase string
+
+	// claimAuto 模型发现时是否自动领取限时福利（默认关闭：领取是对账号的写操作）。
+	claimAuto atomic.Bool
+
+	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
+	// 避免每次 /v1/models 刷新都空等超时。
+	srcMu   sync.Mutex
+	srcFail map[string]time.Time
 }
+
+// srcFailCooldown 上游某一来源连续失败后的退避窗口。
+const srcFailCooldown = 5 * time.Minute
 
 // New 构造客户端。
 func New(timeout time.Duration) *Client {
@@ -106,9 +121,57 @@ func New(timeout time.Duration) *Client {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{
-		http:       &http.Client{Timeout: timeout, Transport: tr},
-		streamHTTP: &http.Client{Transport: tr},
+		http:        &http.Client{Timeout: timeout, Transport: tr},
+		streamHTTP:  &http.Client{Transport: tr},
+		snapBase:    SnapEngineApiHost,
+		benefitBase: BenefitHost,
+		srcFail:     map[string]time.Time{},
 	}
+}
+
+// SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
+// 关闭时 /v1/models 只读不写，需要领取请显式调用 ClaimBenefit（cmd/models -claim）。
+func (c *Client) SetBenefitAutoClaim(v bool) { c.claimAuto.Store(v) }
+
+// BenefitAutoClaim 报告是否开启自动领取。
+func (c *Client) BenefitAutoClaim() bool { return c.claimAuto.Load() }
+
+// snapURL 拼接 snap-access 主机地址。
+func (c *Client) snapURL(path string) string { return c.snapBase + path }
+
+// benefitURL 拼接福利网关主机地址。
+func (c *Client) benefitURL(path string) string { return c.benefitBase + path }
+
+// srcBlocked 报告某来源是否处于失败退避窗口内。
+func (c *Client) srcBlocked(key string) bool {
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	until, ok := c.srcFail[key]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(c.srcFail, key)
+		return false
+	}
+	return true
+}
+
+// noteSrcFail 记录某来源失败，进入退避窗口。
+func (c *Client) noteSrcFail(key string) {
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	if c.srcFail == nil {
+		c.srcFail = map[string]time.Time{}
+	}
+	c.srcFail[key] = time.Now().Add(srcFailCooldown)
+}
+
+// clearSrcFail 清空某来源的失败退避。
+func (c *Client) clearSrcFail(key string) {
+	c.srcMu.Lock()
+	defer c.srcMu.Unlock()
+	delete(c.srcFail, key)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,10 +303,15 @@ type ChatOptions struct {
 	TopP            *float64
 }
 
-// CanonicalModel 把用户友好模型 ID 映射为 InferHub 注册的模型 ID（区分大小写）。
-// 旧版 /v1/chat/chat 用小写 id（glm-5.2 / snap-chat），新 /api/v2/chat/completions
-// 按 InferHub 注册名匹配（GLM-5.2 / deepseek-v4-flash / Qwen3-VL-235B）。
+// CanonicalModel 把用户友好模型 ID 映射为上游 InferHub 注册的模型 ID。
+//
+// 上游按注册名精确匹配（区分大小写），而客户端习惯写小写。动态发现的模型
+// （见 models.go 的 known 索引）优先做大小写不敏感归一；旧版小写别名走下面的
+// 静态映射兜底；都不认识就原样透传。
 func CanonicalModel(id string) string {
+	if exact, ok := lookupKnownModel(id); ok {
+		return exact
+	}
 	switch id {
 	case "snap-chat", "glm-5.2":
 		return "GLM-5.2"
@@ -284,12 +352,15 @@ func ChatHeadersV2(token, traceID, language string) map[string]string {
 
 // ChatStream 发送 /api/v2/chat/completions（OpenAI 兼容，AK/SK 签名 + x-auth-token）
 // 并返回 SSE 流（调用方负责 Close）。
-func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string) (io.ReadCloser, error) {
-	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{})
+//
+// benefit 由调用方按「发起请求的账号」判定（见 IsBenefitModel）：限时福利模型
+// 必须带 maas_type: benefit 头，判定依据是账号自己的模型目录，不能全局共享。
+func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error) {
+	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{}, benefit)
 }
 
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
-func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions) (io.ReadCloser, error) {
+func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
 	body := map[string]any{
 		"model":    CanonicalModel(model),
 		"stream":   true,
@@ -307,7 +378,7 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messa
 	if opts.TopP != nil {
 		body["top_p"] = *opts.TopP
 	}
-	return c.SendChatV2(ctx, body, traceID, cred, cred.SecurityToken)
+	return c.SendChatV2(ctx, body, traceID, cred, cred.SecurityToken, benefit)
 }
 
 // chatMessagesToOpenAI 把上游消息折叠为 OpenAI user 消息。
@@ -321,14 +392,19 @@ func chatMessagesToOpenAI(msgs []ChatMessage) []map[string]any {
 
 // SendChatV2 发送自定义 OpenAI 兼容 body 到 /api/v2/chat/completions。
 // 鉴权：x-auth-token（STS security token）+ 华为云 SDK-HMAC-SHA256 AK/SK 签名。
-func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string) (io.ReadCloser, error) {
+// benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
+// 计入 SignedHeaders。
+func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, SnapEngineApiHost+EpChatV2, bytes.NewReader(raw))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.snapURL(EpChatV2), bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
 	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
 		httpReq.Header.Set(k, v)
+	}
+	if benefit {
+		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
 	}
 	signRequest(httpReq, raw, cred)
 	resp, err := c.streamHTTP.Do(httpReq)
@@ -415,97 +491,6 @@ func truncateStr(s string, n int) string {
 		return s[:n]
 	}
 	return s
-}
-
-// ModelInfo 模型信息（与 workbuddy/trae 一致）。
-type ModelInfo struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	ContextWindow int64  `json:"contextWindow,omitempty"`
-	MaxTokens     int64  `json:"maxTokens,omitempty"`
-}
-
-// FetchModels 从 agent-center 拉取当前账号可用的模型列表（动态缓存 1h）。
-// 链路：useragents 找默认 CodeAgent → detail 的 gpts.models 返回精确模型 ID。
-func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
-	if acct == nil {
-		return nil, fmt.Errorf("account required for model fetch")
-	}
-	cred := SignCredential{
-		AccessKeyID:     acct.AccessKeyID,
-		SecretAccessKey: acct.SecretAccessKey,
-		SecurityToken:   acct.CloudDragonTok,
-	}
-	agentID, err := c.defaultAgentID(cred)
-	if err != nil {
-		return nil, err
-	}
-	if agentID == "" {
-		return nil, fmt.Errorf("no default agent found")
-	}
-	raw, err := c.getSigned(context.Background(), SnapEngineApiHost+EpAgentDetail+"?agent_id="+url.QueryEscape(agentID), cred, true)
-	if err != nil {
-		return nil, err
-	}
-	var detail struct {
-		Gpts struct {
-			Models []struct {
-				ModelAlias string `json:"model_alias"`
-				ModelName  string `json:"model_name"`
-				Params     struct {
-					ContextWindow int64 `json:"context_window"`
-					MaxTokens     int64 `json:"max_tokens"`
-				} `json:"model_parameters"`
-			} `json:"models"`
-		} `json:"gpts"`
-	}
-	if err := json.Unmarshal(raw, &detail); err != nil {
-		return nil, fmt.Errorf("parse models: %w", err)
-	}
-	if len(detail.Gpts.Models) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
-	}
-	out := make([]ModelInfo, 0, len(detail.Gpts.Models))
-	for _, m := range detail.Gpts.Models {
-		id := firstNonEmpty(m.ModelName, m.ModelAlias)
-		if id == "" {
-			continue
-		}
-		out = append(out, ModelInfo{
-			ID:            id,
-			Name:          id,
-			ContextWindow: m.Params.ContextWindow,
-			MaxTokens:     m.Params.MaxTokens,
-		})
-	}
-	return out, nil
-}
-
-// defaultAgentID 拉取用户 agent 列表，返回默认 CodeAgent 的 agent_id。
-func (c *Client) defaultAgentID(cred SignCredential) (string, error) {
-	raw, err := c.getSigned(context.Background(), SnapEngineApiHost+EpAgentList+"?offset=0&limit=100", cred, true)
-	if err != nil {
-		return "", err
-	}
-	var out struct {
-		Agents []struct {
-			AgentID   string `json:"agent_id"`
-			AgentName string `json:"agent_name"`
-			Primary   bool   `json:"is_primary_agent"`
-		} `json:"agents"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("parse agents: %w", err)
-	}
-	for _, a := range out.Agents {
-		if a.Primary {
-			return a.AgentID, nil
-		}
-	}
-	if len(out.Agents) > 0 {
-		return out.Agents[0].AgentID, nil
-	}
-	return "", nil
 }
 
 // getSigned 发送带 Agent-Type 的 AK/SK 签名 GET（用于 agent-center 等管理接口）。

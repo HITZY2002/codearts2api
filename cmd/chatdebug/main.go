@@ -29,7 +29,7 @@ func main() {
 		"model": "GLM-5.2", "stream": true,
 		"messages": []any{map[string]any{"role":"user","content":"hi"}},
 	}
-	rc, err := c.SendChatV2(context.Background(), body, "dbg", cred, cred.SecurityToken)
+	rc, err := c.SendChatV2(context.Background(), body, "dbg", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, "GLM-5.2"))
 	if err != nil { log.Fatalf("chat: %v", err) }
 	defer rc.Close()
 	br := bufio.NewReaderSize(rc, 64*1024)

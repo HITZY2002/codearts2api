@@ -10,3 +10,9 @@ config.json
 *.backup
 *.bak
 *.backup2
+
+# VS Code：只共享项目级调试/任务配置，个人设置（settings.json 等）不入库
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json

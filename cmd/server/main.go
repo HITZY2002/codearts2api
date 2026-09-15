@@ -45,6 +45,7 @@ func main() {
 	}
 
 	c := upstream.New(120 * time.Second)
+	c.SetBenefitAutoClaim(cfg.BenefitAutoClaim)
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,

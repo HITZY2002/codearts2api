@@ -53,6 +53,26 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。多轮上下文按账号自动续接（chat_id 分组）；也可用请求头
 `X-Codearts-Chat-Id: <chatId>` 或 body 里 `conversation_id` 显式指定会话。
 
+### 模型列表与限时福利
+
+`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
+同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
+（免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
+`maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
+列表是各账号可用模型的并集，实际路由会优先挑目录里真有这个模型的账号）。
+
+福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
+
+```bash
+go run ./cmd/models                 # 账号可用模型（内置 + 福利）
+go run ./cmd/models -json           # 机器可读
+go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，属写操作）
+```
+
+`POST /api/v1/benefit/claim` 是对账号的写操作，**默认不会自动执行**：
+`/v1/models`、聊天都只读。需要让服务端在发现模型时顺便领取，才把
+`benefit_auto_claim` 设为 `true`（或 `CA2A_BENEFIT_AUTO_CLAIM=1`）。
+
 ## 部署（systemd / Docker）
 
 ```bash
@@ -85,6 +105,7 @@ docker compose up -d --build
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
+| `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（写操作） | `false` |
 
 ## 目录结构
 
@@ -93,8 +114,9 @@ cmd/server/        HTTP 服务（config + main）
 cmd/login/         华为云 OAuth2 PKCE 登录
 cmd/credit/        账号登录态日报（新增并发信息）
 cmd/apply/         批量 token 续期（使用 pool 包）
+cmd/models/        查看账号可用模型（内置 + 限时福利，可选 -claim 领取）
 internal/auth/     auth 文件读写
-internal/upstream/ 云端客户端（登录/聊天/SSE）+ 逆向常量
+internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
 internal/server/   OpenAI 兼容路由

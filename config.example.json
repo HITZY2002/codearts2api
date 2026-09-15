@@ -1,4 +1,5 @@
 {
+  // 本文件可直接 `cp config.example.json config.json` 使用：// 与 /* */ 注释会被忽略。
   "listen": ":7866",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
@@ -9,6 +10,7 @@
     "err_threshold": 3,
     "err_cooldown": "10m"
   },
+  "benefit_auto_claim": false,   // 模型发现时自动领取限时福利（默认 false：属对账号的写操作）
   "max_concurrent": 5,           // 单账号最大并发数（默认 5）
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {
