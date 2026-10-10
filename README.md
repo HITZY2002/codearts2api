@@ -115,6 +115,25 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 `client_id` 与 `dpop_private_key`；刷新时原样复用并写回轮转后的新 refresh_token。
 若手工换过 `login_client_id`，老账号仍按自己记录的 client_id 刷新。
 
+### 每日签到与新手积分
+
+服务默认在启动和每次 watchdog 轮询时检查活动，自动领取每日签到积分及
+上游返回的可领取新用户积分。新增账号会在下一次轮询处理；也可在 WebUI
+点击「签到」/「全员签到」，或鉴权调用 `POST /admin/api/checkin`（可传 `{"uid":"账号 ID"}`）。
+领取后必须确认；已领取未确认时只补确认，已确认不重复领取。资格、金额、
+每日刷新和活动起止时间均以上游返回为准，失败会在下一次轮询重试，
+不会因活动接口故障冷却或禁用推理账号。
+
+`credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取，
+`watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
+这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果，
+不把领取量或健康账号数当作积分余额。`credit.sh` 查登录态，`apply.sh` 仅续期。
+
+当前[官方每日签到活动](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)
+为已升级积分计费的用户每日发放 1000 积分，30 天有效，活动截止于
+2026-12-31 00:00（UTC+8）；[新用户注册奖励](https://support.huaweicloud.com/price-codeartsagent/codeartsagent_billing_0029.html)
+为 4000 积分。无资格或已自动发放的新手奖励不会再次领取。
+
 ## 部署（systemd / Docker）
 
 ```bash
@@ -148,6 +167,7 @@ docker compose up -d --build
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
+| `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
 
 ## 目录结构

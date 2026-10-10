@@ -1,8 +1,4 @@
-// Package scheduler 提供 token 自动续期看门狗。
-//
-// CodeArts Agent 没有每日签到/申请额度接口（免费额度按月重置，见
-// codearts.huaweicloud.com/portal/settings/personal-usage）。本调度器
-// 周期性校验全部账号，临近过期的 token 自动走 oauth2 refresh_token 续期。
+// Package scheduler 提供 token 自动续期和活动积分自动领取。
 //
 // 增强功能：
 // - 主动保活：定期发送轻量级请求保持会话活跃
@@ -21,6 +17,7 @@ import (
 type Config struct {
 	Pool              *pool.Pool
 	Enabled           bool
+	CreditsAutoClaim  bool          // 自动领取每日签到/新手积分，与 Token 模型福利独立
 	PollInterval      time.Duration // 默认 30m
 	RefreshSkew       time.Duration // 到期前多久刷新，默认 30m
 	KeepaliveInterval time.Duration // 保活心跳间隔，默认 15m
@@ -69,9 +66,15 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// Tick 校验全部账号（自动续期 + 保活）。
+// Tick 校验启用账号（自动续期 + 保活 + 可选活动领取）。
 func (s *Scheduler) Tick(ctx context.Context) {
 	for _, acct := range s.cfg.Pool.Accounts() {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if !s.cfg.Pool.Enabled(acct.Name) {
+			continue
+		}
 		ok, _ := s.cfg.Pool.Validate(acct)
 		if ok {
 			remaining := acct.Auth.Remaining().Round(time.Minute)
@@ -84,6 +87,16 @@ func (s *Scheduler) Tick(ctx context.Context) {
 				} else if remaining <= s.cfg.RefreshSkew {
 					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,
 						acct.Auth.Remaining().Round(time.Minute))
+				}
+			}
+			if s.cfg.CreditsAutoClaim {
+				claimCtx, cancel := context.WithTimeout(ctx, time.Minute)
+				result, err := s.cfg.Pool.Checkin(claimCtx, acct.Name)
+				cancel()
+				if err != nil {
+					log.Printf("credit checkin failed account=%s err=%v", acct.Name, err)
+				} else {
+					log.Printf("credit checkin account=%s ok=%t message=%s", acct.Name, result.OK, result.Message)
 				}
 			}
 		} else {

@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"codearts2api/internal/auth"
 )
@@ -62,13 +64,13 @@ func readUIDBody(r *http.Request) (uidBody, error) {
 }
 
 type actionResult struct {
-	UID     string `json:"uid"`
-	OK      bool   `json:"ok"`
-	Credits int64  `json:"credits,omitempty"`
-	Message string `json:"message,omitempty"`
+	UID     string  `json:"uid"`
+	OK      bool    `json:"ok"`
+	Credits float64 `json:"credits,omitempty"`
+	Message string  `json:"message,omitempty"`
 }
 
-// adminCredits CodeArts 无积分；复用为 Validate/刷新状态。
+// adminCredits 保留旧路由，校验/刷新登录态；不把它当作真实积分查询。
 func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
@@ -110,9 +112,31 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// adminCheckin 无签到；映射为全员保活（refresh）。
+// adminCheckin 领取指定账号或全部启用账号的签到/新手活动积分。
 func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
-	h.adminKeepalive(w, r)
+	body, err := readUIDBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	results := make([]actionResult, 0)
+	for _, uid := range h.pickTargets(body.UID) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		result, err := h.cfg.Pool.Checkin(ctx, uid)
+		cancel()
+		res := actionResult{UID: uid, OK: result.OK, Credits: result.Credits, Message: result.Message}
+		if err != nil {
+			res.OK, res.Message = false, err.Error()
+		}
+		results = append(results, res)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": allOK(results), "message": summaryMsg("签到/新手领取", results), "results": results,
+	})
 }
 
 // adminKeepalive 刷新即将过期的 token。
