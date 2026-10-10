@@ -640,6 +640,9 @@ func embeddedSSEError(data string) *ApiError {
 		strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		// 模型级错误（该账号用不了这个模型）是客户端问题，不是上游故障。
 		status = http.StatusBadRequest
+	case strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid"):
+		// 请求参数无效（实测：tool_choice 对象形态触发）：客户端问题，不是账号故障。
+		status = http.StatusBadRequest
 	}
 	return &ApiError{Code: status, Status: status, Message: truncateStr(combined, 300), Path: EpChatV2}
 }

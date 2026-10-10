@@ -670,6 +670,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	tools, err := nativeTools(req.Tools, req.ToolChoice)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	affinity := r.Header.Get("X-Codearts-Chat-Id")
 	if affinity == "" {
 		affinity = r.Header.Get("X-Session-Affinity")
@@ -768,7 +773,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			MaxTokens:       req.MaxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
-			Tools:           req.Tools,
+			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
 		}
 		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
@@ -821,6 +826,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			if isParamInvalidError(serr) {
+				// Client request-param problem: rotating accounts yields the same 400,
+				// and cooling accounts takes down the whole pool for minutes.
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
+				return
+			}
 			lastErr = serr
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
@@ -861,7 +873,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				if !isParamInvalidError(werr) {
+					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				}
 			} else {
 				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
@@ -872,6 +886,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 		if aerr != nil {
+			if isParamInvalidError(aerr) {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
+				return
+			}
 			lastErr = aerr
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
 			continue
@@ -983,12 +1002,39 @@ func pairedToolMessages(messages []openAIMessage) (map[int]bool, map[int]bool) {
 	return keepCalls, keepResults
 }
 
+// nativeTools preserves a named function choice by exposing only that function
+// to the upstream, whose tool_choice accepts strings but not a named object.
+func nativeTools(tools []map[string]any, choice toolChoiceOpenAI) ([]map[string]any, error) {
+	if choice.Mode != "function" {
+		return tools, nil
+	}
+	var selected map[string]any
+	for _, tool := range tools {
+		fn, ok := tool["function"].(map[string]any)
+		if !ok || fn["name"] != choice.Function {
+			continue
+		}
+		if selected != nil {
+			return nil, fmt.Errorf("tool_choice function %q is defined more than once", choice.Function)
+		}
+		selected = tool
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("tool_choice function %q is not defined in tools", choice.Function)
+	}
+	return []map[string]any{selected}, nil
+}
+
 func nativeToolChoice(choice toolChoiceOpenAI) any {
 	switch choice.Mode {
 	case "none", "required":
 		return choice.Mode
 	case "function":
-		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Function}}
+		// CodeArts InferHub only accepts string-form tool_choice; the object form
+		// is rejected with InferHub.001001005.400 param invalid (measured 2026-10-06).
+		// nativeTools limits the tools to the named function, so "required"
+		// preserves the client's forced-function constraint.
+		return "required"
 	default:
 		return "auto"
 	}
@@ -1055,6 +1101,9 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 // 返回 true 表示这是「模型对这个账号不可用」的模型级错误：调用方应立即结束
 // 轮转并向客户端返回明确错误（换账号也是同样的结果）。
 func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
+	if isParamInvalidError(err) {
+		return false
+	}
 	var ae *upstream.ApiError
 	if errors.As(err, &ae) {
 		// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
@@ -1084,6 +1133,27 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 	}
 	h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	return false
+}
+
+// isParamInvalidError 判断是否为上游「请求参数无效」类错误（InferHub.001001005）。
+// 这类错误是客户端请求形状问题：换账号结果相同，绝不能冷却账号（曾因此打停整池）。
+func isParamInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *upstream.ApiError
+	var streamErr *upstream.UpstreamError
+	var message string
+	switch {
+	case errors.As(err, &apiErr):
+		message = apiErr.Message
+	case errors.As(err, &streamErr):
+		message = streamErr.Code + " " + streamErr.Msg
+	default:
+		return false
+	}
+	low := strings.ToLower(message)
+	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

@@ -57,6 +57,11 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 `choices: []` 的 usage chunk；其余 chunk 的 `usage` 为 `null`。未启用时不返回 usage。
 流式和非流式均优先使用上游 usage；上游未提供时按文本长度估算，估算值不是精确 token 计数。
 
+工具调用支持 `tool_choice` 的 `auto` / `none` / `required` 及指定函数对象。
+指定函数时，网关只向上游发送该函数的定义，并转换为上游支持的字符串 `required`；
+指定函数不存在或重复定义时返回 400。上游 `InferHub.001001005` 参数错误也返回 400，
+不轮换、不冷却账号；若流式响应已开始，则用 SSE 错误事件结束，同样不处罚账号。
+
 ### 模型列表与限时福利
 
 `/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
