@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+func TestCreditsAutoClaimConfigAndEnv(t *testing.T) {
+	t.Setenv("CA2A_API_KEY", "test-key")
+	t.Setenv("CA2A_CREDITS_AUTO_CLAIM", "")
+	if cfg, err := Load(""); err != nil || !cfg.CreditsAutoClaim {
+		t.Fatalf("auto claim default disabled: err=%v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"credits_auto_claim":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil || cfg.CreditsAutoClaim {
+		t.Fatalf("config opt-out ignored: err=%v", err)
+	}
+	t.Setenv("CA2A_CREDITS_AUTO_CLAIM", "1")
+	if cfg, err := Load(path); err != nil || !cfg.CreditsAutoClaim {
+		t.Fatalf("env override ignored: err=%v", err)
+	}
+	t.Setenv("CA2A_CREDITS_AUTO_CLAIM", "0")
+	if cfg, err := Load(""); err != nil || cfg.CreditsAutoClaim {
+		t.Fatalf("env opt-out ignored: err=%v", err)
+	}
+}
+
 // 仓库自带的 config.example.json 含 // 注释，README 让人直接 cp 成 config.json；
 // 带注释的配置必须能加载，否则快起步就断在第一步。
 func TestLoadToleratesExampleConfigComments(t *testing.T) {

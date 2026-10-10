@@ -1,7 +1,6 @@
 // credit 工具：查询全部账号登录态（token 剩余有效期/状态）。
 //
-// CodeArts Agent 没有积分/额度查询接口：免费额度按月重置，见
-// https://codearts.huaweicloud.com/portal/settings/personal-usage
+// 本工具只查询登录态；活动积分由服务的 watchdog 或面板签到按钮领取。
 // 用法：credit [-auth-dir ./auths] [-json] [-uid <uid>]
 package main
 

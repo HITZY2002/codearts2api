@@ -37,6 +37,8 @@ type Account struct {
 
 	mu                sync.Mutex
 	refreshMu         sync.Mutex
+	checkinMu         sync.Mutex
+	checkin           *CheckinStatus
 	lastValidated     time.Time
 	errCount          int
 	coolUntil         time.Time
@@ -58,6 +60,7 @@ type Config struct {
 	MaxConcurrent   int                  // 单账号最大并发数（默认 5）
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
+	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
 }
 
 // Pool 账号池。
@@ -188,7 +191,8 @@ func (p *Pool) List() []map[string]any {
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
-			"credits":           int64(0), // CodeArts 无积分字段；面板仍显示
+			"credits":           int64(0), // 保留旧字段；未查询真实余额
+			"checkin":           a.checkin,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
 			"until":             until,
@@ -456,6 +460,17 @@ func (p *Pool) Healthy(name string) bool {
 		}
 	}
 	return false
+}
+
+// Enabled 报告账号是否启用；冷却期间仍需续期。
+func (p *Pool) Enabled(name string) bool {
+	a := p.Get(name)
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.disabled
 }
 
 // AcquireLock 尝试获取账号的并发请求锁。返回 true 表示成功，false 表示已达上限。

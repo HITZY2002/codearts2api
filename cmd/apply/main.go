@@ -1,6 +1,5 @@
-// apply 工具：批量刷新即将过期的 token（对应其他项目的自动签到）。
-//
-// CodeArts 无签到/无申请额度接口，本工具等价动作 = oauth2 refresh_token 续期。
+// apply 工具：批量刷新即将过期的 token。
+// 每日签到/新手积分由服务的 watchdog 或面板签到按钮领取，与续期独立。
 // 用法：apply [-auth-dir ./auths] [-force]
 package main
 

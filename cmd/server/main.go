@@ -50,6 +50,7 @@ func main() {
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
 		Enabled:           cfg.Watch.Enabled,
+		CreditsAutoClaim:  cfg.CreditsAutoClaim,
 		PollInterval:      time.Duration(cfg.Watch.PollMinutes) * time.Minute,
 		RefreshSkew:       time.Duration(cfg.Watch.RefreshSkewM) * time.Minute,
 		KeepaliveInterval: time.Duration(cfg.Watch.KeepaliveInterval) * time.Minute,
@@ -74,6 +75,7 @@ func main() {
 		ConvStateFile:    cfg.StateFile + ".chats.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
+			"credits_auto_claim":   cfg.CreditsAutoClaim,
 			"poll_minutes":         cfg.Watch.PollMinutes,
 			"refresh_skew_minutes": cfg.Watch.RefreshSkewM,
 			"keepalive_interval":   cfg.Watch.KeepaliveInterval,

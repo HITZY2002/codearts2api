@@ -136,13 +136,13 @@ input{font:inherit}
       <div class="logo">__LOGO__</div>
       <div>
         <h1>__SERVICE_TITLE__</h1>
-        <p id="subTitle">账号池 · 签到 · 积分 · 模型</p>
+        <p id="subTitle">账号池 · 签到及新手福利 · 模型</p>
       </div>
     </div>
     <div class="actions">
       <button class="btn primary" id="btnAddAccount">＋ 授权登录</button>
       <button class="btn" id="btnRefresh">刷新</button>
-      <button class="btn" id="btnCredits">拉积分</button>
+      <button class="btn" id="btnCredits">校验账号</button>
       <button class="btn" id="btnCheckin">全员签到</button>
       <button class="btn" id="btnKeepalive">保活 Token</button>
       <button class="btn" id="btnReload">重载 auths</button>
@@ -154,7 +154,7 @@ input{font:inherit}
     <div class="stat"><div class="k">账号总数</div><div class="v" id="sTotal">—</div></div>
     <div class="stat"><div class="k">健康可用</div><div class="v" id="sHealthy">—</div></div>
     <div class="stat"><div class="k">冷却 / 禁用</div><div class="v" id="sBad">—</div></div>
-    <div class="stat"><div class="k">积分合计</div><div class="v" id="sCredits">—</div></div>
+    <div class="stat"><div class="k">自动签到 / 新手领取</div><div class="v" id="sCredits">—</div></div>
   </div>
 
   <div class="card">
@@ -170,7 +170,7 @@ input{font:inherit}
         <thead>
           <tr>
             <th>账号</th>
-            <th>积分</th>
+            <th>签到 / 新手福利</th>
             <th>状态</th>
             <th>原因 / 冷却至</th>
             <th>操作</th>
@@ -299,7 +299,7 @@ function render(data){
   $("sTotal").textContent = st.total ?? 0;
   $("sHealthy").textContent = st.healthy ?? 0;
   $("sBad").textContent = `${st.cooling??0} / ${st.disabled??0}`;
-  $("sCredits").textContent = Number(st.credits||0).toLocaleString();
+  $("sCredits").textContent = data.schedule?.watch?.enabled && data.schedule?.watch?.credits_auto_claim ? "已开启" : "已关闭";
   $("updatedAt").textContent = "更新于 " + new Date().toLocaleTimeString();
   $("baseUrl").textContent = location.origin + BASE + "/v1";
   $("subTitle").textContent = (data.service || SERVICE) + " · " + (data.region || "cn");
@@ -317,11 +317,11 @@ function render(data){
           <div><strong>${escapeHtml(a.nickname || "未命名")}</strong></div>
           <div class="mono muted" title="${escapeHtml(a.uid||"")}">${escapeHtml(shortUID(a.uid))}</div>
         </td>
-        <td><strong>${Number(a.credits||0).toLocaleString()}</strong></td>
+        <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div></td>
         <td>${statusBadge(a)}${a.err_count?` <span class="badge info">err ${a.err_count}</span>`:""}</td>
         <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(until)}</div></td>
         <td><div class="row-actions">
-          <button class="btn" data-act="credits" data-uid="${escapeAttr(a.uid)}">积分</button>
+          <button class="btn" data-act="credits" data-uid="${escapeAttr(a.uid)}">校验</button>
           <button class="btn" data-act="checkin" data-uid="${escapeAttr(a.uid)}">签到</button>
           ${a.disabled
             ? `<button class="btn" data-act="enable" data-uid="${escapeAttr(a.uid)}">启用</button>`
@@ -340,6 +340,7 @@ function render(data){
 
   const sch = data.schedule || {};
   const chips = [];
+  if (sch.watch?.enabled && sch.watch?.credits_auto_claim) chips.push(`<span class="chip">自动签到 / 新手领取 · 每 ${Number(sch.watch.poll_minutes)||30} 分钟检查</span>`);
   if (sch.checkin_hours?.length) chips.push(`<span class="chip">签到 ${sch.checkin_hours.map(h=>String(h).padStart(2,"0")+":00").join(" / ")}</span>`);
   if (sch.keepalive_hours?.length) chips.push(`<span class="chip">保活 ${sch.keepalive_hours.map(h=>String(h).padStart(2,"0")+":00").join(" / ")}</span>`);
   $("schedChips").innerHTML = chips.join("") || `<span class="muted">未配置</span>`;
