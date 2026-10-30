@@ -3,6 +3,16 @@
 > 华为云 CodeArts Agent（盘古助手/码道）的 OpenAI 兼容代理。**无需运行 CodeArts Agent
 > 客户端**，纯 Go 直连华为云 API，多账号轮转 + token 自动续期 + WebUI。
 
+### 其它相关项目
+
+除了 CodeArts，如果你手上还有别的 AI 编程账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **华为云 CodeArts 码道**（每日领取 + 积分总览：每天能领多少 / 一共还剩多少 / 将过期），另外还统管 **WorkBuddy / CodeBuddy / Trae / Qoder / MiniMax / 豆包 Doubao**，全部账号共用一个 OpenAI 兼容网关。
+
+---
+
 ## 参考项目
 
 本项目是 [Sliverkiss](https://github.com/Sliverkiss) 同系列开源项目的延伸实现，架构与运维形态参考了以下仓库：
