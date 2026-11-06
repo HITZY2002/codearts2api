@@ -1,14 +1,24 @@
 services:
   codearts2api:
-    build: .
+    image: codearts2api:latest
+    build:
+      context: .
+      args:
+        APK_MIRROR: https://mirrors.aliyun.com
     container_name: codearts2api
     restart: unless-stopped
     ports:
       - "7866:7866"
     environment:
-      CA2A_API_KEY: ${CA2A_API_KEY:?需要设置 CA2A_API_KEY（写 .env 或 export 到环境变量）}
+      CA2A_API_KEY: ${CA2A_API_KEY:?需要设置 CA2A_API_KEY（.env 里已生成）}
       TZ: Asia/Shanghai
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7866/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

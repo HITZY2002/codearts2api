@@ -38,9 +38,12 @@ type Config struct {
 	QueueMaxAttempts int
 	DefaultModel     string
 	ConvStateFile    string
-	WatchInfo        map[string]any
-	AuthDir          string
-	Listen           string
+	// AvailStateFile 模型可用性结论快照（重启后复用，避免再把「无权调用」的
+	// 模型列进 /v1/models）。空则不做持久化。
+	AvailStateFile string
+	WatchInfo      map[string]any
+	AuthDir        string
+	Listen         string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
 	OAuthClient *upstream.Client
 	// LoginConfig WebUI 登录配置（client_id 以官方客户端为准）。
@@ -535,10 +538,12 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RUnlock()
 
 	var sets [][]upstream.ModelInfo
+	attempted := 0
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
+		attempted++
 		if !upstream.AccountCatalogStale(acct.UID) {
 			if infos, ok := upstream.AccountModels(acct.UID); ok {
 				sets = append(sets, infos)
@@ -558,9 +563,13 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	infos := upstream.MergeModels(sets...)
 	if len(infos) == 0 {
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
+		// 账号还没就绪（启动瞬间 / 全部冷却）不算「发现失败」：否则 5 分钟负缓存
+		// 会把 /v1/models 锁死在静态兜底表上，客户端看到的是一堆不可用模型。
+		if attempted > 0 {
+			dynamicModelsCache.Lock()
+			dynamicModelsCache.lastFail = time.Now()
+			dynamicModelsCache.Unlock()
+		}
 		return nil
 	}
 	dynamicModelsCache.Lock()
@@ -705,8 +714,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
 	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
 	if h.modelKnownUnusable(model) {
-		writeOpenAIError(w, http.StatusNotFound, "model_not_available",
-			"model "+model+" is not available on any configured account")
+		// 把探测时记下的原因带上：最常见的是 TM.000010051「当前账号无权调用该
+		// 模型」（账号没开通这个模型/套餐），光说 not available 用户无从下手。
+		reason := ""
+		for _, acct := range h.cfg.Pool.Accounts() {
+			if acct == nil || acct.Auth == nil {
+				continue
+			}
+			if _, r := modelAvailability(acct.UID, model); r != "" {
+				reason = r
+				break
+			}
+		}
+		msg := "model " + model + " is not available on any configured account"
+		if reason != "" {
+			msg += "：" + reason
+		}
+		msg += "；可用模型见 GET /v1/models"
+		writeOpenAIError(w, http.StatusNotFound, "model_not_available", msg)
 		return
 	}
 
@@ -782,6 +807,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
+		variantTried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
@@ -822,6 +848,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			// 模型 ID 大小写兜底：上游把一部分模型按内部小写 ID 注册（实测
+			// DeepSeek-V4.1-Flash / GLM-5.3 / Kimi-K3 / OpenPangu-2.0-Pro 只认小写，
+			// 而 GLM-5.2 / Qwen3-VL-235B 只认目录大写名）。写法不对时上游回
+			// TM.000010051「您当前无权调用该模型」，和真的没权限一模一样，
+			// 客户端在码道官方客户端里却能用——差别只在模型 ID 的写法。
+			if isModelNameError(serr) {
+				if !variantTried {
+					if alt := upstream.ModelVariant(model); alt != "" {
+						variantTried = true
+						upstream.SetModelAlias(model, alt)
+						log.Printf("model %s: 上游注册写法是 %q，改用该写法重试 account=%s", model, alt, acct.Name)
+						continue
+					}
+				} else {
+					// 换写法同样失败：撤销学习，按模型不可用处理。
+					upstream.ClearModelAlias(model)
+				}
+			}
 			break // 非并发错误，跳出重试
 		}
 		if serr != nil {
@@ -837,7 +881,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
-					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
+					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200)+
+						"；请用 GET /v1/models 返回的模型（本账号当前可用：支持列表里保留的条目）")
 				return
 			}
 			continue
@@ -1154,6 +1199,21 @@ func isParamInvalidError(err error) bool {
 	}
 	low := strings.ToLower(message)
 	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
+}
+
+// isModelNameError 判断是否为「模型 ID 写法不对」类错误。
+//
+// 上游同一账号下，有的模型按内部小写 ID 注册（deepseek-v4.1-flash、glm-5.3、
+// kimi-k3、openpangu-2.0-pro…），有的按目录大写名注册（GLM-5.2、Qwen3-VL-235B）。
+// 写法不对时返回 502 + TM.000010051「您当前无权调用该模型，请联系企业管理员开通」，
+// 与真正的权限不足文案完全一致（实测 2026-11-06，改大小写即恢复）。
+func isModelNameError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "tm.000010051") || strings.Contains(low, "无权调用该模型") ||
+		strings.Contains(low, "002002009") || strings.Contains(low, "not registered")
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

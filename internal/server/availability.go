@@ -3,7 +3,11 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -76,8 +80,11 @@ var availability = struct {
 	lastTraffic map[string]time.Time
 }{byKey: map[string]availEntry{}, probing: map[string]bool{}, lastTraffic: map[string]time.Time{}}
 
+// availKey 统一用 CanonicalModel 归一后的 ID 作键：客户端写小写别名、"智速模式"
+// 这种展示名时，与探测用的目录 ID 才落在同一条记录上（否则真实流量的结论和探测
+// 的结论互不相认，别名请求还会被「所有账号都不可用」预检挡掉）。
 func availKey(accountID, model string) string {
-	return accountID + "|" + strings.ToLower(model)
+	return accountID + "|" + strings.ToLower(upstream.CanonicalModel(model))
 }
 
 // modelAvailability 返回缓存的可用性；过期视为未知。
@@ -143,6 +150,13 @@ func upstreamUnavailableReason(err error) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(msg, "tm.000010051") || strings.Contains(msg, "无权调用该模型"):
+		// 2026-11-06 实测：agent-center/builtin 会列出账号并未开通权限的模型
+		// （DeepSeek-V4.1-Flash / GLM-5.3 / Kimi-K3 / OpenPangu 等），请求一律
+		// 返回 502 + TM.000010051「您当前无权调用该模型，请联系企业管理员开通」。
+		// 这是账号级权限差异，不是账号故障：归为模型不可用（不冷却账号、从
+		// /v1/models 隐藏），否则一次试探就把整个账号冷却 10 分钟。
+		return "当前账号无权调用该模型（需在华为云 CodeArts 控制台为该账号开通模型/套餐权限）"
 	}
 	return ""
 }
@@ -183,13 +197,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	body := map[string]any{
-		"model":    upstream.CanonicalModel(model),
-		"stream":   true,
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	}
-	rc, err := acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken,
-		upstream.IsBenefitModel(acct.UID, model))
+	rc, err := h.probeSend(ctx, acct, cred, model, upstream.IsBenefitModel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {
@@ -227,6 +235,35 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	log.Printf("probe %s/%s: 可用", acct.Name, model)
 }
 
+// probeSend 发一条最小 chat 探测；模型 ID 大小写不对时（TM.000010051 /
+// not registered）换另一种写法再试一次，并把可用写法记住——真实请求走同一套
+// 学习结果（见 handler.go 的 variantTried 逻辑）。
+func (h *Handler) probeSend(ctx context.Context, acct *pool.Account, cred upstream.SignCredential, model string, benefit bool) (io.ReadCloser, error) {
+	send := func(m string) (io.ReadCloser, error) {
+		body := map[string]any{
+			"model":    m,
+			"stream":   true,
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		}
+		return acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken, benefit)
+	}
+	rc, err := send(upstream.CanonicalModel(model))
+	if err == nil || !isModelNameError(err) {
+		return rc, err
+	}
+	alt := upstream.ModelVariant(model)
+	if alt == "" {
+		return rc, err
+	}
+	upstream.SetModelAlias(model, alt)
+	rc2, err2 := send(alt)
+	if err2 != nil {
+		upstream.ClearModelAlias(model)
+		return rc2, err2
+	}
+	return rc2, nil
+}
+
 // upstreamUnavailableReasonText 同 upstreamUnavailableReason，作用于响应正文。
 func upstreamUnavailableReasonText(s string) string {
 	low := strings.ToLower(s)
@@ -235,12 +272,121 @@ func upstreamUnavailableReasonText(s string) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(low, "tm.000010051") || strings.Contains(low, "无权调用该模型"):
+		return "当前账号无权调用该模型（需在华为云 CodeArts 控制台为该账号开通模型/套餐权限）"
 	}
 	return ""
 }
 
+// ---------------------------------------------------------------------------
+// 可用性结论持久化
+//
+// 探测很贵：每个模型一条真实 chat（间隔 20s 防 TM.00001041），且要求账号空闲
+// 10 分钟才允许探测。结论只存在内存里，重启后 /v1/models 又会把「当前账号无权
+// 调用」（TM.000010051）的模型全列出来，客户端点开就是 404。这里落盘复用。
+// ---------------------------------------------------------------------------
+
+func loadAvailability(path string) {
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var dump struct {
+		Entries map[string]struct {
+			State  int       `json:"state"`
+			Reason string    `json:"reason"`
+			At     time.Time `json:"at"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		log.Printf("availability: ignore bad state file %s: %v", path, err)
+		return
+	}
+	n := 0
+	availability.Lock()
+	for k, v := range dump.Entries {
+		if time.Since(v.At) > availabilityTTL {
+			continue // 过期结论不复活
+		}
+		availability.byKey[k] = availEntry{state: availState(v.State), reason: v.Reason, at: v.At}
+		n++
+	}
+	availability.Unlock()
+	if n > 0 {
+		log.Printf("availability: restored %d cached verdict(s) from %s", n, path)
+	}
+}
+
+// saveAvailability 原子写入可用性快照。
+func saveAvailability(path string) {
+	if path == "" {
+		return
+	}
+	availability.Lock()
+	dump := struct {
+		Entries map[string]struct {
+			State  int       `json:"state"`
+			Reason string    `json:"reason"`
+			At     time.Time `json:"at"`
+		} `json:"entries"`
+	}{Entries: make(map[string]struct {
+		State  int       `json:"state"`
+		Reason string    `json:"reason"`
+		At     time.Time `json:"at"`
+	}, len(availability.byKey))}
+	for k, v := range availability.byKey {
+		if time.Since(v.at) > availabilityTTL {
+			continue
+		}
+		dump.Entries[k] = struct {
+			State  int       `json:"state"`
+			Reason string    `json:"reason"`
+			At     time.Time `json:"at"`
+		}{State: int(v.state), Reason: v.reason, At: v.at}
+	}
+	availability.Unlock()
+	raw, err := json.Marshal(dump)
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o700)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+// startAvailabilityPersister 定期把可用性结论落盘（退出前再存一次）。
+func (h *Handler) startAvailabilityPersister(ctx context.Context) {
+	path := h.cfg.AvailStateFile
+	if path == "" {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				saveAvailability(path)
+				return
+			case <-ticker.C:
+				saveAvailability(path)
+			}
+		}
+	}()
+}
+
 // StartAvailabilityProber 供 main 启动后台探测器。
-func (h *Handler) StartAvailabilityProber(ctx context.Context) { h.startAvailabilityProber(ctx) }
+func (h *Handler) StartAvailabilityProber(ctx context.Context) {
+	loadAvailability(h.cfg.AvailStateFile)
+	h.startAvailabilityProber(ctx)
+	h.startAvailabilityPersister(ctx)
+}
 
 // startAvailabilityProber 后台周期性探测：把「发现到但还没结论」的模型试一遍。
 // 只在有账号且拿到目录后才干活，避免空转打上游。
@@ -298,11 +444,25 @@ func (h *Handler) pendingProbes() []pendingProbe {
 		if !ok {
 			continue
 		}
+		seen := map[string]bool{}
 		for _, mi := range models {
+			seen[strings.ToLower(mi.ID)] = true
 			if st, _ := modelAvailability(acct.UID, mi.ID); st != availUnknown {
 				continue
 			}
 			out = append(out, pendingProbe{acct: acct, model: mi.ID})
+		}
+		// 静态兜底表里的条目（尤其福利种子）不在账号目录里，也必须探测一次：
+		// 账号没有福利渠道时它们会一直挂在 /v1/models 上，客户端点了就报
+		// InferHub.4004.200。探出结论后 modelKnownUnusable 才会把它们摘掉。
+		for _, sm := range staticModels {
+			if seen[strings.ToLower(sm.ID)] {
+				continue
+			}
+			if st, _ := modelAvailability(acct.UID, sm.ID); st != availUnknown {
+				continue
+			}
+			out = append(out, pendingProbe{acct: acct, model: sm.ID})
 		}
 	}
 	return out

@@ -170,6 +170,21 @@ docker compose up -d --build
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
 
+### 排查模型 ID 写法 / 账号权益
+
+```bash
+# 逐个写法试打上游（只读）：确认某模型在这台账号上到底该用哪种写法
+go run ./cmd/modeltest -auth-dir ./auths -gap 12s "DeepSeek-V4.1-Flash" "deepseek-v4.1-flash"
+
+# 身份 / 积分活动 / 福利渠道 只读诊断（caller-identity、current/user、delivery、benefit claim）
+go run ./cmd/diag -auth-dir ./auths
+```
+
+详见 [docs/model-id-casing.md](docs/model-id-casing.md)：上游对同一账号下的不同模型
+注册写法不统一（`GLM-5.2` 认大写、`deepseek-v4.1-flash` 只认小写），写错大小写
+返回的是 `TM.000010051 您当前无权调用该模型`，与真正的权限不足文案一致。
+服务端已内置「换写法自动重试 + 学习」，两种写法都能用。
+
 ## 目录结构
 
 ```
@@ -178,6 +193,8 @@ cmd/login/         华为云 OAuth2 PKCE 登录
 cmd/credit/        账号登录态日报（新增并发信息）
 cmd/apply/         批量 token 续期（使用 pool 包）
 cmd/models/        查看账号可用模型（内置 + 限时福利，可选 -claim 领取）
+cmd/diag/          账号身份/积分活动/福利渠道 只读诊断
+cmd/modeltest/     逐个模型试打，确认上游认的 ID 写法
 internal/auth/     auth 文件读写
 internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）

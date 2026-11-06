@@ -416,6 +416,25 @@ type ChatOptions struct {
 // （见 models.go 的 known 索引）优先做大小写不敏感归一；旧版小写别名走下面的
 // 静态映射兜底；都不认识就原样透传。
 func CanonicalModel(id string) string {
+	base := canonicalBase(id)
+	// 学到的「上游实际注册写法」优先：同一个账号里 GLM-5.2 / Qwen3-VL-235B 只认
+	// 目录大写名，而 DeepSeek-V4.1-Flash / GLM-5.3 / Kimi-K3 / OpenPangu-2.0-Pro
+	// 只认内部小写 ID，写错大小写上游一律回 TM.000010051「您当前无权调用该模型」，
+	// 看起来跟没权限一模一样（实测 2026-11-06）。
+	if alias, ok := lookupModelAlias(base); ok {
+		return alias
+	}
+	return base
+}
+
+// canonicalBase 按目录/静态映射把用户写法归一到「展示用 ID」，不含学习到的别名。
+func canonicalBase(id string) string {
+	// 展示名别名必须在目录查表之前处理：模型发现会把「智速模式」也当成一个 ID
+	// 返回，查表命中后就轮不到下面的 switch 了（实测该 ID 直接透传会被上游判
+	// TM.000010051 无权调用，而 speed 正常，二者是同一个路由模型）。
+	if id == "智速模式" {
+		return "speed"
+	}
 	if exact, ok := lookupKnownModel(id); ok {
 		return exact
 	}
@@ -435,6 +454,59 @@ func CanonicalModel(id string) string {
 	default:
 		return id
 	}
+}
+
+// modelAliases 记录「展示名 → 上游实际注册写法」的学习结果。
+var modelAliases = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: map[string]string{}}
+
+// SetModelAlias 记住「目录归一后的模型 ID」在上游实际要用 to 这种写法发。
+//
+// 归一化很重要：客户端可能写 "deepseek-v4.1-flash"（小写）也可能写
+// "DeepSeek-V4.1-Flash"（目录名），两者都会归一到同一个 base，别名只需记一份。
+func SetModelAlias(from, to string) {
+	base := canonicalBase(from)
+	to = strings.TrimSpace(to)
+	if base == "" || to == "" || to == base {
+		return // 与归一结果写法一致，无需记录
+	}
+	modelAliases.Lock()
+	if modelAliases.m == nil {
+		modelAliases.m = map[string]string{}
+	}
+	modelAliases.m[strings.ToLower(base)] = to
+	modelAliases.Unlock()
+}
+
+// ClearModelAlias 撤销学习结果（换写法重试仍失败时调用，避免把错误写法固化）。
+func ClearModelAlias(from string) {
+	key := strings.ToLower(canonicalBase(from))
+	modelAliases.Lock()
+	delete(modelAliases.m, key)
+	modelAliases.Unlock()
+}
+
+func lookupModelAlias(base string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(base))
+	modelAliases.RLock()
+	defer modelAliases.RUnlock()
+	v, ok := modelAliases.m[key]
+	return v, ok
+}
+
+// ModelVariant 返回同一模型的另一种大小写写法，用于 TM.000010051 兜底重试。
+// 没有可换的写法（大小写已一致且目录里没有对应写法）时返回空串。
+func ModelVariant(model string) string {
+	base := canonicalBase(model)
+	if low := strings.ToLower(base); low != base {
+		return low
+	}
+	if exact, ok := lookupKnownModel(base); ok && exact != base {
+		return exact
+	}
+	return ""
 }
 
 // ChatHeadersV2 组装 /api/v2/chat/completions 请求头。
