@@ -123,6 +123,10 @@ type Client struct {
 	// 避免每次 /v1/models 刷新都空等超时。
 	srcMu   sync.Mutex
 	srcFail map[string]time.Time
+
+	// Each pool account has its own client. Keep accepted model IDs separate
+	// for its normal and benefit routes.
+	chatModelIDs sync.Map // chatModelKey -> accepted spelling
 }
 
 // srcFailCooldown 上游某一来源连续失败后的退避窗口。
@@ -469,7 +473,7 @@ func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatM
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
 func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
 	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit)
+	return c.sendModelChatV2(ctx, body, model, traceID, cred, chatID, sessionIDFor(chatID), benefit)
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
@@ -546,6 +550,60 @@ func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID st
 	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
 }
 
+// ProbeModel sends the same minimal chat used for model availability checks.
+func (c *Client) ProbeModel(ctx context.Context, model string, cred SignCredential, benefit bool) (io.ReadCloser, error) {
+	body := map[string]any{
+		"stream":   true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	return c.sendModelChatV2(ctx, body, model, "", cred, "", "", benefit)
+}
+
+type chatModelKey struct {
+	id      string
+	benefit bool
+}
+
+func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model, traceID string, cred SignCredential, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+	canonical := CanonicalModel(model)
+	lower := strings.ToLower(canonical)
+	key := chatModelKey{id: lower, benefit: benefit}
+	first, alternate := canonical, lower
+	if original := strings.TrimSpace(model); canonical == lower && strings.EqualFold(canonical, original) {
+		alternate = original
+	}
+	if id, ok := c.chatModelIDs.Load(key); ok && id != canonical {
+		first, alternate = id.(string), canonical
+	}
+
+	body["model"] = first
+	rc, err := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	if err == nil || alternate == first || !isModelIDError(err.Error()) {
+		return rc, err
+	}
+
+	// InferHub can report an ID spelling mismatch as a permission error.
+	// Retry once with the other spelling on the same account and route.
+	body["model"] = alternate
+	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	if retryErr == nil {
+		c.chatModelIDs.Store(key, alternate)
+	} else if IsModelAccessErrorMessage(err.Error()) && isModelIDError(retryErr.Error()) {
+		// An unregistered alternate spelling does not resolve the original denial.
+		return nil, err
+	}
+	return rc, retryErr
+}
+
+// IsModelAccessErrorMessage identifies an upstream model permission error.
+func IsModelAccessErrorMessage(message string) bool {
+	return strings.Contains(strings.ToLower(message), "tm.000010051") || strings.Contains(message, "无权调用该模型")
+}
+
+func isModelIDError(message string) bool {
+	return IsModelAccessErrorMessage(message) || strings.Contains(strings.ToLower(message), "inferhub.002002009")
+}
+
 // sendChatV2 发送聊天请求并返回 SSE 流。
 //
 // chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
@@ -586,21 +644,27 @@ type replayReadCloser struct {
 	io.Closer
 }
 
-// preflightSSE 只读到首个 data 事件：正常事件原样回放，不破坏流式；
-// HTTP 200 里内嵌的 CodeArts 排队/TPM 错误则在响应头发给客户端前
-// 转为 ApiError，让上层可以重试整个请求。
+// preflightSSE surfaces business errors before streaming starts. A role-only
+// chunk can precede a model rejection, so keep it buffered until the next event.
 func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
 	br := bufio.NewReaderSize(body, 1<<20)
 	var prefix bytes.Buffer
+	sawRole := false
 	for prefix.Len() < 2<<20 {
 		line, err := br.ReadString('\n')
 		prefix.WriteString(line)
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if apiErr := embeddedSSEError(data); apiErr != nil {
+			var payload map[string]any
+			_ = json.Unmarshal([]byte(data), &payload)
+			if apiErr := embeddedSSEError(payload); apiErr != nil && (!sawRole || isModelIDError(apiErr.Message)) {
 				_ = body.Close()
 				return nil, apiErr
+			}
+			if !sawRole && err == nil && isRoleOnlyChatChunk(payload) {
+				sawRole = true
+				continue
 			}
 			return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), br), Closer: body}, nil
 		}
@@ -615,20 +679,36 @@ func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
 	return &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), br), Closer: body}, nil
 }
 
+func isRoleOnlyChatChunk(payload map[string]any) bool {
+	choices, _ := payload["choices"].([]any)
+	if len(choices) != 1 {
+		return false
+	}
+	delta, finish := deltaFromChunk(payload)
+	if delta["role"] != "assistant" || finish != "" {
+		return false
+	}
+	for key, value := range delta {
+		if key != "role" && value != nil && value != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // embeddedSSEError 识别 HTTP 200 里内嵌的上游业务错误。
-func embeddedSSEError(data string) *ApiError {
-	if data == "" || data == "[DONE]" {
-		return nil
-	}
-	var payload map[string]any
-	if json.Unmarshal([]byte(data), &payload) != nil {
-		return nil
-	}
+func embeddedSSEError(payload map[string]any) *ApiError {
 	code, _ := payload["error_code"].(string)
-	if code == "" || code == "0" {
-		return nil
-	}
 	message, _ := payload["error_msg"].(string)
+	if code == "" || code == "0" {
+		code, _ = payload["code"].(string)
+		if message == "" {
+			message, _ = payload["message"].(string)
+		}
+		if !isModelIDError(code + " " + message) {
+			return nil
+		}
+	}
 	combined := strings.TrimSpace(code + " " + message)
 	status := http.StatusBadGateway
 	low := strings.ToLower(combined)
@@ -636,7 +716,7 @@ func embeddedSSEError(data string) *ApiError {
 	case strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
 		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话"):
 		status = http.StatusTooManyRequests
-	case strings.Contains(low, "002002009") || strings.Contains(low, "not registered") ||
+	case isModelIDError(combined) || strings.Contains(low, "002002009") || strings.Contains(low, "not registered") ||
 		strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		// 模型级错误（该账号用不了这个模型）是客户端问题，不是上游故障。
 		status = http.StatusBadRequest

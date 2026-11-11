@@ -711,7 +711,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tried := map[string]bool{}
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if st, reason := modelAvailability(acct.UID, model); st == availUnusable && reason == modelAccessDeniedReason {
+			tried[acct.Name] = true
+		}
+	}
+	if tried[stickyAcct] {
+		stickyAcct = ""
+	}
 	var lastErr error
+	var modelAccessErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
@@ -824,7 +833,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			break // 非并发错误，跳出重试
 		}
+		var comp *upstream.RawCompletion
+		readCompletion := serr == nil && !req.Stream
+		if readCompletion {
+			comp, serr = upstream.AggregateRaw(rc)
+			rc.Close()
+		}
 		if serr != nil {
+			modelDenied := upstreamUnavailableReason(serr) == modelAccessDeniedReason
+			if modelDenied {
+				markUnusable(acct.UID, model, modelAccessDeniedReason)
+			}
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
@@ -833,7 +852,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
 			}
+			if modelDenied {
+				modelAccessErr = serr
+				stickyAcct = ""
+				continue
+			}
 			lastErr = serr
+			if readCompletion {
+				h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, serr.Error())
+				continue
+			}
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
@@ -842,8 +870,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
-		markUsable(acct.UID, model)
 		noteTraffic(acct.UID)
 
 		w.Header().Set("X-Codearts-Chat-Id", chatID)
@@ -870,31 +896,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.PingKeepalive(acct.Name)
 			}, usage)
 			rc.Close()
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if !isParamInvalidError(werr) {
+				if upstreamUnavailableReason(werr) == modelAccessDeniedReason {
+					markUnusable(acct.UID, model, modelAccessDeniedReason)
+				} else if !isParamInvalidError(werr) {
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
 			} else {
+				markUsable(acct.UID, model)
 				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
+			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			return
 		}
 
-		comp, aerr := upstream.AggregateRaw(rc)
-		rc.Close()
+		markUsable(acct.UID, model)
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
-		if aerr != nil {
-			if isParamInvalidError(aerr) {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
-				return
-			}
-			lastErr = aerr
-			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
-			continue
-		}
 
 		content, finish := comp.Content, comp.Finish
 		calls := fromUpstreamToolCalls(comp.ToolCalls)
@@ -916,6 +934,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
 		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
+		return
+	}
+	if lastErr == nil && modelAccessErr != nil {
+		writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+			"model "+model+" is not available: "+truncateMsg(modelAccessErr.Error(), 200))
 		return
 	}
 	msg := "all accounts unavailable (disabled/cooldown)"

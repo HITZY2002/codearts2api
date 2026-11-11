@@ -26,6 +26,8 @@ import (
 //   - 上游报 not registered / benefit not found 时立即记为不可用（从真实流量学习）
 
 const (
+	modelAccessDeniedReason = "当前账号无权调用该模型"
+
 	// availabilityTTL 探测结果有效期。套餐/福利变化后最多滞后这么久。
 	availabilityTTL = 30 * time.Minute
 	// probeTimeout 单次探测超时。
@@ -137,14 +139,7 @@ func upstreamUnavailableReason(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "002002009") || strings.Contains(msg, "not registered"):
-		return "模型未在当前账号注册"
-	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
-		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
-	}
-	return ""
+	return upstreamUnavailableReasonText(err.Error())
 }
 
 // probeModel 用一条最小请求真实试一次该模型，并记录结果。
@@ -183,13 +178,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	body := map[string]any{
-		"model":    upstream.CanonicalModel(model),
-		"stream":   true,
-		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
-	}
-	rc, err := acct.Client.SendChatV2(ctx, body, "", cred, cred.SecurityToken,
-		upstream.IsBenefitModel(acct.UID, model))
+	rc, err := acct.Client.ProbeModel(ctx, model, cred, upstream.IsBenefitModel(acct.UID, model))
 	if err != nil {
 		// 并发上限是暂时的，不代表模型不可用。
 		if strings.Contains(err.Error(), "TM.00001041") {
@@ -231,6 +220,8 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 func upstreamUnavailableReasonText(s string) string {
 	low := strings.ToLower(s)
 	switch {
+	case upstream.IsModelAccessErrorMessage(s):
+		return modelAccessDeniedReason
 	case strings.Contains(low, "002002009") || strings.Contains(low, "not registered"):
 		return "模型未在当前账号注册"
 	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
