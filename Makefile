@@ -1,11 +1,15 @@
-.PHONY: all linux windows test docker clean
+.PHONY: all panel linux windows test docker clean
 
 GO ?= go
 BINDIR := bin
 
 all: linux
 
+panel:
+	cd web/ui && npm ci && npm run build
+
 linux:
+	$(MAKE) panel
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -o $(BINDIR)/codearts2api -buildvcs=false ./cmd/server
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -o $(BINDIR)/codearts2api-login -buildvcs=false ./cmd/login
@@ -14,6 +18,7 @@ linux:
 	@echo "linux binaries -> $(BINDIR)/"
 
 windows:
+	$(MAKE) panel
 	@mkdir -p $(BINDIR)
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -o $(BINDIR)/codearts2api.exe -buildvcs=false ./cmd/server
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -o $(BINDIR)/codearts2api-login.exe -buildvcs=false ./cmd/login

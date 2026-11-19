@@ -18,6 +18,17 @@ jobs:
         with:
           go-version: '1.24.x'
           cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/ui/package-lock.json
+      - name: Build panel
+        run: npm ci
+        working-directory: web/ui
+      - name: Build panel artifacts
+        run: npm run build
+        working-directory: web/ui
       - name: Test
         run: go test ./...
       - name: Race detector

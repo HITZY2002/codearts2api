@@ -91,12 +91,13 @@ func (s *Scheduler) Tick(ctx context.Context) {
 			}
 			if s.cfg.CreditsAutoClaim {
 				claimCtx, cancel := context.WithTimeout(ctx, time.Minute)
-				result, err := s.cfg.Pool.Checkin(claimCtx, acct.Name)
+				result, due, err := s.cfg.Pool.CheckinIfDue(claimCtx, acct.Name)
 				cancel()
 				if err != nil {
 					log.Printf("credit checkin failed account=%s err=%v", acct.Name, err)
-				} else {
-					log.Printf("credit checkin account=%s ok=%t message=%s", acct.Name, result.OK, result.Message)
+				} else if due {
+					log.Printf("credit checkin account=%s ok=%t wrote=%t message=%s",
+						acct.Name, result.OK, result.Wrote, result.Message)
 				}
 			}
 		} else {

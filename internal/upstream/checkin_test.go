@@ -19,11 +19,12 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 		end          string
 		start        string
 		wantOK       bool
+		wantWrote    bool
 		wantWrites   []string
 		wantCredits  float64
 	}{
-		{name: "fresh", status: "ELIGIBLE", claimable: true, wantOK: true, wantWrites: []string{EpCreditClaim, EpCreditConfirm}, wantCredits: 1000},
-		{name: "unconfirmed", status: "CLAIMED", wantOK: true, wantWrites: []string{EpCreditConfirm}},
+		{name: "fresh", status: "ELIGIBLE", claimable: true, wantOK: true, wantWrote: true, wantWrites: []string{EpCreditClaim, EpCreditConfirm}, wantCredits: 150},
+		{name: "unconfirmed", status: "CLAIMED", wantOK: true, wantWrote: true, wantWrites: []string{EpCreditConfirm}},
 		{name: "confirmed", status: "CONFIRMED", wantOK: true},
 		{name: "consumed", status: "CONSUMED", wantOK: true},
 		{name: "not eligible", wantOK: true},
@@ -45,7 +46,7 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 						t.Errorf("wrong delivery URL: %s", r.URL)
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []any{
-						map[string]any{"campaignId": 1, "title": "daily", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 1000, "pendingTotalAmount": 1000, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
+						map[string]any{"campaignId": 34, "title": "每日签到领150积分", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 150, "pendingTotalAmount": 150, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
 						map[string]any{"campaignId": 2, "claimable": true, "status": "ELIGIBLE"},
 						map[string]any{"campaignId": 3, "claimable": true, "status": "ELIGIBLE"},
 					}}})
@@ -56,12 +57,12 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Error(err)
 				}
-				if body["campaignId"] != float64(1) {
+				if body["campaignId"] != float64(34) {
 					t.Errorf("unexpected campaign: %v", body)
 				}
 				if r.URL.Path == EpCreditClaim {
 					key, _ := body["idempotentKey"].(string)
-					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_1_") {
+					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_34_") {
 						t.Errorf("wrong claim body: %v", body)
 					}
 				}
@@ -71,10 +72,34 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 			c := New(time.Second)
 			c.snapBase = srv.URL
 			res, err := c.Checkin(context.Background(), SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"})
-			if err != nil || res.OK != tc.wantOK || res.Credits != tc.wantCredits || !reflect.DeepEqual(writes, tc.wantWrites) {
-				t.Fatalf("result=%+v err=%v writes=%v, want ok=%t credits=%g writes=%v", res, err, writes, tc.wantOK, tc.wantCredits, tc.wantWrites)
+			if err != nil || res.OK != tc.wantOK || res.Wrote != tc.wantWrote || res.Credits != tc.wantCredits || !reflect.DeepEqual(writes, tc.wantWrites) {
+				t.Fatalf("result=%+v err=%v writes=%v, want ok=%t wrote=%t credits=%g writes=%v", res, err, writes, tc.wantOK, tc.wantWrote, tc.wantCredits, tc.wantWrites)
 			}
 		})
+	}
+}
+
+func TestCheckinRecognizesCurrentDailyCampaignAndSkipsCompleted(t *testing.T) {
+	writes := 0
+	status := "CONFIRMED"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":34,"title":"每日签到领150积分","status":%q,"claimable":false,"benefitUnit":"CREDIT"}]}}`, status)
+			return
+		}
+		writes++
+		_, _ = fmt.Fprint(w, `{"code":0}`)
+	}))
+	defer server.Close()
+
+	client := New(time.Second)
+	client.snapBase = server.URL
+	result, err := client.Checkin(context.Background(), SignCredential{})
+	if err != nil || !result.OK || result.Wrote || !result.Skipped || result.Message != "今日已签到" {
+		t.Fatalf("completed daily campaign result=%+v err=%v", result, err)
+	}
+	if writes != 0 {
+		t.Fatalf("completed campaign issued %d writes", writes)
 	}
 }
 
@@ -84,7 +109,7 @@ func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case EpCreditDelivery:
-			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":1,"status":%q,"claimable":true,"benefitAmount":1000}]}}`, status)
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":34,"title":"每日签到领150积分","status":%q,"claimable":true,"benefitAmount":150}]}}`, status)
 		case EpCreditClaim:
 			claimCount++
 			status = "CLAIMED"
@@ -115,19 +140,19 @@ func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 	// 上游在次日重新变为 ELIGIBLE；本地不得永久缓存「已签」。
 	status = "ELIGIBLE"
 	res, err := c.Checkin(context.Background(), SignCredential{})
-	if err != nil || !res.OK || res.Credits != 1000 || claimCount != 2 || confirmCount != 3 {
+	if err != nil || !res.OK || res.Credits != 150 || claimCount != 2 || confirmCount != 3 {
 		t.Fatalf("daily reset not handled: result=%+v err=%v claim=%d confirm=%d", res, err, claimCount, confirmCount)
 	}
 }
 
-func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
+func TestCheckinDailyCampaignAndMalformedResponses(t *testing.T) {
 	tests := []struct {
 		name, delivery, claim string
 		wantErr, wantOK       bool
 		wantConfirm           int
 		wantCredits           float64
 	}{
-		{name: "new user", claim: `{"code":0}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
+		{name: "daily campaign", claim: `{"code":0}`, wantOK: true, wantConfirm: 1, wantCredits: 150},
 		{name: "claim business failure", claim: `{"code":40001,"message":"not ready"}`},
 		{name: "claim missing code", claim: `{"message":"ok"}`},
 		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`, wantOK: true},
@@ -143,7 +168,7 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 				case EpCreditDelivery:
 					body := tc.delivery
 					if body == "" {
-						body = `{"code":0,"data":{"items":[{"campaignId":4,"title":"new user","status":"ELIGIBLE","claimable":true,"benefitAmount":4000}]}}`
+						body = `{"code":0,"data":{"items":[{"campaignId":34,"title":"每日签到领150积分","status":"ELIGIBLE","claimable":true,"benefitAmount":150}]}}`
 					}
 					_, _ = fmt.Fprint(w, body)
 				case EpCreditClaim:
@@ -151,7 +176,7 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 						ID int `json:"campaignId"`
 					}
 					_ = json.NewDecoder(r.Body).Decode(&body)
-					if body.ID != 4 {
+					if body.ID != 34 {
 						t.Errorf("claimed other campaign: %d", body.ID)
 					}
 					_, _ = fmt.Fprint(w, tc.claim)

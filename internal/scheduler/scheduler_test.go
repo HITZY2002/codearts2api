@@ -18,6 +18,13 @@ func (f *failingCheckinClient) Checkin(context.Context, upstream.SignCredential)
 	return upstream.CheckinResult{}, errors.New("temporary activity failure")
 }
 
+type completedCheckinClient struct{ calls int }
+
+func (c *completedCheckinClient) Checkin(context.Context, upstream.SignCredential) (upstream.CheckinResult, error) {
+	c.calls++
+	return upstream.CheckinResult{OK: true, Skipped: true, Message: "今日已签到"}, nil
+}
+
 func TestAutoCheckinOptOutAndRetry(t *testing.T) {
 	c := &failingCheckinClient{}
 	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")
@@ -39,5 +46,20 @@ func TestAutoCheckinOptOutAndRetry(t *testing.T) {
 	s.Tick(context.Background())
 	if c.calls != 2 {
 		t.Fatal("disabled account was claimed")
+	}
+}
+
+func TestAutoCheckinRunsOncePerDay(t *testing.T) {
+	client := &completedCheckinClient{}
+	account := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{account}, pool.Config{CheckinClient: client}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler := New(Config{Pool: p, CreditsAutoClaim: true})
+	scheduler.Tick(context.Background())
+	scheduler.Tick(context.Background())
+	if client.calls != 1 {
+		t.Fatalf("same-day checkin calls=%d, want 1", client.calls)
 	}
 }

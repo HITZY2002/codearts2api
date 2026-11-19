@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"codearts2api/internal/auth"
+	"codearts2api/internal/telemetry"
 	"codearts2api/internal/upstream"
 )
 
@@ -35,20 +36,21 @@ type Account struct {
 	Auth   *auth.Auth       `json:"-"`
 	Client *upstream.Client `json:"-"`
 
-	mu                sync.Mutex
-	refreshMu         sync.Mutex
-	checkinMu         sync.Mutex
-	checkin           *CheckinStatus
-	lastValidated     time.Time
-	errCount          int
-	coolUntil         time.Time
-	coolKind          CoolKind
-	disabled          bool
-	disabledReason    string
-	lastErr           string
-	activeConcurrent  int       // 当前活跃并发请求数
-	maxConcurrent     int       // 最大允许并发数
-	keepaliveLastPing time.Time // 最后保活心跳时间
+	mu                 sync.Mutex
+	refreshMu          sync.Mutex
+	checkinMu          sync.Mutex
+	checkin            *CheckinStatus
+	checkinAttemptedAt time.Time
+	lastValidated      time.Time
+	errCount           int
+	coolUntil          time.Time
+	coolKind           CoolKind
+	disabled           bool
+	disabledReason     string
+	lastErr            string
+	activeConcurrent   int       // 当前活跃并发请求数
+	maxConcurrent      int       // 最大允许并发数
+	keepaliveLastPing  time.Time // 最后保活心跳时间
 }
 
 // Config 池配置。
@@ -61,6 +63,7 @@ type Config struct {
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+	Telemetry       *telemetry.Store
 }
 
 // Pool 账号池。
@@ -227,7 +230,7 @@ func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
 		}
 		a.mu.Unlock()
 	}
-	credits = int64(healthy) // 面板「积分合计」位复用为健康数
+	credits = 0 // 真实余额未确认，不再用健康数冒充积分
 	return
 }
 
@@ -377,6 +380,9 @@ func (p *Pool) Cooldown(name string, kind CoolKind, dur time.Duration, reason st
 		log.Printf("pool cooldown account=%s kind=%d dur=%s reason=%s", name, kind, dur, reason)
 	}
 	p.saveState()
+	if p.cfg.Telemetry != nil {
+		_ = p.cfg.Telemetry.RecordEvent("pool_cooldown", "warn", name, "", reason, nil)
+	}
 }
 
 // NoteError 累计错误。
@@ -396,6 +402,9 @@ func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
 		a.mu.Unlock()
 	}
 	p.saveState()
+	if p.cfg.Telemetry != nil {
+		_ = p.cfg.Telemetry.RecordEvent("pool_note_error", "warn", name, "", "consecutive errors", nil)
+	}
 }
 
 // NoteSuccess 清零错误计数。
@@ -648,6 +657,7 @@ func (p *Pool) RefreshToken(name string) error {
 
 	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
 	if err != nil {
+		p.notifyEvent("token_refresh_failed", "error", name, err.Error())
 		return fmt.Errorf("refresh failed: %w", err)
 	}
 
@@ -667,6 +677,7 @@ func (p *Pool) RefreshToken(name string) error {
 	acct.lastValidated = time.Now()
 	acct.mu.Unlock()
 	log.Printf("pool token refreshed manually account=%s", name)
+	p.notifyEvent("token_refreshed", "info", name, "token refreshed")
 	return nil
 }
 
@@ -747,6 +758,7 @@ func (p *Pool) CheckKeepalive(name string) bool {
 	if target == nil {
 		return false
 	}
+
 	target.mu.Lock()
 	defer target.mu.Unlock()
 
@@ -911,12 +923,14 @@ func (p *Pool) loadState() {
 		return
 	}
 	var data []struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name               string         `json:"name"`
+		ErrCount           int            `json:"err_count"`
+		CoolUntil          time.Time      `json:"cool_until"`
+		Disabled           bool           `json:"disabled"`
+		Reason             string         `json:"reason"`
+		LastErr            string         `json:"last_error"`
+		CheckinAttemptedAt time.Time      `json:"checkin_attempted_at,omitempty"`
+		Checkin            *CheckinStatus `json:"checkin,omitempty"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
 		return
@@ -930,6 +944,8 @@ func (p *Pool) loadState() {
 				a.disabled = s.Disabled
 				a.disabledReason = s.Reason
 				a.lastErr = s.LastErr
+				a.checkinAttemptedAt = s.CheckinAttemptedAt
+				a.checkin = s.Checkin
 				a.mu.Unlock()
 			}
 		}
@@ -941,23 +957,27 @@ func (p *Pool) saveState() {
 		return
 	}
 	type entry struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name               string         `json:"name"`
+		ErrCount           int            `json:"err_count"`
+		CoolUntil          time.Time      `json:"cool_until"`
+		Disabled           bool           `json:"disabled"`
+		Reason             string         `json:"reason"`
+		LastErr            string         `json:"last_error"`
+		CheckinAttemptedAt time.Time      `json:"checkin_attempted_at,omitempty"`
+		Checkin            *CheckinStatus `json:"checkin,omitempty"`
 	}
 	out := make([]entry, 0, len(p.accounts))
 	for _, a := range p.accounts {
 		a.mu.Lock()
 		out = append(out, entry{
-			Name:      a.Name,
-			ErrCount:  a.errCount,
-			CoolUntil: a.coolUntil,
-			Disabled:  a.disabled,
-			Reason:    a.disabledReason,
-			LastErr:   a.lastErr,
+			Name:               a.Name,
+			ErrCount:           a.errCount,
+			CoolUntil:          a.coolUntil,
+			Disabled:           a.disabled,
+			Reason:             a.disabledReason,
+			LastErr:            a.lastErr,
+			CheckinAttemptedAt: a.checkinAttemptedAt,
+			Checkin:            a.checkin,
 		})
 		a.mu.Unlock()
 	}
@@ -967,4 +987,11 @@ func (p *Pool) saveState() {
 		return
 	}
 	_ = os.Rename(tmp, p.state)
+}
+
+func (p *Pool) notifyEvent(kind, level, name, message string) {
+	if p.cfg.Telemetry == nil {
+		return
+	}
+	_ = p.cfg.Telemetry.RecordEvent(kind, level, name, "", message, nil)
 }

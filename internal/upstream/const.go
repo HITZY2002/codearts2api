@@ -35,6 +35,9 @@ const (
 	EpBenefitConfig = "/api/v1/gateway/config"
 	EpBenefitClaim  = "/api/v1/benefit/claim"
 
+	// 套餐与积分用量（snap-manager）。
+	EpPackageOverview = "/snap-manager/v1/package/overview"
+
 	// 登录/令牌
 	EpLoginTicket    = "/v1/login/ticket"
 	EpOAuthTokens    = "/v1/oauth2/tokens"

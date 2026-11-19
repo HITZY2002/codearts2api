@@ -20,6 +20,7 @@ import (
 
 	"codearts2api/internal/auth"
 	"codearts2api/internal/pool"
+	"codearts2api/internal/telemetry"
 	"codearts2api/internal/upstream"
 )
 
@@ -43,6 +44,12 @@ type Config struct {
 	Listen           string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
 	OAuthClient *upstream.Client
+	// Telemetry 可选 SQLite 观测存储。
+	Telemetry                  *telemetry.Store
+	ObservabilityRetentionDays int
+	ObservabilityMaxRows       int
+	ObservabilityMaxDBBytes    int64
+	SnapshotInterval           time.Duration
 	// LoginConfig WebUI 登录配置（client_id 以官方客户端为准）。
 	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
@@ -153,8 +160,8 @@ func NewHandler(cfg Config) *Handler {
 		convAcct: map[string]string{},
 	}
 	h.loadChats()
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withTelemetry(h.withAuth(h.chatCompletions)))
+	h.mux.HandleFunc("GET /v1/models", h.withTelemetry(h.withAuth(h.models)))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// WorkBuddy 风格控制台（页面不鉴权，API 走 Bearer）
@@ -162,9 +169,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin", h.servePanel)
 	h.mux.HandleFunc("GET /panel", h.servePanel)
 	h.mux.HandleFunc("GET /panel/", h.servePanel)
+	h.mux.HandleFunc("GET /assets/", h.servePanelAssets)
 	h.mux.HandleFunc("GET /admin/api/overview", h.withAuth(h.adminOverview))
 	h.mux.HandleFunc("POST /admin/api/credits", h.withAuth(h.adminCredits))
+	h.mux.HandleFunc("GET /admin/api/credits/balance", h.withAuth(h.adminCreditBalances))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
+	h.mux.HandleFunc("GET /admin/api/checkin/status", h.withAuth(h.adminCheckinStatuses))
 	h.mux.HandleFunc("POST /admin/api/keepalive", h.withAuth(h.adminKeepalive))
 	h.mux.HandleFunc("POST /admin/api/reload", h.withAuth(h.adminReload))
 	h.mux.HandleFunc("POST /admin/api/accounts/enable", h.withAuth(h.adminEnable))
@@ -173,6 +183,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(h.adminOAuthStart))
 	h.mux.HandleFunc("POST /admin/api/oauth/poll", h.withAuth(h.adminOAuthPoll))
 	h.mux.HandleFunc("POST /admin/api/oauth/import-callback", h.withAuth(h.adminOAuthImportCallback))
+	h.mux.HandleFunc("GET /admin/api/logs", h.withAuth(h.adminLogs))
+	h.mux.HandleFunc("GET /admin/api/events", h.withAuth(h.adminEvents))
+	h.mux.HandleFunc("GET /admin/api/metrics/overview", h.withAuth(h.adminMetricsOverview))
+	h.mux.HandleFunc("GET /admin/api/metrics/series", h.withAuth(h.adminMetricsSeries))
+	h.mux.HandleFunc("POST /admin/api/observability/purge", h.withAuth(h.adminObservabilityPurge))
 	h.mux.HandleFunc("GET /oauth/callback", h.oauthCallback)
 	return h
 }
@@ -548,13 +563,22 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		infos, err := h.cfg.Upstream.FetchModels(acct.Auth) // 成功即写入该账号目录
 		if err != nil {
 			log.Printf("model discovery failed for account %s: %v", acct.Name, err)
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("model_discovery_failed", "error", acct.UID, "", "model discovery failed", nil)
+			}
 			continue
 		}
 		if len(infos) == 0 {
 			log.Printf("model discovery returned no models for account %s", acct.Name)
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("model_discovery_empty", "warn", acct.UID, "", "model discovery returned no models", nil)
+			}
 			continue
 		}
 		sets = append(sets, infos)
+		if h.cfg.Telemetry != nil {
+			_ = h.cfg.Telemetry.RecordEvent("model_discovery_succeeded", "info", acct.UID, "", "models discovered", map[string]any{"model_count": len(infos)})
+		}
 	}
 	infos := upstream.MergeModels(sets...)
 	if len(infos) == 0 {
@@ -656,6 +680,7 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	rec := requestRecorderFromContext(r.Context())
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -688,6 +713,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	model := h.cfg.DefaultModel
 	if req.Model != "" && req.Model != "auto" {
 		model = req.Model
+	}
+	if rec != nil {
+		rec.record.Model = model
+		rec.record.Stream = req.Stream
+		if req.Stream {
+			rec.enableStreamOutput()
+		}
 	}
 
 	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
@@ -741,11 +773,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[acct.Name] = true
 
+		if rec != nil {
+			rec.record.AccountUID = acct.UID
+			rec.record.AccountName = acct.UserName
+		}
+
 		// 阻塞等待并发槽位（上游单账号并发会话释放慢，串行最稳）。
 		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号。
+		queueStart := time.Now()
 		if !h.cfg.Pool.AcquireLockWait(acct.Name, 180*time.Second) {
 			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
 			continue
+		}
+		if rec != nil {
+			rec.record.QueueWaitMs = time.Since(queueStart).Milliseconds()
 		}
 
 		ok, verr := h.cfg.Pool.Validate(acct)
@@ -795,6 +836,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
+			if rec != nil {
+				rec.record.Attempts++
+			}
 			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
 			if serr == nil {
 				break
@@ -840,6 +884,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 		}
 		if serr != nil {
+			if rec != nil && rec.record.ErrorType == "" {
+				rec.record.ErrorType = "upstream_error"
+			}
 			modelDenied := upstreamUnavailableReason(serr) == modelAccessDeniedReason
 			if modelDenied {
 				markUnusable(acct.UID, model, modelAccessDeniedReason)
@@ -851,6 +898,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
+			}
+			if rec != nil {
+				rec.record.ErrorType = "model_access"
 			}
 			if modelDenied {
 				modelAccessErr = serr
@@ -892,12 +942,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
 				storeChat()
+				applyCompletionMetrics(rec, msgs, comp)
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
 			}, usage)
 			rc.Close()
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
+				if rec != nil && rec.record.ErrorType == "" {
+					rec.record.ErrorType = "stream_error"
+				}
 				if upstreamUnavailableReason(werr) == modelAccessDeniedReason {
 					markUnusable(acct.UID, model, modelAccessDeniedReason)
 				} else if !isParamInvalidError(werr) {
@@ -915,6 +969,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 
 		content, finish := comp.Content, comp.Finish
+		applyCompletionMetrics(rec, msgs, comp)
 		calls := fromUpstreamToolCalls(comp.ToolCalls)
 		// 原生 tool_calls 是 GLM-5.2 的主路径。仅保留文本协议解析作为
 		// 旧模型/异常输出的兼容兜底，并同时检查 reasoning_content，
@@ -1136,13 +1191,22 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
 			log.Printf("model unusable account=%s model=%s: %s", acct.Name, model, reason)
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("model_unusable", "warn", acct.UID, model, reason, nil)
+			}
 			return true
 		}
 		switch {
 		case ae.Status == 401 || ae.Code == 401:
 			h.cfg.Pool.Disable(acct.Name, "401 "+ae.Message)
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("upstream_auth", "error", acct.Name, model, "upstream 401", nil)
+			}
 		case ae.Status == 429:
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolSoft, h.cfg.SoftCooldown, ae.Error())
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("upstream_rate_limit", "warn", acct.Name, model, ae.Error(), nil)
+			}
 		case ae.Status == 400 && isConcurrentLimitError(ae.Message):
 			// 并发会话上限（TM.00001041）是瞬时错误：上游会话槽位会被其他请求释放，
 			// 不冷却账号——池的并发锁已防止过载，冷却反而误伤后续请求。

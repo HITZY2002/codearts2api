@@ -37,6 +37,7 @@ type CreditClaimResult struct {
 	CampaignID int     `json:"campaign_id"`
 	Title      string  `json:"title"`
 	OK         bool    `json:"ok"`
+	Wrote      bool    `json:"wrote"`
 	Status     string  `json:"status"`
 	Credits    float64 `json:"credits,omitempty"`
 	Message    string  `json:"message"`
@@ -45,9 +46,23 @@ type CreditClaimResult struct {
 // CheckinResult 的 Credits 是本次领取量，不是账号余额。
 type CheckinResult struct {
 	OK        bool                `json:"ok"`
+	Skipped   bool                `json:"skipped,omitempty"`
+	Wrote     bool                `json:"wrote"`
 	Credits   float64             `json:"credits,omitempty"`
 	Message   string              `json:"message"`
 	Campaigns []CreditClaimResult `json:"campaigns"`
+}
+
+// DailyCheckinStatus is the read-only status of the true daily check-in campaign.
+type DailyCheckinStatus struct {
+	Found      bool    `json:"found"`
+	Done       bool    `json:"done"`
+	Actionable bool    `json:"actionable"`
+	CampaignID int     `json:"campaign_id,omitempty"`
+	Title      string  `json:"title,omitempty"`
+	Status     string  `json:"status,omitempty"`
+	Amount     float64 `json:"amount,omitempty"`
+	Message    string  `json:"message"`
 }
 
 func (c *Client) creditRequest(ctx context.Context, method, path string, body any, cred SignCredential) (json.RawMessage, error) {
@@ -123,7 +138,7 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	}
 	out := CheckinResult{OK: true, Campaigns: make([]CreditClaimResult, 0)}
 	for _, campaign := range campaigns {
-		if campaign.ID != 1 && campaign.ID != 4 {
+		if !IsCheckinCampaign(campaign) {
 			continue
 		}
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
@@ -132,6 +147,7 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 		res := c.claimCreditCampaign(ctx, cred, campaign, time.Now())
 		out.Campaigns = append(out.Campaigns, res)
 		out.OK = out.OK && res.OK
+		out.Wrote = out.Wrote || res.Wrote
 		out.Credits += res.Credits
 	}
 	parts := make([]string, 0, len(out.Campaigns))
@@ -141,8 +157,64 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	out.Message = strings.Join(parts, "; ")
 	if len(parts) == 0 {
 		out.Message = "无可领取的签到或新手活动"
+		out.Skipped = true
+	} else if !out.Wrote && out.OK {
+		alreadyDone := true
+		for _, res := range out.Campaigns {
+			if res.Status != "CONFIRMED" && res.Status != "CONSUMED" {
+				alreadyDone = false
+				break
+			}
+		}
+		if alreadyDone {
+			out.Message = "今日已签到"
+			out.Skipped = true
+		}
 	}
 	return out, nil
+}
+
+// IsCheckinCampaign reports whether a campaign belongs to daily check-in or onboarding.
+func IsCheckinCampaign(campaign CreditCampaign) bool {
+	title := strings.ToLower(strings.TrimSpace(campaign.Title))
+	return campaign.ID == 34 || (strings.Contains(title, "每日签到") && strings.Contains(title, "150"))
+}
+
+// FetchDailyCheckinStatus reads the current daily check-in status without writing.
+func (c *Client) FetchDailyCheckinStatus(ctx context.Context, cred SignCredential) (DailyCheckinStatus, error) {
+	campaigns, err := c.FetchCreditCampaigns(ctx, cred)
+	if err != nil {
+		return DailyCheckinStatus{}, err
+	}
+	for _, campaign := range campaigns {
+		if !IsCheckinCampaign(campaign) {
+			continue
+		}
+		status := strings.TrimSpace(campaign.Status)
+		result := DailyCheckinStatus{
+			Found: true, CampaignID: campaign.ID, Title: campaign.Title,
+			Status: status, Amount: campaign.BenefitAmount,
+		}
+		switch status {
+		case "CONFIRMED", "CONSUMED":
+			result.Done = true
+			result.Message = "今日已签到"
+		case "CLAIMED":
+			result.Actionable = true
+			result.Message = "已领取，待确认"
+		case "ELIGIBLE":
+			result.Actionable = campaign.Claimable
+			if campaign.Claimable {
+				result.Message = "今日未签到"
+			} else {
+				result.Message = "暂不可签到"
+			}
+		default:
+			result.Message = "签到活动状态未知"
+		}
+		return result, nil
+	}
+	return DailyCheckinStatus{Message: "未找到每日签到活动"}, nil
 }
 
 func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, now time.Time) CreditClaimResult {
@@ -160,7 +232,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 	}
 	switch res.Status {
 	case "CONFIRMED", "CONSUMED":
-		res.Message = "已领取"
+		res.Message = "今日已签到"
 		return res
 	case "CLAIMED":
 		// 已到账但尚未确认；不得重复领取。
@@ -177,6 +249,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 			res.OK, res.Message = false, err.Error()
 			return res
 		}
+		res.Wrote = true
 		res.Status = "CLAIMED"
 		res.Credits = campaign.PendingTotalAmount
 		if res.Credits <= 0 {
@@ -193,6 +266,7 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		res.OK, res.Message = false, "已领取，确认失败，稍后重试: "+err.Error()
 		return res
 	}
+	res.Wrote = true
 	res.Status = "CONFIRMED"
 	res.Message = "已补确认"
 	if res.Credits > 0 {

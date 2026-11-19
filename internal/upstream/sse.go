@@ -4,7 +4,7 @@
 //   - onAnswer:  {"text":"增量","custom_extra_info":...}
 //   - reasoning / thinking: 思考链增量
 //   - done:      {"error_code":"0","error_msg":"","related_question_answer":[...],"response_message_id":"..."}
-//                 related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
+//     related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
 //   - error / heartbeat 等
 //
 // 另：部分帧可能直接给出 structured QA 对象 {question,options,answer}（无 text 字段）。
@@ -37,11 +37,22 @@ func (e *UpstreamError) Error() string {
 
 // RawCompletion 聚合结果。
 type RawCompletion struct {
-	Content   string
-	Reasoning string
-	Finish    string
-	ToolCalls []ChatToolCall
-	Usage     map[string]any
+	Content     string
+	Reasoning   string
+	Finish      string
+	ToolCalls   []ChatToolCall
+	Usage       map[string]any
+	CreditUsage *CreditUsage
+}
+
+// CreditUsage captures billing metadata from a CodeArts Web done frame.
+type CreditUsage struct {
+	CreditCost          float64 `json:"credit_cost"`
+	PromptTokenUsed     int64   `json:"prompt_token_used"`
+	CompletionTokenUsed int64   `json:"completion_token_used"`
+	CachedTokenUsed     int64   `json:"cached_token_used"`
+	TotalTokenUsed      int64   `json:"total_token_used"`
+	RequestCount        int64   `json:"request_count"`
 }
 
 // scanLine 处理一行 SSE：CodeArts 是逐行 data:（无空行分隔），
@@ -395,12 +406,13 @@ func firstNonEmpty(values ...string) string {
 func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
-		content strings.Builder
-		reason  strings.Builder
-		finish  = "stop"
-		upErr   error
-		calls   = make(toolCallAccumulator)
-		usage   map[string]any
+		content     strings.Builder
+		reason      strings.Builder
+		finish      = "stop"
+		upErr       error
+		calls       = make(toolCallAccumulator)
+		usage       map[string]any
+		creditUsage *CreditUsage
 	)
 	var pendingEvent string
 	for {
@@ -413,6 +425,9 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 			if json.Unmarshal([]byte(data), &payload) == nil {
 				if u, ok := payload["usage"].(map[string]any); ok {
 					usage = u
+				}
+				if credit := creditUsageFromPayload(payload); credit != nil {
+					creditUsage = credit
 				}
 				delta, _ := deltaFromChunk(payload)
 				applyToolCallDeltas(delta, calls)
@@ -427,11 +442,12 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		return nil, upErr
 	}
 	return &RawCompletion{
-		Content:   unwrapQAContent(content.String()),
-		Reasoning: reason.String(),
-		Finish:    finish,
-		ToolCalls: sortedToolCalls(calls),
-		Usage:     usage,
+		Content:     unwrapQAContent(content.String()),
+		Reasoning:   reason.String(),
+		Finish:      finish,
+		ToolCalls:   sortedToolCalls(calls),
+		Usage:       usage,
+		CreditUsage: creditUsage,
 	}, nil
 }
 
@@ -484,17 +500,22 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	sawDone := false
 	var (
-		content   strings.Builder
-		reason    strings.Builder
-		finish    = "stop"
-		streamErr error
-		calls     = make(toolCallAccumulator)
-		usage     map[string]any
+		content     strings.Builder
+		reason      strings.Builder
+		finish      = "stop"
+		streamErr   error
+		calls       = make(toolCallAccumulator)
+		usage       map[string]any
+		creditUsage *CreditUsage
 	)
 	var pendingEvent string
 
 	completion := func() *RawCompletion {
-		return &RawCompletion{Content: unwrapQAContent(content.String()), Reasoning: reason.String(), Finish: finish, ToolCalls: sortedToolCalls(calls), Usage: usage}
+		return &RawCompletion{
+			Content: unwrapQAContent(content.String()), Reasoning: reason.String(),
+			Finish: finish, ToolCalls: sortedToolCalls(calls), Usage: usage,
+			CreditUsage: creditUsage,
+		}
 	}
 	writeChunk := func(delta map[string]any, fin string) error {
 		choice := map[string]any{"index": 0, "delta": delta}
@@ -573,6 +594,9 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			if u, ok := payload["usage"].(map[string]any); ok {
 				usage = u
 			}
+			if credit := creditUsageFromPayload(payload); credit != nil {
+				creditUsage = credit
+			}
 			nativeDelta, nativeFinish := deltaFromChunk(payload)
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
@@ -638,4 +662,31 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		onDone(completion())
 	}
 	return streamErr
+}
+
+func creditUsageFromPayload(payload map[string]any) *CreditUsage {
+	raw, ok := payload["credit_cost_for_web"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out CreditUsage
+	if value, ok := raw["credit_cost"].(float64); ok {
+		out.CreditCost = value
+	}
+	if value, ok := raw["prompt_token_used"].(float64); ok {
+		out.PromptTokenUsed = int64(value)
+	}
+	if value, ok := raw["completion_token_used"].(float64); ok {
+		out.CompletionTokenUsed = int64(value)
+	}
+	if value, ok := raw["cached_token_used"].(float64); ok {
+		out.CachedTokenUsed = int64(value)
+	}
+	if value, ok := raw["total_token_used"].(float64); ok {
+		out.TotalTokenUsed = int64(value)
+	}
+	if value, ok := raw["request_count"].(float64); ok {
+		out.RequestCount = int64(value)
+	}
+	return &out
 }
