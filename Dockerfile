@@ -1,6 +1,15 @@
+FROM node:22-alpine AS ui
+WORKDIR /ui
+COPY web/ui/package.json web/ui/package-lock.json ./
+RUN npm ci
+COPY web/ui .
+RUN npm run build -- --outDir /ui/dist
+
 FROM golang:1.24-alpine AS build
 WORKDIR /src
+COPY --from=ui /ui/dist /src/internal/server/webui/dist
 COPY go.mod ./
+COPY go.sum ./
 COPY cmd ./cmd
 COPY internal ./internal
 RUN go build -o /out/codearts2api ./cmd/server && \

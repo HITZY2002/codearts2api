@@ -2,3 +2,4 @@ auths
 data
 .git
 *.exe
+web/ui/node_modules

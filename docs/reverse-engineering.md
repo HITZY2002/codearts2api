@@ -131,6 +131,22 @@ Body：
 [Coding2API CodeArts 客户端](https://github.com/RobbsLuo/Coding2API/blob/main/src/provider/codearts/client.py)。
 `credit.sh` 保留为登录态查询；`apply.sh` 仍仅进行 token 续期。
 
+2026-11-19 的 DevCloud Web 抓包补充：聊天请求的 `done` 事件还带
+`credit_cost_for_web`，其中包含本次消耗与计费口径：
+
+```json
+{
+  "credit_cost": 0.16,
+  "prompt_token_used": 30371,
+  "completion_token_used": 74,
+  "cached_token_used": 29696,
+  "total_token_used": 30445,
+  "request_count": 2
+}
+```
+
+这是积分消耗，不是模型返回的普通 `tokens.total`；两者分别建模。
+
 ## 7. 限时福利模型（免费套餐，2026-09-06 逆向自 CodeArtsSpace 0.1.18）
 
 > 该节由 PR #2（@threegod3）的逆向结论整理而来。

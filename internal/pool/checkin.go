@@ -53,8 +53,68 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	if err != nil {
 		result.OK, result.Message = false, err.Error()
 	}
+	attemptedAt := time.Now()
 	a.mu.Lock()
-	a.checkin = &CheckinStatus{OK: result.OK, Message: result.Message, CheckedAt: time.Now()}
+	if err == nil {
+		a.checkinAttemptedAt = attemptedAt
+	}
+	if result.Wrote || (err != nil && !result.OK) {
+		a.checkin = &CheckinStatus{OK: result.OK, Message: result.Message, CheckedAt: attemptedAt}
+	}
 	a.mu.Unlock()
+	if err == nil {
+		p.saveState()
+	}
+	if p.cfg.Telemetry != nil && (err != nil || !result.OK || result.Wrote) {
+		level := "info"
+		if err != nil || !result.OK {
+			level = "error"
+		}
+		_ = p.cfg.Telemetry.RecordEvent("credit_checkin", level, name, "", result.Message, nil)
+	}
 	return result, err
+}
+
+// CheckinIfDue runs the automatic check-in at most once per local calendar day.
+func (p *Pool) CheckinIfDue(ctx context.Context, name string) (upstream.CheckinResult, bool, error) {
+	account := p.Get(name)
+	if account == nil {
+		return upstream.CheckinResult{}, false, fmt.Errorf("account not found")
+	}
+	now := time.Now()
+	account.mu.Lock()
+	attempted := account.checkinAttemptedAt
+	account.mu.Unlock()
+	if !attempted.IsZero() && sameLocalDate(attempted, now) {
+		return upstream.CheckinResult{
+			OK: true, Skipped: true, Message: "今日已检查签到",
+		}, false, nil
+	}
+	result, err := p.Checkin(ctx, name)
+	return result, true, err
+}
+
+// DailyCheckinStatus reports whether the account completed today's 150-credit check-in.
+func (p *Pool) DailyCheckinStatus(ctx context.Context, name string) (upstream.DailyCheckinStatus, error) {
+	account := p.Get(name)
+	if account == nil {
+		return upstream.DailyCheckinStatus{}, fmt.Errorf("account not found")
+	}
+	ok, err := p.Validate(account)
+	if err != nil {
+		return upstream.DailyCheckinStatus{}, err
+	}
+	if !ok {
+		return upstream.DailyCheckinStatus{}, fmt.Errorf("token invalid; re-login required")
+	}
+	token, ak, sk := account.Auth.Credentials()
+	return account.Client.FetchDailyCheckinStatus(ctx, upstream.SignCredential{
+		SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
+	})
+}
+
+func sameLocalDate(a, b time.Time) bool {
+	ay, am, ad := a.In(time.Local).Date()
+	by, bm, bd := b.In(time.Local).Date()
+	return ay == by && am == bm && ad == bd
 }

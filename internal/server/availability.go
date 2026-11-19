@@ -186,10 +186,16 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		}
 		if reason := upstreamUnavailableReason(err); reason != "" {
 			markUnusable(acct.UID, model, reason)
+			if h.cfg.Telemetry != nil {
+				_ = h.cfg.Telemetry.RecordEvent("model_probe_failed", "warn", acct.UID, model, reason, nil)
+			}
 			log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
 			return
 		}
 		log.Printf("probe %s/%s: 未判定 %v", acct.Name, model, err)
+		if h.cfg.Telemetry != nil {
+			_ = h.cfg.Telemetry.RecordEvent("model_probe_failed", "error", acct.UID, model, "probe inconclusive", nil)
+		}
 		return
 	}
 	defer rc.Close()
@@ -206,6 +212,9 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	headStr := head.String()
 	if reason := upstreamUnavailableReasonText(headStr); reason != "" {
 		markUnusable(acct.UID, model, reason)
+		if h.cfg.Telemetry != nil {
+			_ = h.cfg.Telemetry.RecordEvent("model_probe_failed", "warn", acct.UID, model, reason, nil)
+		}
 		log.Printf("probe %s/%s: 不可用：%s", acct.Name, model, reason)
 		return
 	}
@@ -213,6 +222,9 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		return
 	}
 	markUsable(acct.UID, model)
+	if h.cfg.Telemetry != nil {
+		_ = h.cfg.Telemetry.RecordEvent("model_probe_succeeded", "info", acct.UID, model, "model available", nil)
+	}
 	log.Printf("probe %s/%s: 可用", acct.Name, model)
 }
 

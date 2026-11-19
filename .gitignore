@@ -1,6 +1,7 @@
 auths/
 data/
 bin/
+node_modules/
 config.json
 .env
 *.key

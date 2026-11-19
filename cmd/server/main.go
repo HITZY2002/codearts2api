@@ -15,6 +15,7 @@ import (
 	"codearts2api/internal/pool"
 	"codearts2api/internal/scheduler"
 	"codearts2api/internal/server"
+	"codearts2api/internal/telemetry"
 	"codearts2api/internal/upstream"
 )
 
@@ -39,7 +40,23 @@ func main() {
 	if cfg.StateFile != "" {
 		_ = os.MkdirAll(filepath.Dir(cfg.StateFile), 0o700)
 	}
-	p, err := pool.New(auths, cfg.ToPoolConfig(), cfg.StateFile)
+	var telemetryStore *telemetry.Store
+	if cfg.Observability.Enabled {
+		telemetryStore, err = telemetry.Open(cfg.Observability.SQLitePath)
+		if err != nil {
+			log.Fatalf("open telemetry store: %v", err)
+		}
+		if _, err := telemetryStore.Purge(
+			cfg.Observability.RetentionDays,
+			cfg.Observability.MaxRows,
+			cfg.Observability.MaxDBBytes,
+		); err != nil {
+			log.Printf("telemetry purge failed: %v", err)
+		}
+	}
+	poolConfig := cfg.ToPoolConfig()
+	poolConfig.Telemetry = telemetryStore
+	p, err := pool.New(auths, poolConfig, cfg.StateFile)
 	if err != nil {
 		log.Fatalf("build pool: %v", err)
 	}
@@ -82,22 +99,51 @@ func main() {
 			"max_concurrent":       cfg.MaxConcurrent,
 			"keepalive_window":     "10m",
 		},
-		AuthDir:           cfg.AuthDir,
-		Listen:            cfg.Listen,
-		OAuthClient:       upstream.New(15 * time.Second),
-		LoginConfig:       loginConfig(cfg),
-		OAuthCallbackHost: cfg.OAuthCallbackHost,
+		AuthDir:                    cfg.AuthDir,
+		Listen:                     cfg.Listen,
+		OAuthClient:                upstream.New(15 * time.Second),
+		Telemetry:                  telemetryStore,
+		ObservabilityRetentionDays: cfg.Observability.RetentionDays,
+		ObservabilityMaxRows:       cfg.Observability.MaxRows,
+		ObservabilityMaxDBBytes:    cfg.Observability.MaxDBBytes,
+		SnapshotInterval:           time.Duration(cfg.Observability.SnapshotIntervalSeconds) * time.Second,
+		LoginConfig:                loginConfig(cfg),
+		OAuthCallbackHost:          cfg.OAuthCallbackHost,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 	h.StartAvailabilityProber(ctx)
+	h.StartSnapshotter(ctx)
+	if telemetryStore != nil {
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if _, err := telemetryStore.Purge(
+						cfg.Observability.RetentionDays,
+						cfg.Observability.MaxRows,
+						cfg.Observability.MaxDBBytes,
+					); err != nil {
+						log.Printf("telemetry purge failed: %v", err)
+					}
+				}
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+	}
+	if telemetryStore != nil {
+		defer telemetryStore.Close()
 	}
 	go func() {
 		<-ctx.Done()

@@ -109,6 +109,15 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 # 3) docker compose 的 .env
 ```
 
+### 观测与可视化面板
+
+WebUI 已重构为 Vue 3 + Naive UI 面板，内置亮色/暗色/跟随系统三种主题。默认将
+请求元数据、系统事件和账号快照写入 `./data/observability.db`（SQLite）。面板显示
+请求量、成功率、首字延迟、总耗时、Token 用量、账号健康、模型可用性和最近事件。
+
+日志只保存请求元数据，不保存 prompt、completion、Authorization 或 API Key。
+积分消耗字段来自抓包确认的聊天 `done.credit_cost_for_web`，不会二次推算。
+
 ### 账号续期
 
 `refresh_token` 与登录时的 `client_id`、DPoP 私钥绑定，因此凭证文件会保存
@@ -169,6 +178,12 @@ docker compose up -d --build
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
+| `CA2A_OBSERVABILITY_ENABLED` | 启用 SQLite 观测存储 | `true` |
+| `CA2A_OBSERVABILITY_SQLITE_PATH` | 观测数据库路径 | `./data/observability.db` |
+| `CA2A_OBSERVABILITY_RETENTION_DAYS` | 观测数据保留天数 | `30` |
+| `CA2A_OBSERVABILITY_MAX_ROWS` | 每张表最大行数 | `200000` |
+| `CA2A_OBSERVABILITY_MAX_DB_BYTES` | 观测数据库体积上限 | `134217728` |
+| `CA2A_OBSERVABILITY_SNAPSHOT_INTERVAL_SECONDS` | 账号快照间隔 | `60` |
 
 ## 目录结构
 
@@ -183,7 +198,8 @@ internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向�
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
 internal/server/   OpenAI 兼容路由
-internal/webui/    内嵌 WebUI 控制台
+web/ui/           WebUI 源码（Vue 3 + Naive UI）
+internal/server/webui/dist/ 内嵌 WebUI 构建产物
 deploy/            systemd unit 样例
 docs/              逆向过程与接口清单
 ```

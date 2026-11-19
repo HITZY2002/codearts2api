@@ -26,5 +26,13 @@
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+  "observability": {
+    "enabled": true,
+    "sqlite_path": "./data/observability.db",
+    "retention_days": 30,
+    "max_rows": 200000,
+    "max_db_bytes": 134217728,
+    "snapshot_interval_seconds": 60
   }
 }

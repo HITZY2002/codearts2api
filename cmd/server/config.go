@@ -59,6 +59,15 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
 
+	Observability struct {
+		Enabled                 bool   `json:"enabled"`
+		SQLitePath              string `json:"sqlite_path"`
+		RetentionDays           int    `json:"retention_days"`
+		MaxRows                 int    `json:"max_rows"`
+		MaxDBBytes              int64  `json:"max_db_bytes"`
+		SnapshotIntervalSeconds int    `json:"snapshot_interval_seconds"`
+	} `json:"observability"`
+
 	SoftRateDur    time.Duration
 	ErrCooldownDur time.Duration
 }
@@ -81,6 +90,12 @@ func Default() *Config {
 	c.MaxConcurrent = 1            // 上游单账号最多 3 并发会话但释放慢，串行最稳
 	c.KeepaliveWindow = "10m"      // 新增：保活窗口 10 分钟
 	c.Upstream.TimeoutSeconds = 120
+	c.Observability.Enabled = true
+	c.Observability.SQLitePath = "./data/observability.db"
+	c.Observability.RetentionDays = 30
+	c.Observability.MaxRows = 200000
+	c.Observability.MaxDBBytes = 128 << 20
+	c.Observability.SnapshotIntervalSeconds = 60
 	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
 	c.CreditsAutoClaim = true
 	return c
@@ -230,6 +245,32 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("CA2A_CREDITS_AUTO_CLAIM"); v != "" {
 		c.CreditsAutoClaim = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_ENABLED"); v != "" {
+		c.Observability.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_SQLITE_PATH"); v != "" {
+		c.Observability.SQLitePath = v
+	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Observability.RetentionDays = n
+		}
+	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_MAX_ROWS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Observability.MaxRows = n
+		}
+	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_MAX_DB_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.Observability.MaxDBBytes = n
+		}
+	}
+	if v := os.Getenv("CA2A_OBSERVABILITY_SNAPSHOT_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Observability.SnapshotIntervalSeconds = n
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -266,6 +307,18 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 1 // 上游并发会话释放慢，单账号串行最稳
+	}
+	if c.Observability.RetentionDays <= 0 {
+		c.Observability.RetentionDays = 30
+	}
+	if c.Observability.MaxRows <= 0 {
+		c.Observability.MaxRows = 200000
+	}
+	if c.Observability.MaxDBBytes <= 0 {
+		c.Observability.MaxDBBytes = 128 << 20
+	}
+	if c.Observability.SnapshotIntervalSeconds <= 0 {
+		c.Observability.SnapshotIntervalSeconds = 60
 	}
 	return nil
 }
