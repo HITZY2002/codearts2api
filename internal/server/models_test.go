@@ -22,7 +22,7 @@ func TestPickAccountPrefersAccountWithModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second)})
 
 	upstream.SetAccountModels("acct-a", []upstream.ModelInfo{{ID: "GLM-5.2"}})
 	upstream.SetAccountModels("acct-b", []upstream.ModelInfo{{ID: "GLM-5.2"}})

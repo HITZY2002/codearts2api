@@ -309,7 +309,7 @@ func TestChatStreamSendsUserMsgID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewWithChatEndpoint(time.Second, srv.URL)
+	c := NewWithChatEndpoint(5*time.Second, srv.URL)
 	rc, err := c.ChatStreamWithOptions(context.Background(),
 		[]ChatMessage{{Role: "user", Content: "hi"}}, "trace",
 		SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"}, "user",
@@ -336,7 +336,9 @@ func TestFetchCreditUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(time.Second)
+	// 放宽超时：Windows 本机防火墙/杀软偶发拖慢 httptest 本地 TCP 连接，
+	// 1s 在全量并行时会造成与代码无关的假超时。
+	c := New(5 * time.Second)
 	c.snapBase = srv.URL
 	usage, err := c.FetchCreditUsage(context.Background(), "msg_test_1234567890", SignCredential{
 		AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token",
@@ -378,7 +380,7 @@ func TestChatBodyV2OmitsGatewayOnlyFields(t *testing.T) {
 
 func TestBuildAuthorizeURLUsesRefreshableOAuthParameters(t *testing.T) {
 	cfg := DefaultLoginConfig()
-	got, err := url.Parse(New(time.Second).BuildAuthorizeURL(cfg, "ticket", "challenge", "S256", 43123))
+	got, err := url.Parse(New(5*time.Second).BuildAuthorizeURL(cfg, "ticket", "challenge", "S256", 43123))
 	if err != nil {
 		t.Fatal(err)
 	}
