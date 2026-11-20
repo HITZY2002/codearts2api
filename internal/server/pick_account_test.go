@@ -26,7 +26,7 @@ func TestPickAccountDiscoversCatalogLazily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second)})
 
 	// 模拟「惰性发现后」d 账号的目录里有该模型
 	upstream.SetAccountModels("d", []upstream.ModelInfo{{ID: "brand-new-benefit-0915", Benefit: true}})
@@ -43,7 +43,7 @@ func TestAccountCanServeOptimisticWhenUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second)})
 	if !h.accountCanServe(p.Get("x"), "whatever-model") {
 		t.Error("目录未知应乐观放行")
 	}

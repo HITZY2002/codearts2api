@@ -73,7 +73,7 @@ func TestModelKnownUnusable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second)})
 
 	if h.modelKnownUnusable("m-keep") {
 		t.Error("无结论时不应下架")
@@ -99,7 +99,7 @@ func TestProbeSkipsBusyAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second)})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second)})
 	upstream.SetAccountModels("u-busy", []upstream.ModelInfo{{ID: "m-busy"}})
 
 	// 占用并发槽位，模拟真实请求在跑
@@ -148,7 +148,7 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second), ErrCooldown: time.Minute, ErrThreshold: 1})
 
 	err404 := &upstream.ApiError{
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",

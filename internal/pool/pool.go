@@ -687,11 +687,6 @@ func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error
 	return p.RefreshToken(name)
 }
 
-// CheckAndRefreshToken 检查 token 是否快过期并主动刷新（比 scheduler 更积极）。
-func (p *Pool) CheckAndRefreshToken(name string) error {
-	return p.CheckAndRefreshTokenWithin(name, time.Hour)
-}
-
 // RefreshToken 手动刷新指定账号的 token。
 func (p *Pool) RefreshToken(name string) error {
 	p.mu.Lock()

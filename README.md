@@ -50,8 +50,11 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
   -d '{"model":"snap-chat","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。多轮上下文按账号自动续接（chat_id 分组）；也可用请求头
-`X-Codearts-Chat-Id: <chatId>` 或 body 里 `conversation_id` 显式指定会话。
+浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。
+多轮语义由完整 `messages` 承载（上游 V2 不保留服务端上下文）。body 里传
+`conversation_id` 或请求头 `X-Codearts-Chat-Id: <id>` 可锁定同一账号续接（黏性路由），
+并复用该轮的上游消息 ID；不传时每次请求独立路由（随机 chatID，没有按账号的隐式续接）。
+多个下游会话并发时须保证 `conversation_id` 唯一，否则会共享黏性与轮次 ID。
 
 流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前返回一次
 `choices: []` 的 usage chunk；其余 chunk 的 `usage` 为 `null`。未启用时不返回 usage。

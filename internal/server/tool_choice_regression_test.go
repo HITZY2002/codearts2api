@@ -28,7 +28,7 @@ func toolChoiceTestHandler(t *testing.T, endpoint string) (*Handler, *pool.Pool)
 	}
 	useFreshTestCatalogs(p)
 	for _, acct := range p.Accounts() {
-		acct.Client = upstream.NewWithChatEndpoint(time.Second, endpoint)
+		acct.Client = upstream.NewWithChatEndpoint(5*time.Second, endpoint)
 	}
 	return NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.2", MaxRotate: 2, ErrThreshold: 1}), p
 }

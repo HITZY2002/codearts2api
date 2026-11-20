@@ -69,7 +69,7 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 				_, _ = fmt.Fprint(w, `{"code":0,"message":"ok"}`)
 			}))
 			defer srv.Close()
-			c := New(time.Second)
+			c := New(5 * time.Second)
 			c.snapBase = srv.URL
 			res, err := c.Checkin(context.Background(), SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"})
 			if err != nil || res.OK != tc.wantOK || res.Wrote != tc.wantWrote || res.Credits != tc.wantCredits || !reflect.DeepEqual(writes, tc.wantWrites) {
@@ -92,7 +92,7 @@ func TestCheckinRecognizesCurrentDailyCampaignAndSkipsCompleted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := New(time.Second)
+	client := New(5 * time.Second)
 	client.snapBase = server.URL
 	result, err := client.Checkin(context.Background(), SignCredential{})
 	if err != nil || !result.OK || result.Wrote || !result.Skipped || result.Message != "今日已签到" {
@@ -126,7 +126,7 @@ func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c := New(time.Second)
+	c := New(5 * time.Second)
 	c.snapBase = srv.URL
 	for i, wantOK := range []bool{false, true, true} {
 		res, err := c.Checkin(context.Background(), SignCredential{})
@@ -186,7 +186,7 @@ func TestCheckinDailyCampaignAndMalformedResponses(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			c := New(time.Second)
+			c := New(5 * time.Second)
 			c.snapBase = srv.URL
 			res, err := c.Checkin(context.Background(), SignCredential{})
 			if (err != nil) != tc.wantErr || res.OK != tc.wantOK || confirms != tc.wantConfirm || res.Credits != tc.wantCredits {

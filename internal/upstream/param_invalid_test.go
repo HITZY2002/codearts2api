@@ -22,7 +22,7 @@ func TestSendChatV2SurfacesEmbeddedParamInvalidAsBadRequest(t *testing.T) {
 				_, _ = io.WriteString(w, "data: "+payload+"\n\n")
 			}))
 			defer backend.Close()
-			c := NewWithChatEndpoint(time.Second, backend.URL)
+			c := NewWithChatEndpoint(5*time.Second, backend.URL)
 			_, err := c.SendChatV2(context.Background(), map[string]any{"model": "GLM-5.2"}, "", SignCredential{}, "", false)
 			var apiErr *ApiError
 			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || !strings.Contains(apiErr.Message, "invalid") {

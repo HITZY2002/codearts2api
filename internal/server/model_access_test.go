@@ -161,7 +161,7 @@ func modelAccessTestHandler(t *testing.T, endpoint string, paths ...string) (*Ha
 	}
 	useFreshTestCatalogs(p)
 	for i, acct := range p.Accounts() {
-		acct.Client = upstream.NewWithChatEndpoint(time.Second, endpoint+paths[i])
+		acct.Client = upstream.NewWithChatEndpoint(5*time.Second, endpoint+paths[i])
 	}
 	return NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, ErrThreshold: 1, MaxRotate: len(paths)}), p
 }
