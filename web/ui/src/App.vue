@@ -126,26 +126,29 @@ const latencyOption = computed(() => ({
   ]
 }))
 
+// 自适应列宽：紧凑列（时间/状态/数值/操作）定宽且永不换行；文本列（模型/账号/ID）
+// 不设 width，按容器剩余宽度弹性分摊，超出省略号 + 悬浮提示。table-layout=fixed
+// 保证省略号生效，scroll-x 为各列最小宽度之和（窄屏横向滚动而非压扁列）。
 const logColumns = [
-  { title: '时间', key: 'created_at', width: 165, render: row => formatTime(row.created_at) },
-  { title: '上游消息 ID', key: 'upstream_msg_id', width: 170, render: row => h('span', { class: 'mono truncate-cell', title: row.upstream_msg_id || '' }, shortenID(row.upstream_msg_id)) },
-  { title: '模型', key: 'model', width: 150 },
-  { title: '账号', key: 'account_name', width: 150, ellipsis: { tooltip: true } },
-  { title: '状态', key: 'status_code', width: 86, render: row => h(NTag, { size: 'small', bordered: false, type: statusType(row.status_code) }, { default: () => String(row.status_code) }) },
-  { title: 'TTFT', key: 'first_output_ms', width: 105, render: row => row.first_output_ms == null ? '—' : formatDuration(row.first_output_ms) },
-  { title: '耗时', key: 'total_ms', width: 105, render: row => formatDuration(row.total_ms) },
-  { title: 'Token', key: 'total_tokens', width: 105, render: row => formatNumber(row.total_tokens) },
-  { title: '积分', key: 'credit_cost', width: 90, render: row => row.credit_cost == null ? '—' : formatNumber(row.credit_cost) },
-  { title: 'IP', key: 'client_ip', width: 135 },
-  { title: '详情', key: 'details', width: 80, render: row => h(NButton, { size: 'tiny', onClick: () => { selectedLog.value = row; detailOpen.value = true } }, { default: () => '查看' }) }
+  { title: '时间', key: 'created_at', width: 150, render: row => formatTime(row.created_at) },
+  { title: '模型', key: 'model', minWidth: 150, ellipsis: { tooltip: true } },
+  { title: '账号', key: 'account_name', minWidth: 130, ellipsis: { tooltip: true } },
+  { title: '状态', key: 'status_code', width: 70, render: row => h(NTag, { size: 'small', bordered: false, type: statusType(row.status_code) }, { default: () => String(row.status_code) }) },
+  { title: 'TTFT', key: 'first_output_ms', width: 90, align: 'right', render: row => row.first_output_ms == null ? '—' : formatDuration(row.first_output_ms) },
+  { title: '耗时', key: 'total_ms', width: 90, align: 'right', render: row => formatDuration(row.total_ms) },
+  { title: 'Token', key: 'total_tokens', width: 100, align: 'right', render: row => formatNumber(row.total_tokens) },
+  { title: '积分', key: 'credit_cost', width: 80, align: 'right', render: row => row.credit_cost == null ? '—' : formatNumber(row.credit_cost) },
+  { title: '上游消息 ID', key: 'upstream_msg_id', minWidth: 170, render: row => h('span', { class: 'mono truncate-cell', title: row.upstream_msg_id || '' }, row.upstream_msg_id || '—') },
+  { title: 'IP', key: 'client_ip', width: 120 },
+  { title: '详情', key: 'details', width: 70, render: row => h(NButton, { size: 'tiny', onClick: () => { selectedLog.value = row; detailOpen.value = true } }, { default: () => '查看' }) }
 ]
 
 const eventColumns = [
-  { title: '时间', key: 'created_at', width: 165, render: row => formatTime(row.created_at) },
+  { title: '时间', key: 'created_at', width: 150, render: row => formatTime(row.created_at) },
   { title: '级别', key: 'level', width: 85, render: row => h(NTag, { size: 'small', type: row.level === 'error' ? 'error' : row.level === 'warn' ? 'warning' : 'info' }, { default: () => eventLevelLabel(row.level) }) },
-  { title: '类型', key: 'kind', width: 170, render: row => h('span', { class: 'truncate-cell', title: row.kind || '' }, eventKindLabel(row.kind)) },
-  { title: '账号', key: 'account_uid', width: 170, ellipsis: { tooltip: true } },
-  { title: '消息', key: 'message' },
+  { title: '类型', key: 'kind', minWidth: 150, render: row => h('span', { class: 'truncate-cell', title: row.kind || '' }, eventKindLabel(row.kind)) },
+  { title: '账号', key: 'account_uid', minWidth: 150, ellipsis: { tooltip: true } },
+  { title: '消息', key: 'message', minWidth: 200, className: 'wrap-cell' },
   { title: '数据', key: 'data', width: 80, render: row => h(NButton, { size: 'tiny', onClick: () => { selectedLog.value = { ...row, request_id: `事件 #${row.id}`, event: true }; detailOpen.value = true } }, { default: () => '查看' }) }
 ]
 
@@ -153,7 +156,7 @@ const accountColumns = [
   {
     title: '账号',
     key: 'nickname',
-    width: 250,
+    minWidth: 220,
     render: row => h('div', { class: 'account-cell' }, [
       h('strong', {}, row.nickname || '未命名'),
       h('span', { class: 'mono muted' }, row.uid || row.name || '—')
@@ -170,12 +173,13 @@ const accountColumns = [
       title: row.reason || undefined
     }, { default: () => row.disabled ? '禁用' : row.cooling ? '冷却' : '健康' })
   },
-  { title: '并发', key: 'active_concurrent', width: 78, render: row => `${row.active_concurrent}/${row.max_concurrent}` },
-  { title: '错误', key: 'err_count', width: 70 },
+  { title: '并发', key: 'active_concurrent', width: 78, align: 'right', render: row => `${row.active_concurrent}/${row.max_concurrent}` },
+  { title: '错误', key: 'err_count', width: 70, align: 'right' },
   {
     title: '剩余积分',
     key: 'credit_balance',
     width: 115,
+    align: 'right',
     render: row => {
       if (!row.credit_balance) return '—'
       if (!row.credit_balance.ok) {
@@ -187,8 +191,8 @@ const accountColumns = [
       }, formatCredit(row.credit_balance.remaining_amount))
     }
   },
-  { title: 'Token 剩余', key: 'token_remaining', width: 105 },
-  { title: '到期时间', key: 'expires_at', width: 155, render: row => formatTime(row.expires_at) },
+  { title: 'Token 剩余', key: 'token_remaining', width: 105, align: 'right' },
+  { title: '到期时间', key: 'expires_at', width: 150, render: row => formatTime(row.expires_at) },
   {
     title: '最近签到',
     key: 'checkin',
@@ -265,7 +269,7 @@ const batchCheckinColumns = [
   {
     title: '账号',
     key: 'uid',
-    width: 230,
+    minWidth: 180,
     ellipsis: { tooltip: true },
     render: row => accountDisplayName(row.uid)
   },
@@ -280,7 +284,7 @@ const batchCheckinColumns = [
       return h(NTag, { size: 'small', type }, { default: () => label })
     }
   },
-  { title: '本次积分', key: 'credits', width: 100, render: row => row.credits ? formatCredit(row.credits) : '0.00' },
+  { title: '本次积分', key: 'credits', width: 100, align: 'right', render: row => row.credits ? formatCredit(row.credits) : '0.00' },
   {
     title: '活动状态',
     key: 'campaigns',
@@ -349,12 +353,6 @@ function formatCredit(value) {
 function formatDuration(value) {
   if (!value) return '0 ms'
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${formatNumber(value)} ms`
-}
-
-function shortenID(value) {
-  if (!value) return '—'
-  if (value.length <= 20) return value
-  return `${value.slice(0, 12)}...${value.slice(-6)}`
 }
 
 function emptySettings() {
@@ -770,7 +768,8 @@ onMounted(async () => {
                   :bordered="false"
                   :loading="loading"
                   size="small"
-                  scroll-x="1520"
+                  table-layout="fixed"
+                  scroll-x="1220"
                   :pagination="{ pageSize, itemCount: logTotal, page: logPage, onUpdatePage: page => { logPage = page; loadAll() } }"
                   :row-key="row => row.request_id"
                 />
@@ -845,7 +844,8 @@ onMounted(async () => {
                   :bordered="false"
                   size="small"
                   striped
-                  scroll-x="1153"
+                  table-layout="fixed"
+                  scroll-x="1133"
                   :row-key="row => row.uid"
                 />
               </n-card>
@@ -866,6 +866,7 @@ onMounted(async () => {
                   :loading="loading"
                   size="small"
                   :bordered="false"
+                  table-layout="fixed"
                   scroll-x="820"
                   :pagination="{ pageSize, itemCount: eventTotal, page: eventPage, onUpdatePage: page => { eventPage = page; loadAll() } }"
                   :row-key="row => row.id"
@@ -992,6 +993,7 @@ onMounted(async () => {
                   :loading="batchCheckinLoading"
                   :bordered="false"
                   size="small"
+                  table-layout="fixed"
                   scroll-x="690"
                   :pagination="{ pageSize: 20 }"
                   :row-key="row => row.uid"
@@ -1064,6 +1066,12 @@ html.theme-dark .account-action-feedback.error { color: #f87171; }
 .campaign-title, .campaign-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .truncate-cell { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+/* 自适应列宽配套：单元格默认不换行（数值/时间不再被折成两行），
+   文本列靠省略号截断；事件消息列例外，允许换行完整展示。 */
+.data-card .n-data-table-th,
+.data-card .n-data-table-td { white-space: nowrap; }
+.data-card .n-data-table-td.wrap-cell { white-space: normal; overflow-wrap: anywhere; }
+.data-card .n-data-table-td .truncate-cell { max-width: 100%; }
 @media (max-width: 640px) {
   .app-content { padding: 12px; }
   .app-header { flex-wrap: wrap; }
