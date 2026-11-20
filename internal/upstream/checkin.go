@@ -50,6 +50,15 @@ type CheckinResult struct {
 	Campaigns []CreditClaimResult `json:"campaigns"`
 }
 
+// CreditDeliveryRaw 返回活动投放接口的原始 JSON（诊断用：确认上游是否有剩余额度字段）。
+func (c *Client) CreditDeliveryRaw(ctx context.Context, cred SignCredential) ([]byte, error) {
+	raw, err := c.creditRequest(ctx, http.MethodGet, EpCreditDelivery+"?channel="+creditChannel, nil, cred)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func (c *Client) creditRequest(ctx context.Context, method, path string, body any, cred SignCredential) (json.RawMessage, error) {
 	var raw []byte
 	var err error

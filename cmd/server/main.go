@@ -60,7 +60,7 @@ func main() {
 		Pool:         p,
 		Upstream:     c,
 		APIKey:       cfg.APIKey,
-		MaxRotate:    3,
+		MaxRotate:    8,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
@@ -87,6 +87,8 @@ func main() {
 		OAuthClient:       upstream.New(15 * time.Second),
 		LoginConfig:       loginConfig(cfg),
 		OAuthCallbackHost: cfg.OAuthCallbackHost,
+		HistoryFile:       historyFile(cfg),
+		HistoryLimit:      cfg.HistoryLimit,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -132,4 +134,12 @@ func loginConfig(cfg *Config) upstream.LoginConfig {
 		}
 	}
 	return lc
+}
+
+// historyFile 调用历史默认落在 state 文件旁边。
+func historyFile(cfg *Config) string {
+	if cfg.HistoryFile != "" {
+		return cfg.HistoryFile
+	}
+	return cfg.StateFile + ".history.jsonl"
 }

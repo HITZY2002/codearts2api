@@ -19,12 +19,8 @@ func (h *Handler) servePanel(w http.ResponseWriter, r *http.Request) {
 	html = strings.ReplaceAll(html, "__SERVICE_TITLE__", "CodeArts2API")
 	html = strings.ReplaceAll(html, "__LOGO__", "CA")
 	html = strings.ReplaceAll(html, "__ACCENT__", "#0284c7")
-	// CodeArts 无积分/签到；「签到」隐藏文案改为保活相关
-	html = strings.ReplaceAll(html, ">全员签到<", ">全员保活<")
-	html = strings.ReplaceAll(html, ">拉积分<", ">刷新状态<")
-	html = strings.ReplaceAll(html, ">签到<", ">保活<")
-	html = strings.ReplaceAll(html, ">积分<", ">状态<")
-	html = strings.ReplaceAll(html, "积分合计", "账号健康")
+	// 注：CodeArts 账号本身有签到积分（/admin/api/checkin 会返回本次领取的 credits），
+	// 因此不再把「积分 / 签到」改写为其他文案，面板如实展示积分与签到状态。
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
