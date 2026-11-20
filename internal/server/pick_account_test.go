@@ -9,6 +9,12 @@ import (
 	"codearts2api/internal/upstream"
 )
 
+func useFreshTestCatalogs(p *pool.Pool) {
+	for _, acct := range p.Accounts() {
+		upstream.SetAccountModels(acct.UID, []upstream.ModelInfo{{ID: "GLM-5.2"}})
+	}
+}
+
 // 客户端只调 /v1/chat/completions（没调过 /v1/models）时目录为空。
 // pickAccount 必须先补齐目录再挑号，否则 MaxRotate 用尽也轮不到有能力的账号。
 func TestPickAccountDiscoversCatalogLazily(t *testing.T) {

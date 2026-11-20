@@ -20,6 +20,7 @@ const (
 
 	// 聊天端点（chatDomain 商业版 = snap-access.cn-north-4）。
 	EpChatV2         = "/api/v2/chat/completions"
+	EpCreditUsage    = "/v1/ops/credit/usage"
 	EpChat           = "/v1/chat/chat"
 	EpStartChat      = "/v1/chat/start-chat"
 	EpChatAgents     = "/v1/chat/agents"

@@ -17,7 +17,7 @@ func TestPickAccountPrefersAccountWithModel(t *testing.T) {
 		{UserID: "acct-a", UserName: "a"},
 		{UserID: "acct-b", UserName: "b"},
 		{UserID: "acct-c", UserName: "c"},
-		{UserID: "acct-d", UserName: "d"}, // 未发现目录
+		{UserID: "acct-d", UserName: "d"},
 	}, pool.Config{}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -29,6 +29,7 @@ func TestPickAccountPrefersAccountWithModel(t *testing.T) {
 	upstream.SetAccountModels("acct-c", []upstream.ModelInfo{
 		{ID: "GLM-5.2"}, {ID: "deepseek-v4-pro-0813", Benefit: true},
 	})
+	upstream.SetAccountModels("acct-d", []upstream.ModelInfo{{ID: "GLM-5.2"}})
 
 	got := h.pickAccount(map[string]bool{}, "deepseek-v4-pro-0813")
 	if got == nil || got.Name != "acct-c" {
@@ -57,7 +58,7 @@ func TestPickAccountPrefersAccountWithModel(t *testing.T) {
 		t.Error("有该模型的账号应通过能力检查（大小写不敏感）")
 	}
 	// 目录未知的账号乐观放行，交给上游判定；nil 也不能崩。
-	if !h.accountCanServe(p.Get("acct-d"), "deepseek-v4-pro-0813") {
+	if !h.accountCanServe(&pool.Account{UID: "acct-never-discovered"}, "deepseek-v4-pro-0813") {
 		t.Error("目录未知时应乐观放行")
 	}
 	if !h.accountCanServe(nil, "deepseek-v4-pro-0813") {

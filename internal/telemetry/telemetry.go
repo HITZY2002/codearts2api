@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 type RequestLog struct {
 	ID                      int64    `json:"id"`
 	RequestID               string   `json:"request_id"`
+	ChatID                  string   `json:"chat_id"`
+	UpstreamMsgID           string   `json:"upstream_msg_id"`
 	CreatedAt               int64    `json:"created_at"`
 	Endpoint                string   `json:"endpoint"`
 	Method                  string   `json:"method"`
@@ -91,6 +94,8 @@ const schema = `
 CREATE TABLE IF NOT EXISTS request_logs (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	request_id TEXT NOT NULL,
+	chat_id TEXT NOT NULL DEFAULT '',
+	upstream_msg_id TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
 	endpoint TEXT NOT NULL,
 	method TEXT NOT NULL,
@@ -183,6 +188,15 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate sqlite: %w", err)
 	}
+	for _, migration := range []string{
+		"ALTER TABLE request_logs ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE request_logs ADD COLUMN upstream_msg_id TEXT NOT NULL DEFAULT ''",
+	} {
+		if _, err := db.Exec(migration); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate sqlite: %w", err)
+		}
+	}
 	s := &Store{
 		db:    db,
 		path:  path,
@@ -266,13 +280,13 @@ func (s *Store) insertRequest(req RequestLog) error {
 	}
 	_, err := s.db.Exec(
 		`INSERT INTO request_logs
-		(request_id, created_at, endpoint, method, client_ip, status_code, stream, model,
+		(request_id, chat_id, upstream_msg_id, created_at, endpoint, method, client_ip, status_code, stream, model,
 		 account_uid, account_name, attempts, queue_wait_ms, first_output_ms, total_ms,
 		 prompt_tokens, completion_tokens, total_tokens, usage_estimated, credit_cost,
 		 billing_prompt_tokens, billing_completion_tokens, billing_cached_tokens,
 		 billing_total_tokens, billing_request_count, finish_reason, error_type)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.RequestID, req.CreatedAt, req.Endpoint, req.Method, req.ClientIP, req.StatusCode,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.RequestID, req.ChatID, req.UpstreamMsgID, req.CreatedAt, req.Endpoint, req.Method, req.ClientIP, req.StatusCode,
 		stream, req.Model, req.AccountUID, req.AccountName, req.Attempts, req.QueueWaitMs,
 		req.FirstOutputMs, req.TotalMs, req.PromptTokens, req.CompletionTokens,
 		req.TotalTokens, usageEstimated, req.CreditCost, req.BillingPromptTokens,

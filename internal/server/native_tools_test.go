@@ -48,9 +48,10 @@ func TestChatCompletionsStreamsNativeToolCallsWithoutBuffering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	useFreshTestCatalogs(p)
 	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, upstreamServer.URL)
 
-	apiServer := httptest.NewServer(NewHandler(Config{Pool: p, DefaultModel: "glm-5.2", MaxRotate: 1}))
+	apiServer := httptest.NewServer(NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.2", MaxRotate: 1}))
 	defer apiServer.Close()
 
 	payload := `{
@@ -70,6 +71,7 @@ func TestChatCompletionsStreamsNativeToolCallsWithoutBuffering(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testHandlerAPIKey)
 
 	responseCh := make(chan *http.Response, 1)
 	errCh := make(chan error, 1)
@@ -140,8 +142,8 @@ func TestChatCompletionsStreamsNativeToolCallsWithoutBuffering(t *testing.T) {
 	}
 
 	headers := <-headersSeen
-	if headers.Get("Chat-Id") == "" || headers.Get("Session-Id") == "" {
-		t.Fatalf("CodeArts affinity headers missing: %#v", headers)
+	if headers.Get("Chat-Id") != "" || headers.Get("Session-Id") != "" {
+		t.Fatalf("official kernel does not send Chat-Id/Session-Id: %#v", headers)
 	}
 }
 
@@ -164,13 +166,14 @@ func TestChatCompletionsRetriesEmbeddedCodeArtsQueueLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	useFreshTestCatalogs(p)
 	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, upstreamServer.URL)
 	h := NewHandler(Config{
-		Pool: p, DefaultModel: "glm-5.2", MaxRotate: 1,
+		Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.2", MaxRotate: 1,
 		QueueRetryDelay: time.Millisecond, QueueMaxAttempts: 2,
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+	req := authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
 		"model":"glm-5.2","stream":false,"messages":[{"role":"user","content":"hi"}]
 	}`))
 	rec := httptest.NewRecorder()
@@ -199,10 +202,11 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	useFreshTestCatalogs(p)
 	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, upstreamServer.URL)
-	h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.3-flash", MaxRotate: 1})
+	h := NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.3-flash", MaxRotate: 1})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+	req := authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
 		"model":"glm-5.3-flash","stream":false,"messages":[{"role":"user","content":"hi"}]
 	}`))
 	rec := httptest.NewRecorder()
@@ -226,8 +230,8 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(Config{Pool: p})
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	h := NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey})
+	req := authenticatedTestRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

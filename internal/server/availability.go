@@ -148,7 +148,7 @@ func upstreamUnavailableReason(err error) string {
 // 拿不到锁就让位给真实请求，等下一轮再试——否则用户请求会被探测挤成
 // TM.00001041「并发会话数已达上限」。
 func (h *Handler) probeModel(acct *pool.Account, model string) {
-	if acct == nil || acct.Auth == nil {
+	if acct == nil || acct.AuthSnapshot() == nil {
 		return
 	}
 	// 账号一旦有真实请求在跑（或刚跑过），本轮探测整体让位：探测只是为了让
@@ -174,7 +174,8 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		availability.Unlock()
 	}()
 
-	token, ak, sk := acct.Auth.Credentials()
+	authz := acct.AuthSnapshot()
+	token, ak, sk := authz.Credentials()
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
@@ -294,7 +295,7 @@ type pendingProbe struct {
 func (h *Handler) pendingProbes() []pendingProbe {
 	var out []pendingProbe
 	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct == nil || acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
+		if acct == nil || acct.AuthSnapshot() == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
 		models, ok := upstream.AccountModels(acct.UID)

@@ -4,6 +4,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,7 +203,7 @@ func (a *Auth) ExpiresAt() time.Time {
 func (a *Auth) Remaining() time.Duration {
 	t := a.ExpiresAt()
 	if t.IsZero() {
-		return 24 * time.Hour
+		return 0
 	}
 	return time.Until(t)
 }
@@ -243,11 +244,13 @@ func LoadDir(dir string) ([]*Auth, error) {
 		p := filepath.Join(dir, e.Name())
 		raw, err := os.ReadFile(p)
 		if err != nil {
-			return nil, err
+			log.Printf("auth: skip unreadable credential file=%s err=%v", p, err)
+			continue
 		}
 		var a Auth
 		if err := json.Unmarshal(raw, &a); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", e.Name(), err)
+			log.Printf("auth: skip malformed credential file=%s err=%v", p, err)
+			continue
 		}
 		if a.CloudDragonTok == "" {
 			continue

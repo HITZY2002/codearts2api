@@ -45,6 +45,14 @@ func newOAuthStore() *oauthStore {
 	return &oauthStore{byID: map[string]*oauthSession{}}
 }
 
+func cloneOAuthSession(sess *oauthSession) *oauthSession {
+	if sess == nil {
+		return nil
+	}
+	copy := *sess
+	return &copy
+}
+
 func (s *oauthStore) put(sess *oauthSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -56,7 +64,7 @@ func (s *oauthStore) get(id string) *oauthSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcLocked()
-	return s.byID[id]
+	return cloneOAuthSession(s.byID[id])
 }
 
 func (s *oauthStore) getByTicket(tid string) *oauthSession {
@@ -65,22 +73,24 @@ func (s *oauthStore) getByTicket(tid string) *oauthSession {
 	s.gcLocked()
 	for _, sess := range s.byID {
 		if sess.TicketID == tid {
-			return sess
+			return cloneOAuthSession(sess)
 		}
 	}
 	return nil
 }
 
-func (s *oauthStore) enableTicketFallbackByTicket(ticketID, secret string) {
+func (s *oauthStore) enableTicketFallbackByTicket(ticketID, secret string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gcLocked()
 	for _, sess := range s.byID {
-		if sess.TicketID == ticketID {
+		if sess.TicketID == ticketID && !sess.Done {
 			sess.Secret = secret
 			sess.TicketFallback = true
-			return
+			return true
 		}
 	}
+	return false
 }
 
 func (s *oauthStore) enableTicketFallbackByID(id, secret string) {
@@ -98,6 +108,15 @@ func (s *oauthStore) complete(id string) {
 	if sess := s.byID[id]; sess != nil {
 		sess.Done = true
 		sess.Err = ""
+	}
+}
+
+func (s *oauthStore) fail(id string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess := s.byID[id]; sess != nil {
+		sess.Done = true
+		sess.Err = err.Error()
 	}
 }
 
@@ -122,7 +141,7 @@ func (s *oauthStore) codeSessionCandidates(ticketID, secret string) []*oauthSess
 	if secret != "" {
 		for _, sess := range s.byID {
 			if sess.Secret == secret && !sess.Done {
-				return []*oauthSession{sess}
+				return []*oauthSession{cloneOAuthSession(sess)}
 			}
 		}
 		return nil // 带了 secret 却不命中：会话已失效，不得再猜
@@ -130,14 +149,14 @@ func (s *oauthStore) codeSessionCandidates(ticketID, secret string) []*oauthSess
 	if ticketID != "" {
 		for _, sess := range s.byID {
 			if sess.TicketID == ticketID && !sess.Done {
-				return []*oauthSession{sess}
+				return []*oauthSession{cloneOAuthSession(sess)}
 			}
 		}
 		return nil
 	}
 	for _, sess := range s.byID {
 		if !sess.Done {
-			out = append(out, sess)
+			out = append(out, cloneOAuthSession(sess))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
@@ -225,11 +244,6 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		ID: id, TicketID: ticketID, Secret: secret, Verifier: verifier, Port: port,
 		DPoPPrivateKey: dpopPrivateJWK, AuthURL: authURL, CreatedAt: time.Now(),
 	})
-	// 兼容旧 loginMu 回调路径（/oauth/callback 会更新 portal secret）
-	h.loginMu.Lock()
-	h.logins[ticketID] = &pendingLogin{TicketID: ticketID, Secret: secret, Verifier: verifier, Port: port}
-	h.loginMu.Unlock()
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"session_id": id,
@@ -279,13 +293,6 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 同步 loginMu 里可能被 callback 更新的 portal secret
-	h.loginMu.Lock()
-	if p, ok := h.logins[sess.TicketID]; ok && p.Secret != "" {
-		sess.Secret = p.Secret
-	}
-	h.loginMu.Unlock()
-
 	tok, err := h.cfg.OAuthClient.PollTicket(context.Background(), h.cfg.LoginConfig, sess.TicketID, sess.Secret)
 	if err != nil || tok == nil || tok.UserName == "" || tok.Credentials.SecurityToken == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -294,12 +301,11 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.saveLoginResult(tok, sess.Verifier); err != nil {
-		sess.Done = true
-		sess.Err = err.Error()
+		h.oauth.fail(req.SessionID, err)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "error", "message": err.Error()})
 		return
 	}
-	sess.Done = true
+	h.oauth.complete(req.SessionID)
 	h.oauth.del(req.SessionID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
@@ -350,7 +356,7 @@ func (h *Handler) adminOAuthImportCallback(w http.ResponseWriter, r *http.Reques
 			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "status": "error", "message": err.Error()})
 			return
 		}
-		sess.Done = true
+		h.oauth.complete(req.SessionID)
 		h.oauth.del(req.SessionID)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "status": "done", "message": "OAuth 登录成功，已保存可自动续期凭据",
@@ -368,11 +374,6 @@ func (h *Handler) adminOAuthImportCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	h.oauth.enableTicketFallbackByID(req.SessionID, secret)
-	h.loginMu.Lock()
-	if pending, ok := h.logins[sess.TicketID]; ok {
-		pending.Secret = secret
-	}
-	h.loginMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "status": "continue", "next_url": nextURL,
 		"message": "回调已接收，请继续打开华为授权页并等待自动检测",

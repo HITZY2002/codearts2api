@@ -1,6 +1,6 @@
 <script setup>
 import { computed, h, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
-import { NAlert, NButton, NCard, NConfigProvider, NDataTable, NDescriptions, NDescriptionsItem, NDrawer, NDrawerContent, NGrid, NGi, NInput, NLayout, NLayoutContent, NLayoutHeader, NSelect, NSpace, NStatistic, NTabPane, NTabs, NTag, darkTheme } from 'naive-ui'
+import { NAlert, NButton, NCard, NConfigProvider, NDataTable, NDescriptions, NDescriptionsItem, NDrawer, NDrawerContent, NForm, NFormItem, NGrid, NGi, NInput, NInputNumber, NLayout, NLayoutContent, NLayoutHeader, NSelect, NSpace, NStatistic, NSwitch, NTabPane, NTabs, NTag, darkTheme } from 'naive-ui'
 import { use } from 'echarts/core'
 import { BarChart, LineChart } from 'echarts/charts'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -79,6 +79,12 @@ const batchCheckinSize = ref(3)
 const batchCheckinResults = ref([])
 const batchCheckinMessage = ref('')
 const batchCheckinError = ref(false)
+const settingsLoading = ref(false)
+const settingsSaving = ref(false)
+const settingsMessage = ref('')
+const settingsError = ref(false)
+const settingsLoaded = ref(false)
+const settingsForm = ref(emptySettings())
 const filteredAccountRows = computed(() => {
   const keyword = accountSearch.value.trim().toLowerCase()
   return accountRows.value
@@ -122,11 +128,12 @@ const latencyOption = computed(() => ({
 
 const logColumns = [
   { title: '时间', key: 'created_at', width: 165, render: row => formatTime(row.created_at) },
+  { title: '上游消息 ID', key: 'upstream_msg_id', width: 170, render: row => h('span', { class: 'mono truncate-cell', title: row.upstream_msg_id || '' }, shortenID(row.upstream_msg_id)) },
   { title: '模型', key: 'model', width: 150 },
   { title: '账号', key: 'account_name', width: 150, ellipsis: { tooltip: true } },
   { title: '状态', key: 'status_code', width: 86, render: row => h(NTag, { size: 'small', bordered: false, type: statusType(row.status_code) }, { default: () => String(row.status_code) }) },
-  { title: 'TTFT', key: 'first_output_ms', width: 105, render: row => row.first_output_ms == null ? '—' : `${formatNumber(row.first_output_ms)} ms` },
-  { title: '耗时', key: 'total_ms', width: 105, render: row => `${formatNumber(row.total_ms)} ms` },
+  { title: 'TTFT', key: 'first_output_ms', width: 105, render: row => row.first_output_ms == null ? '—' : formatDuration(row.first_output_ms) },
+  { title: '耗时', key: 'total_ms', width: 105, render: row => formatDuration(row.total_ms) },
   { title: 'Token', key: 'total_tokens', width: 105, render: row => formatNumber(row.total_tokens) },
   { title: '积分', key: 'credit_cost', width: 90, render: row => row.credit_cost == null ? '—' : formatNumber(row.credit_cost) },
   { title: 'IP', key: 'client_ip', width: 135 },
@@ -339,6 +346,33 @@ function formatCredit(value) {
   return Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+function formatDuration(value) {
+  if (!value) return '0 ms'
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${formatNumber(value)} ms`
+}
+
+function shortenID(value) {
+  if (!value) return '—'
+  if (value.length <= 20) return value
+  return `${value.slice(0, 12)}...${value.slice(-6)}`
+}
+
+function emptySettings() {
+  return {
+    default_model: 'glm-5.2',
+    max_concurrent: 1,
+    queue_retry_seconds: 10,
+    queue_max_attempts: 30,
+    benefit_auto_claim: true,
+    credits_auto_claim: true,
+    watch_enabled: true,
+    poll_minutes: 30,
+    refresh_skew_minutes: 30,
+    keepalive_interval_minutes: 15,
+    keepalive_window_minutes: 10
+  }
+}
+
 function authHeaders() {
   return apiKey.value ? { Authorization: `Bearer ${apiKey.value}` } : {}
 }
@@ -531,6 +565,41 @@ async function loadCreditBalances() {
   }
 }
 
+async function loadSettings() {
+  settingsLoading.value = true
+  try {
+    const result = await request('/admin/api/settings')
+    settingsForm.value = { ...emptySettings(), ...result.settings }
+    settingsLoaded.value = true
+    settingsMessage.value = ''
+  } catch (error) {
+    settingsError.value = true
+    settingsMessage.value = error.message
+  } finally {
+    settingsLoading.value = false
+  }
+}
+
+async function saveSettings() {
+  settingsSaving.value = true
+  settingsMessage.value = ''
+  try {
+    const result = await request('/admin/api/settings', {
+      method: 'POST',
+      body: JSON.stringify(settingsForm.value)
+    })
+    settingsForm.value = { ...result.settings }
+    settingsLoaded.value = true
+    settingsError.value = false
+    settingsMessage.value = result.message || '设置已保存'
+  } catch (error) {
+    settingsError.value = true
+    settingsMessage.value = error.message
+  } finally {
+    settingsSaving.value = false
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -618,6 +687,9 @@ watch(page, value => {
   if (value === 'accounts' && loggedIn.value && !creditLoaded.value && !creditLoading.value) {
     loadCreditBalances()
   }
+  if (value === 'settings' && loggedIn.value && !settingsLoaded.value && !settingsLoading.value) {
+    loadSettings()
+  }
 })
 
 onMounted(async () => {
@@ -698,7 +770,7 @@ onMounted(async () => {
                   :bordered="false"
                   :loading="loading"
                   size="small"
-                  scroll-x="1260"
+                  scroll-x="1520"
                   :pagination="{ pageSize, itemCount: logTotal, page: logPage, onUpdatePage: page => { logPage = page; loadAll() } }"
                   :row-key="row => row.request_id"
                 />
@@ -810,6 +882,78 @@ onMounted(async () => {
                 </n-gi>
               </n-grid>
             </n-tab-pane>
+
+            <n-tab-pane name="settings" tab="设置">
+              <n-card title="运行设置" class="data-card">
+                <template #header-extra>
+                  <n-button type="primary" size="small" :loading="settingsSaving" @click="saveSettings">
+                    保存
+                  </n-button>
+                </template>
+                <n-alert v-if="settingsMessage" :type="settingsError ? 'error' : 'success'" :show-icon="true" class="settings-alert">
+                  {{ settingsMessage }}
+                </n-alert>
+                <n-form class="settings-form" label-placement="left" label-width="170" :disabled="settingsLoading || settingsSaving">
+                  <n-grid :x-gap="18" :y-gap="0" cols="1 s:2 m:3" responsive="screen">
+                    <n-gi span="1 s:2 m:3">
+                      <n-form-item label="默认模型">
+                        <n-input v-model:value="settingsForm.default_model" placeholder="glm-5.2" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="单账号并发上限">
+                        <n-input-number v-model:value="settingsForm.max_concurrent" :min="1" :max="10" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="排队重试间隔（秒）">
+                        <n-input-number v-model:value="settingsForm.queue_retry_seconds" :min="1" :max="300" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="排队最大尝试">
+                        <n-input-number v-model:value="settingsForm.queue_max_attempts" :min="1" :max="180" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="Watchdog">
+                        <n-switch v-model:value="settingsForm.watch_enabled" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="自动活动积分">
+                        <n-switch v-model:value="settingsForm.credits_auto_claim" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="自动限时福利">
+                        <n-switch v-model:value="settingsForm.benefit_auto_claim" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="轮询间隔（分钟）">
+                        <n-input-number v-model:value="settingsForm.poll_minutes" :min="1" :max="1440" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="Token 提前刷新（分钟）">
+                        <n-input-number v-model:value="settingsForm.refresh_skew_minutes" :min="1" :max="720" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="保活心跳间隔（分钟）">
+                        <n-input-number v-model:value="settingsForm.keepalive_interval_minutes" :min="1" :max="1440" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                    <n-gi>
+                      <n-form-item label="保活空闲窗口（分钟）">
+                        <n-input-number v-model:value="settingsForm.keepalive_window_minutes" :min="1" :max="1440" :show-button="false" />
+                      </n-form-item>
+                    </n-gi>
+                  </n-grid>
+                </n-form>
+              </n-card>
+            </n-tab-pane>
           </n-tabs>
           <n-drawer v-model:show="detailOpen" :width="560" placement="right">
             <n-drawer-content title="记录详情" closable>
@@ -896,6 +1040,9 @@ body {
 .data-card .log-filters { margin-bottom: 14px; }
 .account-login-panel { margin-bottom: 14px; }
 .credit-alert { margin-bottom: 14px; }
+.settings-alert { margin-bottom: 14px; }
+.settings-form .n-input,
+.settings-form .n-input-number { width: 240px; max-width: 100%; }
 .log-filters .n-select { width: 160px; }
 .detail-json { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .theme-select { width: 120px; }

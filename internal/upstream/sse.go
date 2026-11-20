@@ -35,6 +35,12 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("codearts error: %s", e.Msg)
 }
 
+// APIError applies the same status classification to errors found after SSE
+// preflight, so streaming and aggregated responses treat them consistently.
+func (e *UpstreamError) APIError() *ApiError {
+	return embeddedSSEError(map[string]any{"error_code": e.Code, "error_msg": e.Msg})
+}
+
 // RawCompletion 聚合结果。
 type RawCompletion struct {
 	Content     string
@@ -48,6 +54,8 @@ type RawCompletion struct {
 // CreditUsage captures billing metadata from a CodeArts Web done frame.
 type CreditUsage struct {
 	CreditCost          float64 `json:"credit_cost"`
+	CacheHitRatio       float64 `json:"cache_hit_ratio"`
+	MsgID               string  `json:"msg_id"`
 	PromptTokenUsed     int64   `json:"prompt_token_used"`
 	CompletionTokenUsed int64   `json:"completion_token_used"`
 	CachedTokenUsed     int64   `json:"cached_token_used"`
@@ -600,8 +608,12 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			nativeDelta, nativeFinish := deltaFromChunk(payload)
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
-			beforeContent, beforeReason := content.Len(), reason.Len()
+			beforeContent, beforeReason := content.String(), reason.Len()
 			applyEvent(&content, &reason, &finish, &upErr, ev, data)
+			currentContent := content.String()
+			if upErr == nil && currentContent != beforeContent && !strings.HasPrefix(currentContent, beforeContent) {
+				upErr = &UpstreamError{Code: "invalid_snapshot", Msg: "upstream replaced already streamed content"}
+			}
 			if upErr != nil {
 				if werr := writeErr(upErr.Error()); werr != nil {
 					streamErr = werr
@@ -619,8 +631,8 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			if role, ok := nativeDelta["role"].(string); ok && role != "" {
 				delta["role"] = role
 			}
-			if content.Len() > beforeContent {
-				delta["content"] = content.String()[beforeContent:]
+			if currentContent != beforeContent {
+				delta["content"] = currentContent[len(beforeContent):]
 			}
 			if reason.Len() > beforeReason {
 				delta["reasoning_content"] = reason.String()[beforeReason:]
@@ -670,8 +682,14 @@ func creditUsageFromPayload(payload map[string]any) *CreditUsage {
 		return nil
 	}
 	var out CreditUsage
+	if value, ok := raw["id"].(string); ok {
+		out.MsgID = value
+	}
 	if value, ok := raw["credit_cost"].(float64); ok {
 		out.CreditCost = value
+	}
+	if value, ok := raw["cache_hit_ratio"].(float64); ok {
+		out.CacheHitRatio = value
 	}
 	if value, ok := raw["prompt_token_used"].(float64); ok {
 		out.PromptTokenUsed = int64(value)

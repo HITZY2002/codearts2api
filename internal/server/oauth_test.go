@@ -264,6 +264,21 @@ func TestOAuthImportRejectsNonHuaweiContinuation(t *testing.T) {
 	}
 }
 
+func TestOAuthDirectCallbackRejectsOpenRedirect(t *testing.T) {
+	h := NewHandler(Config{LoginConfig: upstream.DefaultLoginConfig()})
+	h.oauth.put(&oauthSession{ID: "session", TicketID: "ticket", CreatedAt: time.Now()})
+	nextURL := "https://example.com/steal?ticket_id=ticket"
+	req := httptest.NewRequest(http.MethodGet, "/oauth/callback?secret=portal-secret&redirect="+url.QueryEscape(nextURL), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+		t.Fatalf("untrusted continuation status=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	if sess := h.oauth.get("session"); sess.TicketFallback || sess.Secret == "portal-secret" {
+		t.Fatal("untrusted callback mutated the OAuth session")
+	}
+}
+
 // portal 第二次回调不带 ticket_id，只带 code + secret。若匹配不到就回退到
 // 「唯一活跃会话」，服务重启过或开过两次登录时会把 code 配给错误的 PKCE 密钥，
 // 表现为 400 STS5.1805 invalid authorization code。

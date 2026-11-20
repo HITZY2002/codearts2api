@@ -48,14 +48,16 @@ func TestChatCompletionsUsage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			useFreshTestCatalogs(p)
 			p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, up.URL)
-			h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.2", MaxRotate: 1})
+			h := NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.2", MaxRotate: 1})
 			stream := "false"
 			if tc.stream {
 				stream = "true"
 			}
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":`+stream+`,"messages":[{"role":"user","content":"hi"}]`+tc.options+`}`))
 			rec := httptest.NewRecorder()
+			req.Header.Set("Authorization", "Bearer "+testHandlerAPIKey)
 			h.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())

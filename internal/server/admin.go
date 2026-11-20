@@ -127,7 +127,8 @@ func (h *Handler) adminCreditBalances(w http.ResponseWriter, r *http.Request) {
 					result.Message = "token invalid"
 				default:
 					ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-					token, ak, sk := account.Auth.Credentials()
+					authz := account.AuthSnapshot()
+					token, ak, sk := authz.Credentials()
 					balance, fetchErr := account.Client.FetchCreditBalance(ctx, upstream.SignCredential{
 						SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
 					})
@@ -327,7 +328,8 @@ func (h *Handler) adminCheckinStatuses(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-				token, ak, sk := account.Auth.Credentials()
+				authz := account.AuthSnapshot()
+				token, ak, sk := authz.Credentials()
 				campaigns, err := account.Client.FetchCreditCampaigns(ctx, upstream.SignCredential{
 					SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
 				})
@@ -461,7 +463,10 @@ func (h *Handler) adminDisable(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "manual disable"
 	}
-	h.cfg.Pool.Disable(body.UID, reason)
+	if !h.cfg.Pool.Disable(body.UID, reason) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已禁用 " + body.UID})
 }
 
