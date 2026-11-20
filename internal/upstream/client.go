@@ -165,6 +165,17 @@ func NewWithChatEndpoint(timeout time.Duration, endpoint string) *Client {
 	return c
 }
 
+// NewWithSnapEndpoint 构造指向自定义 snap-access 主机的客户端（测试注入用）。
+// 与 NewWithChatEndpoint 不同：chatURL 留空，聊天与积分查询都走 snapBase，
+// CreditUsageEnabled 保持 true，可端到端验证积分查询时机。
+func NewWithSnapEndpoint(timeout time.Duration, snapBase string) *Client {
+	c := New(timeout)
+	if strings.TrimSpace(snapBase) != "" {
+		c.snapBase = strings.TrimRight(snapBase, "/")
+	}
+	return c
+}
+
 // chatEndpoint 返回本次请求要用的 chat-completions 地址。
 func (c *Client) chatEndpoint() string {
 	if c.chatURL != "" {
@@ -720,9 +731,9 @@ func embeddedSSEError(payload map[string]any) *ApiError {
 	status := http.StatusBadGateway
 	low := strings.ToLower(combined)
 	switch {
-	case strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "未授权"):
+	case containsHTTPCode(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "未授权"):
 		status = http.StatusUnauthorized
-	case strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
+	case containsHTTPCode(low, "429") || strings.Contains(low, "tm.00001041") ||
 		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话"):
 		status = http.StatusTooManyRequests
 	case isModelIDError(combined) || strings.Contains(low, "002002009") || strings.Contains(low, "not registered") ||
@@ -734,6 +745,30 @@ func embeddedSSEError(payload map[string]any) *ApiError {
 		status = http.StatusBadRequest
 	}
 	return &ApiError{Code: status, Status: status, Message: truncateStr(combined, 300), Path: EpChatV2}
+}
+
+// containsHTTPCode 按独立词元匹配 HTTP 状态码：前后必须不是字母/数字。
+// 裸 strings.Contains 会把 "14013 tokens"、"00200401" 之类误判成 401/429，
+// 进而把健康账号 Disable/Cooldown。"IAM.401"、"quota.429" 这类真实错误码仍命中。
+func containsHTTPCode(low, code string) bool {
+	isWord := func(b byte) bool {
+		return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z')
+	}
+	for off := 0; off+len(code) <= len(low); {
+		idx := strings.Index(low[off:], code)
+		if idx < 0 {
+			return false
+		}
+		idx += off
+		end := idx + len(code)
+		beforeOK := idx == 0 || !isWord(low[idx-1])
+		afterOK := end == len(low) || !isWord(low[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		off = idx + 1
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

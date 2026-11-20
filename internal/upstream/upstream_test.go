@@ -21,6 +21,28 @@ type terminalErrorReader struct{ err error }
 
 func (r terminalErrorReader) Read([]byte) (int, error) { return 0, r.err }
 
+func TestEmbeddedSSEErrorStatusCodeBoundaries(t *testing.T) {
+	tests := []struct {
+		name, code, message string
+		want                int
+	}{
+		{"real 401 code", "IAM.401", "unauthorized", http.StatusUnauthorized},
+		{"401 in message", "E", "http 401 from upstream", http.StatusUnauthorized},
+		{"token count contains 401", "E", "used 14013 tokens", http.StatusBadGateway},
+		{"long code contains 401", "00200401", "some business error", http.StatusBadGateway},
+		{"real 429 code", "quota.429", "rate limited", http.StatusTooManyRequests},
+		{"number contains 429", "E", "request 4290 failed", http.StatusBadGateway},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := embeddedSSEError(map[string]any{"error_code": tc.code, "error_msg": tc.message})
+			if err == nil || err.Status != tc.want {
+				t.Fatalf("status=%v, want %d (err=%v)", err, tc.want, err)
+			}
+		})
+	}
+}
+
 func TestStreamStopsReadingAfterDone(t *testing.T) {
 	stream := io.MultiReader(
 		strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"),

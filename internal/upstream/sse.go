@@ -224,8 +224,41 @@ func sortedToolCalls(calls toolCallAccumulator) []ChatToolCall {
 	return out
 }
 
+// textBuffer 是可按字节尾部取增量的文本累积器。strings.Builder 每个事件都要
+// String() 全量拷贝来做前缀校验/增量切片，长回复是 O(n²)；这里增量路径 O(delta)。
+type textBuffer struct{ buf []byte }
+
+func (b *textBuffer) WriteString(s string) { b.buf = append(b.buf, s...) }
+func (b *textBuffer) Reset()               { b.buf = b.buf[:0] }
+func (b *textBuffer) Len() int             { return len(b.buf) }
+func (b *textBuffer) String() string       { return string(b.buf) }
+func (b *textBuffer) tail(from int) string { return string(b.buf[from:]) }
+
+// hasBytePrefix 报告 s 是否以 b 为前缀，零分配。
+func hasBytePrefix(s string, b []byte) bool {
+	if len(s) < len(b) {
+		return false
+	}
+	for i := range b {
+		if s[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// replaceSnapshot 应用全文快照替换。check 为 true（流式转发）时校验已转发
+// 内容仍是新快照的前缀，否则报 invalid_snapshot；聚合路径不校验。
+func replaceSnapshot(content *textBuffer, t string, upErr *error, check bool) {
+	if check && *upErr == nil && !hasBytePrefix(t, content.buf) {
+		*upErr = &UpstreamError{Code: "invalid_snapshot", Msg: "upstream replaced already streamed content"}
+	}
+	content.Reset()
+	content.WriteString(t)
+}
+
 // applyEvent 把单事件应用到聚合状态。
-func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, event, data string) {
+func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event, data string, checkSnapshot bool) {
 	event = strings.ToLower(strings.TrimSpace(event))
 	var payload map[string]any
 	if strings.TrimSpace(data) != "" {
@@ -280,8 +313,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 				return
 			}
 			// 实测：text 为全文快照（非增量）→ 替换
-			content.Reset()
-			content.WriteString(t)
+			replaceSnapshot(content, t, upErr, checkSnapshot)
 			return
 		}
 		// 终态 output 数组：[{type:"output_text",text}]
@@ -295,8 +327,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 				}
 			}
 			if sb.Len() > 0 {
-				content.Reset()
-				content.WriteString(sb.String())
+				replaceSnapshot(content, sb.String(), upErr, checkSnapshot)
 			}
 			return
 		}
@@ -325,8 +356,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 				*finish = "stop"
 				return
 			}
-			content.Reset()
-			content.WriteString(t)
+			replaceSnapshot(content, t, upErr, checkSnapshot)
 			return
 		}
 		tryFillStructuredAnswer(content, payload)
@@ -349,7 +379,7 @@ func applyEvent(content, reason *strings.Builder, finish *string, upErr *error, 
 
 // tryFillStructuredAnswer 尝试填充 structured QA（{question,options,answer} 对象）。
 // 仅 content 为空时生效（避免把整段 JSON 当回复）；答案优先，直接取 answer。
-func tryFillStructuredAnswer(content *strings.Builder, obj map[string]any) {
+func tryFillStructuredAnswer(content *textBuffer, obj map[string]any) {
 	if content.Len() > 0 || !isValidStructuredQA(obj) {
 		return
 	}
@@ -414,8 +444,8 @@ func firstNonEmpty(values ...string) string {
 func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
-		content     strings.Builder
-		reason      strings.Builder
+		content     textBuffer
+		reason      textBuffer
 		finish      = "stop"
 		upErr       error
 		calls       = make(toolCallAccumulator)
@@ -440,7 +470,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 				delta, _ := deltaFromChunk(payload)
 				applyToolCallDeltas(delta, calls)
 			}
-			applyEvent(&content, &reason, &finish, &upErr, ev, data)
+			applyEvent(&content, &reason, &finish, &upErr, ev, data, false)
 		}
 		if err == io.EOF {
 			break
@@ -508,8 +538,8 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	sawDone := false
 	var (
-		content     strings.Builder
-		reason      strings.Builder
+		content     textBuffer
+		reason      textBuffer
 		finish      = "stop"
 		streamErr   error
 		calls       = make(toolCallAccumulator)
@@ -608,12 +638,8 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			nativeDelta, nativeFinish := deltaFromChunk(payload)
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
-			beforeContent, beforeReason := content.String(), reason.Len()
-			applyEvent(&content, &reason, &finish, &upErr, ev, data)
-			currentContent := content.String()
-			if upErr == nil && currentContent != beforeContent && !strings.HasPrefix(currentContent, beforeContent) {
-				upErr = &UpstreamError{Code: "invalid_snapshot", Msg: "upstream replaced already streamed content"}
-			}
+			beforeLen, beforeReasonLen := content.Len(), reason.Len()
+			applyEvent(&content, &reason, &finish, &upErr, ev, data, true)
 			if upErr != nil {
 				if werr := writeErr(upErr.Error()); werr != nil {
 					streamErr = werr
@@ -631,11 +657,11 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			if role, ok := nativeDelta["role"].(string); ok && role != "" {
 				delta["role"] = role
 			}
-			if currentContent != beforeContent {
-				delta["content"] = currentContent[len(beforeContent):]
+			if content.Len() > beforeLen {
+				delta["content"] = content.tail(beforeLen)
 			}
-			if reason.Len() > beforeReason {
-				delta["reasoning_content"] = reason.String()[beforeReason:]
+			if reason.Len() > beforeReasonLen {
+				delta["reasoning_content"] = reason.tail(beforeReasonLen)
 			}
 			if toolCalls, ok := nativeDelta["tool_calls"]; ok {
 				delta["tool_calls"] = toolCalls

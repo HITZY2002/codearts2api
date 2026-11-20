@@ -239,17 +239,25 @@ func (h *Handler) adminSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) applySettings(settings Settings) {
+	h.cfgMu.Lock()
 	h.cfg.DefaultModel = settings.DefaultModel
 	h.cfg.QueueRetryDelay = time.Duration(settings.QueueRetrySeconds) * time.Second
 	h.cfg.QueueMaxAttempts = settings.QueueMaxAttempts
 	if h.cfg.WatchInfo != nil {
-		h.cfg.WatchInfo["enabled"] = settings.WatchEnabled
-		h.cfg.WatchInfo["credits_auto_claim"] = settings.CreditsAutoClaim
-		h.cfg.WatchInfo["poll_minutes"] = settings.PollMinutes
-		h.cfg.WatchInfo["refresh_skew_minutes"] = settings.RefreshSkewMinutes
-		h.cfg.WatchInfo["keepalive_interval"] = settings.KeepaliveIntervalMinutes
-		h.cfg.WatchInfo["max_concurrent"] = settings.MaxConcurrent
+		// 复制后整体替换：已发出去的快照（adminOverview）不受后续修改影响。
+		watch := make(map[string]any, len(h.cfg.WatchInfo)+6)
+		for k, v := range h.cfg.WatchInfo {
+			watch[k] = v
+		}
+		watch["enabled"] = settings.WatchEnabled
+		watch["credits_auto_claim"] = settings.CreditsAutoClaim
+		watch["poll_minutes"] = settings.PollMinutes
+		watch["refresh_skew_minutes"] = settings.RefreshSkewMinutes
+		watch["keepalive_interval"] = settings.KeepaliveIntervalMinutes
+		watch["max_concurrent"] = settings.MaxConcurrent
+		h.cfg.WatchInfo = watch
 	}
+	h.cfgMu.Unlock()
 	if h.cfg.Upstream != nil {
 		h.cfg.Upstream.SetBenefitAutoClaim(settings.BenefitAutoClaim)
 	}

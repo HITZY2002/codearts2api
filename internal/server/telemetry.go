@@ -18,6 +18,8 @@ type requestRecorder struct {
 	started      time.Time
 	record       telemetry.RequestLog
 	finishReason string
+	// responseDone 冻结「响应写完」的时刻：响应后的积分补查不计入请求耗时。
+	responseDone time.Time
 }
 
 type requestRecorderKey struct{}
@@ -151,12 +153,23 @@ func requestRecorderFromContext(ctx context.Context) *requestRecorder {
 func (rec *requestRecorder) finish(store *telemetry.Store) {
 	rec.record.StatusCode = rec.writer.status
 	rec.record.FinishReason = rec.finishReason
-	rec.record.TotalMs = time.Since(rec.started).Milliseconds()
+	done := rec.responseDone
+	if done.IsZero() {
+		done = time.Now()
+	}
+	rec.record.TotalMs = done.Sub(rec.started).Milliseconds()
 	if rec.record.ErrorType == "" && rec.record.StatusCode >= 400 {
 		rec.record.ErrorType = "http_error"
 	}
 	if store != nil {
 		_ = store.RecordRequest(rec.record)
+	}
+}
+
+// markResponseDone 在响应体完整写出后调用，冻结耗时统计。
+func (rec *requestRecorder) markResponseDone() {
+	if rec != nil && rec.responseDone.IsZero() {
+		rec.responseDone = time.Now()
 	}
 }
 
