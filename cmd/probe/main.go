@@ -42,10 +42,10 @@ func main() {
 	switch mode {
 	case "raw-role":
 		body := map[string]any{
-		"model":          model,
-		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
-		"messages":       []any{map[string]any{"role": "user", "content": msg}},
+			"model":          model,
+			"stream":         true,
+			"stream_options": map[string]any{"include_usage": true},
+			"messages":       []any{map[string]any{"role": "user", "content": msg}},
 		}
 		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	case "raw-text":

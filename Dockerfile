@@ -19,7 +19,7 @@ RUN go build -o /out/codearts2api ./cmd/server && \
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -S app && adduser -S -G app app && \
+    addgroup -S -g 10001 app && adduser -S -u 10001 -G app app && \
     mkdir -p /app/auths /app/data && chown -R app:app /app
 WORKDIR /app
 COPY --from=build /out/ /usr/local/bin/

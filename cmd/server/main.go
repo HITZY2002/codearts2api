@@ -169,6 +169,7 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	h.FlushConversationState()
 	log.Printf("bye")
 }
 

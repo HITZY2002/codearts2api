@@ -36,7 +36,7 @@ func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"accounts": h.cfg.Pool.List(),
 		"models":   ids,
 		"schedule": map[string]any{
-			"watch": h.cfg.WatchInfo,
+			"watch": h.watchInfoSnapshot(),
 		},
 	})
 }

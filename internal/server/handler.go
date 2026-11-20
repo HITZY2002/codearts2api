@@ -130,11 +130,37 @@ type Handler struct {
 	mux   *http.ServeMux
 	oauth *oauthStore
 
+	// cfgMu 保护设置页热更新的 cfg 可变字段（DefaultModel、QueueRetryDelay、
+	// QueueMaxAttempts、WatchInfo）。请求路径只读，applySettings 写入。
+	cfgMu sync.RWMutex
+
 	convMu sync.Mutex
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
 	convAcct map[string]conversationBinding
 	// 上游消息 ID 按账号 + 用户轮次复用；跨账号不复用，避免积分归属错误。
 	turnIDs map[string]turnIDBinding
+	// 会话状态延迟合并写盘：热路径只改内存，200ms 后由一次性定时器落盘。
+	convDirty        bool
+	convFlushPending bool
+	convFileMu       sync.Mutex
+}
+
+// runtimeTuning 读取可热更新的请求参数快照。
+func (h *Handler) runtimeTuning() (defaultModel string, queueDelay time.Duration, queueAttempts int) {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg.DefaultModel, h.cfg.QueueRetryDelay, h.cfg.QueueMaxAttempts
+}
+
+// watchInfoSnapshot 返回 WatchInfo 的副本，避免与 applySettings 并发读写同一 map。
+func (h *Handler) watchInfoSnapshot() map[string]any {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	out := make(map[string]any, len(h.cfg.WatchInfo))
+	for k, v := range h.cfg.WatchInfo {
+		out[k] = v
+	}
+	return out
 }
 
 // NewHandler 构建 handler。
@@ -744,7 +770,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	req.ConversationID = conversationIDFor(req, affinity)
 
 	toolsOn := toolsActive(req)
-	model := h.cfg.DefaultModel
+	defaultModel, queueRetryDelay, queueMaxAttempts := h.runtimeTuning()
+	model := defaultModel
 	if req.Model != "" && req.Model != "auto" {
 		model = req.Model
 	}
@@ -880,7 +907,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
-		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
+		for retry := 0; retry < queueMaxAttempts; retry++ {
 			if rec != nil {
 				rec.record.Attempts++
 			}
@@ -909,11 +936,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
-				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
+				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, queueMaxAttempts, acct.Name, queueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
 				releaseLock()
 				select {
-				case <-time.After(h.cfg.QueueRetryDelay):
+				case <-time.After(queueRetryDelay):
 				case <-r.Context().Done():
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
@@ -1018,7 +1045,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			releaseLock()
 			if werr == nil && streamedComp != nil {
-				if streamedComp.CreditUsage == nil {
+				rec.markResponseDone()
+				// 对齐官方：整轮结束才查积分（见下方非流式注释）。
+				if streamedComp.CreditUsage == nil && streamedComp.Finish != "tool_calls" {
 					streamedComp.CreditUsage = fetchCreditUsage()
 				}
 				applyCompletionMetrics(rec, msgs, streamedComp)
@@ -1030,10 +1059,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		releaseLock()
 
 		content, finish := comp.Content, comp.Finish
-		if comp.CreditUsage == nil {
-			comp.CreditUsage = fetchCreditUsage()
-		}
-		applyCompletionMetrics(rec, msgs, comp)
 		calls := fromUpstreamToolCalls(comp.ToolCalls)
 		// 原生 tool_calls 是 GLM-5.2 的主路径。仅保留文本协议解析作为
 		// 旧模型/异常输出的兼容兜底，并同时检查 reasoning_content，
@@ -1053,6 +1078,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
 		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
+		// 积分只进观测记录，不进响应体（usageEstimate 不读 CreditUsage）。
+		// 响应写完后再补查，避免阻塞客户端。
+		//
+		// 查询时机对齐官方桌面客户端：renderer 在 session 进入终态
+		// （COMPLETED/CANCELED/FAILED → recordTurnStats）时按 user-msg-id
+		// 查一次 /v1/ops/credit/usage?type=msg，而不是每次上游推理都查。
+		// 网关侧一轮 = 共享同一 msg_id 的若干请求；finish_reason=tool_calls
+		// 说明本轮还有工具续请求，跳过查询，等最终 stop 的那次请求查整轮汇总
+		// （上游按 msg_id 聚合计费，request_count 累计）。
+		rec.markResponseDone()
+		if comp.CreditUsage == nil && finish != "tool_calls" {
+			comp.CreditUsage = fetchCreditUsage()
+		}
+		applyCompletionMetrics(rec, msgs, comp)
 		return
 	}
 	if lastErr == nil && modelAccessErr != nil {
@@ -1415,11 +1454,8 @@ func (h *Handler) storeConversation(id, account string) {
 	now := time.Now()
 	h.pruneConversationsLocked(now)
 	h.convAcct[id] = conversationBinding{Account: account, UpdatedAt: now}
-	err := h.saveConversationsLocked()
+	h.markConvDirtyLocked()
 	h.convMu.Unlock()
-	if err != nil {
-		log.Printf("save conversation state: %v", err)
-	}
 }
 
 // upstreamSessionID 派生官方 x-ot-session-id：同一账号+同一会话稳定不变，
@@ -1448,11 +1484,8 @@ func (h *Handler) upstreamMsgIDFor(accountUID, turnKey string) string {
 	}
 	id := upstream.NewUpstreamMsgID(now)
 	h.turnIDs[key] = turnIDBinding{ID: id, UpdatedAt: now}
-	err := h.saveConversationsLocked()
+	h.markConvDirtyLocked()
 	h.convMu.Unlock()
-	if err != nil {
-		log.Printf("save turn id state: %v", err)
-	}
 	return id
 }
 
@@ -1489,18 +1522,47 @@ func (h *Handler) pruneConversationsLocked(now time.Time) {
 	}
 }
 
-// saveConversationsLocked serializes and writes while convMu is held, keeping
-// both the map snapshot and the shared temporary file exclusive to one writer.
-func (h *Handler) saveConversationsLocked() error {
+// markConvDirtyLocked 标记状态待落盘并调度一次合并写。convMu 已持有。
+// 请求路径不再同步写盘：一次磁盘故障/慢盘不会拖住聊天请求。
+func (h *Handler) markConvDirtyLocked() {
+	h.convDirty = true
 	if h.cfg.ConvStateFile == "" {
-		return nil
+		return
 	}
+	if !h.convFlushPending {
+		h.convFlushPending = true
+		time.AfterFunc(200*time.Millisecond, h.flushConversations)
+	}
+}
+
+// flushConversations 把内存状态快照落盘。convFileMu 保证临时文件单写者；
+// 快照在 convMu 内序列化，写盘在锁外，不阻塞请求路径。
+func (h *Handler) flushConversations() {
+	h.convFileMu.Lock()
+	defer h.convFileMu.Unlock()
+	h.convMu.Lock()
+	h.convFlushPending = false
+	if !h.convDirty || h.cfg.ConvStateFile == "" {
+		h.convMu.Unlock()
+		return
+	}
+	h.convDirty = false
 	raw, err := json.MarshalIndent(conversationState{Conversations: h.convAcct, Turns: h.turnIDs}, "", "  ")
+	h.convMu.Unlock()
 	if err != nil {
-		return err
+		log.Printf("encode conversation state: %v", err)
+		return
 	}
 	if err := os.WriteFile(h.cfg.ConvStateFile+".tmp", raw, 0o600); err != nil {
-		return err
+		log.Printf("save conversation state: %v", err)
+		return
 	}
-	return os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
+	if err := os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile); err != nil {
+		log.Printf("replace conversation state: %v", err)
+	}
+}
+
+// FlushConversationState 立即落盘未保存的会话状态（进程退出前调用）。
+func (h *Handler) FlushConversationState() {
+	h.flushConversations()
 }

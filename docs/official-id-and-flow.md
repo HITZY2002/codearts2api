@@ -27,6 +27,16 @@ agent-kernel.exe
   `GET {snapEngine}/v1/ops/credit/usage?type=msg&id={userMessageId}`，
   进行中会话取 assistant 消息的 `parentID`，历史会话取配对 user 消息 ID；
   另有 `type=session` 按会话查询。AK/SK 签名，`Agent-Type: PromptCenter`。
+- **积分查询时机（renderer 源码确认，`out/renderer/assets/index-*.js`）**：
+  `recordTurnStats(sessionId, finalStatus)` 只在 session 进入终态
+  （`COMPLETED`/`CANCELED`/`FAILED`，由 `session.status`/`session.idle` 事件触发）
+  时执行，对最后一条 assistant 消息调一次 `fetchCreditUsage`——即**整轮
+  Agent 循环（含全部工具续请求）结束后查一次**，不是每次上游推理都查。
+  仅积分计费用户（`isCreditPackage`）触发；历史会话加载时
+  `fetchHistoryCreditUsage` 按每轮配对的 user 消息 ID 批量补查。
+  上游按 `msg_id` 聚合计费（`requestCount` 累计），所以轮末一次查询即整轮总消耗。
+  网关对齐：`finish_reason=tool_calls` 的请求跳过查询，最终 `stop` 的请求
+  用该轮复用的 `msg_id` 查一次（`internal/server/handler.go`，响应写出后执行）。
 - 官方实际记录可见同一 `msg_…` 出现在相隔十几分钟的两次请求中（同一轮的重试/续跑），
   证实 ID 绑定“用户消息/轮次”，与时间无关。
 

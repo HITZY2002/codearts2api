@@ -29,6 +29,8 @@ func TestConversationStateConcurrentSaveAndReload(t *testing.T) {
 	}
 	wg.Wait()
 
+	// 落盘是延迟合并的：显式 flush 模拟进程退出前的 FlushConversationState。
+	h.FlushConversationState()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -47,6 +49,27 @@ func TestConversationStateConcurrentSaveAndReload(t *testing.T) {
 		if got := reloaded.convAcct[id].Account; got != fmt.Sprintf("account-%d", i) {
 			t.Fatalf("reloaded conversation %s account=%q", id, got)
 		}
+	}
+}
+
+func TestConversationStatePersistsWithoutExplicitFlush(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	h := NewHandler(Config{ConvStateFile: path})
+	id := fmt.Sprintf("%032x", 42)
+	h.storeConversation(id, "account-async")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var state conversationState
+			if json.Unmarshal(raw, &state) == nil && state.Conversations[id].Account == "account-async" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("conversation state was not persisted by the background flush")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

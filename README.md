@@ -185,6 +185,30 @@ docker compose up -d --build
 | `CA2A_OBSERVABILITY_MAX_DB_BYTES` | 观测数据库体积上限 | `134217728` |
 | `CA2A_OBSERVABILITY_SNAPSHOT_INTERVAL_SECONDS` | 账号快照间隔 | `60` |
 
+### WebUI 设置页与 settings.json 优先级
+
+WebUI 设置页可热更新：默认模型、单账号并发、排队重试、watchdog 开关与周期、
+保活参数、福利/签到自动领取。保存后立即生效（调度器周期随之重建），并持久化到
+`data/settings.json`（跟随 `state_file` 所在目录）。
+
+**启动时的配置优先级：`settings.json` > 环境变量 > `config.json`。**
+只要 `settings.json` 存在，其中保存的整套设置会覆盖 config/env 的对应项——
+改 config.json 或环境变量却不生效时，先检查或删除 `data/settings.json`。
+API Key、监听地址、凭证目录、观测存储等不在设置页范围内的项仍只由 config/env 决定。
+
+### Docker 挂载目录权限
+
+容器以非 root 用户 `app`（uid/gid 固定 `10001`）运行。使用 bind mount
+（`./auths`、`./data`）时，宿主机目录必须归属该 uid，否则账号凭证与
+settings/观测数据库无法写入：
+
+```bash
+mkdir -p auths data
+sudo chown -R 10001:10001 auths data
+```
+
+匿名 volume 不受影响（镜像内已 chown）。
+
 ## 目录结构
 
 ```
