@@ -54,6 +54,10 @@ type Config struct {
 	BenefitAutoClaim bool `json:"benefit_auto_claim"`
 	// CreditsAutoClaim 每次 watchdog 轮询领取每日签到和新手活动积分（默认 true）。
 	CreditsAutoClaim bool `json:"credits_auto_claim"`
+	// HistoryFile 调用历史 JSONL 路径，留空用 <state_file>.history.jsonl。
+	HistoryFile string `json:"history_file"`
+	// HistoryLimit 内存中保留的调用历史条数（默认 500）。
+	HistoryLimit int `json:"history_limit"`
 
 	Upstream struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -83,6 +87,7 @@ func Default() *Config {
 	c.Upstream.TimeoutSeconds = 120
 	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
 	c.CreditsAutoClaim = true
+	c.HistoryLimit = 500
 	return c
 }
 

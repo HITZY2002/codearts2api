@@ -39,6 +39,16 @@ type Account struct {
 	refreshMu         sync.Mutex
 	checkinMu         sync.Mutex
 	checkin           *CheckinStatus
+	credits           float64   // 该账号累计领取到的积分（上游活动返回值，非估算）
+	creditsDay        string    // 已计入积分合计的自然日，避免同一天重复累加
+	// 以下计数全部来自上游 usage，不做本地估算。
+	tokPrompt     int64 // prompt_tokens 累计
+	tokCompletion int64 // completion_tokens 累计
+	tokCached     int64 // cached_tokens 累计
+	calls         int64 // 成功调用次数
+	// creditsStat 是上游 statistics/plugin 的积分快照（剩余余额的真实来源）。
+	creditsStat   *upstream.CreditStat
+	creditsErr    string
 	lastValidated     time.Time
 	errCount          int
 	coolUntil         time.Time
@@ -191,7 +201,18 @@ func (p *Pool) List() []map[string]any {
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
-			"credits":           int64(0), // 保留旧字段；未查询真实余额
+			"credits":           a.credits, // 累计领取积分（上游活动值）
+			"credits_total":     creditTotal(a.creditsStat, a.credits),
+			"credits_used":      creditUsed(a.creditsStat),
+			"credits_remain":    creditRemain(a.creditsStat, a.credits),
+			"credits_expiring":  creditExpiring(a.creditsStat),
+			"credits_breakdown": creditBreakdown(a.creditsStat),
+			"credits_fetched_at": creditFetchedAt(a.creditsStat),
+			"credits_err":       a.creditsErr,
+			"tokens_prompt":     a.tokPrompt,
+			"tokens_completion": a.tokCompletion,
+			"tokens_cached":     a.tokCached,
+			"calls":             a.calls,
 			"checkin":           a.checkin,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
@@ -210,11 +231,155 @@ func (p *Pool) List() []map[string]any {
 	return out
 }
 
+// HasUntriedHealthy 报告除 tried 里已用过的账号外，是否还有健康账号可供换号。
+// 用于上游排队上限时的判断：有别的号就立刻换，没有才原地等（单账号池）。
+func (p *Pool) HasUntriedHealthy(tried map[string]bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for _, a := range p.accounts {
+		a.mu.Lock()
+		ok := !a.disabled && now.After(a.coolUntil) && !tried[a.Name] && !tried[a.UID]
+		a.mu.Unlock()
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// CreditTTL 控制积分快照的缓存时长：面板刷新走缓存，避免每次开页都打上游。
+const CreditTTL = 45 * time.Second
+
+// RefreshCredits 拉取单个账号的积分余额（上游 statistics/plugin）。
+func (p *Pool) RefreshCredits(ctx context.Context, name string) *upstream.CreditStat {
+	a := p.Get(name)
+	if a == nil || a.Client == nil || a.Auth == nil {
+		return nil
+	}
+	token, ak, sk := a.Auth.Credentials()
+	st, _, err := a.Client.CreditStatistics(ctx, upstream.SignCredential{
+		SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
+	})
+	a.mu.Lock()
+	if err != nil {
+		a.creditsErr = truncateErr(err)
+		prev := a.creditsStat
+		a.mu.Unlock()
+		return prev
+	}
+	a.creditsErr = ""
+	a.creditsStat = st
+	a.mu.Unlock()
+	// saveState 会重新锁每个账号，必须在释放 a.mu 之后调用，否则自锁死。
+	p.saveState()
+	return st
+}
+
+// RefreshCreditsStale 并发刷新所有过期快照（TTL 内直接复用）。
+func (p *Pool) RefreshCreditsStale(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, a := range p.Accounts() {
+		a.mu.Lock()
+		fresh := a.creditsStat != nil && time.Since(time.Unix(a.creditsStat.FetchedAt, 0)) < CreditTTL
+		enabled := !a.disabled
+		a.mu.Unlock()
+		if fresh || !enabled {
+			continue
+		}
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			p.RefreshCredits(c, name)
+		}(a.Name)
+	}
+	wg.Wait()
+}
+
+func creditTotal(st *upstream.CreditStat, fallback float64) float64 {
+	if st != nil && st.Total > 0 {
+		return st.Total
+	}
+	return fallback
+}
+
+func creditUsed(st *upstream.CreditStat) float64 {
+	if st != nil {
+		return st.Used
+	}
+	return 0
+}
+
+func creditRemain(st *upstream.CreditStat, fallback float64) float64 {
+	if st != nil && st.Total > 0 {
+		return st.Remain
+	}
+	return fallback
+}
+
+func creditExpiring(st *upstream.CreditStat) float64 {
+	if st != nil {
+		return st.Expiring
+	}
+	return 0
+}
+
+func creditFetchedAt(st *upstream.CreditStat) int64 {
+	if st != nil {
+		return st.FetchedAt
+	}
+	return 0
+}
+
+func creditBreakdown(st *upstream.CreditStat) map[string]any {
+	if st == nil {
+		return nil
+	}
+	return map[string]any{
+		"basic":     map[string]any{"total": st.Basic.Total, "used": st.Basic.Used, "remain": st.Basic.Remain},
+		"bonus":     map[string]any{"total": st.Bonus.Total, "used": st.Bonus.Used, "remain": st.Bonus.Remain},
+		"on_demand": map[string]any{"total": st.OnDemand.Total, "used": st.OnDemand.Used, "remain": st.OnDemand.Remain},
+		"expires_at": st.ExpiresAt,
+	}
+}
+
+func truncateErr(err error) string {
+	msg := err.Error()
+	if len(msg) > 160 {
+		return msg[:160]
+	}
+	return msg
+}
+
+// AddUsage 累加一次调用的真实 token 用量（来源：上游响应 usage，不估算）。
+func (p *Pool) AddUsage(name string, prompt, completion, cached int) {
+	if prompt <= 0 && completion <= 0 && cached <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range p.accounts {
+		if a.Name == name || a.UID == name {
+			a.mu.Lock()
+			a.tokPrompt += int64(prompt)
+			a.tokCompletion += int64(completion)
+			a.tokCached += int64(cached)
+			a.calls++
+			a.mu.Unlock()
+			p.saveState()
+			return
+		}
+	}
+}
+
 // Stats 汇总。
 func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	var creditsSum float64
 	for _, a := range p.accounts {
 		total++
 		a.mu.Lock()
@@ -225,9 +390,10 @@ func (p *Pool) Stats() (total, healthy, disabled, cooling int, credits int64) {
 		} else {
 			healthy++
 		}
+		creditsSum += a.credits
 		a.mu.Unlock()
 	}
-	credits = int64(healthy) // 面板「积分合计」位复用为健康数
+	credits = int64(creditsSum)
 	return
 }
 
@@ -917,6 +1083,12 @@ func (p *Pool) loadState() {
 		Disabled  bool      `json:"disabled"`
 		Reason    string    `json:"reason"`
 		LastErr   string    `json:"last_error"`
+		Credits   float64   `json:"credits"`
+		CreditsDay string   `json:"credits_day"`
+		TokPrompt     int64 `json:"tokens_prompt"`
+		TokCompletion int64 `json:"tokens_completion"`
+		TokCached     int64 `json:"tokens_cached"`
+		Calls         int64 `json:"calls"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
 		return
@@ -930,6 +1102,12 @@ func (p *Pool) loadState() {
 				a.disabled = s.Disabled
 				a.disabledReason = s.Reason
 				a.lastErr = s.LastErr
+				a.credits = s.Credits
+				a.creditsDay = s.CreditsDay
+				a.tokPrompt = s.TokPrompt
+				a.tokCompletion = s.TokCompletion
+				a.tokCached = s.TokCached
+				a.calls = s.Calls
 				a.mu.Unlock()
 			}
 		}
@@ -947,6 +1125,12 @@ func (p *Pool) saveState() {
 		Disabled  bool      `json:"disabled"`
 		Reason    string    `json:"reason"`
 		LastErr   string    `json:"last_error"`
+		Credits   float64   `json:"credits"`
+		CreditsDay string   `json:"credits_day"`
+		TokPrompt     int64 `json:"tokens_prompt"`
+		TokCompletion int64 `json:"tokens_completion"`
+		TokCached     int64 `json:"tokens_cached"`
+		Calls         int64 `json:"calls"`
 	}
 	out := make([]entry, 0, len(p.accounts))
 	for _, a := range p.accounts {
@@ -958,6 +1142,12 @@ func (p *Pool) saveState() {
 			Disabled:  a.disabled,
 			Reason:    a.disabledReason,
 			LastErr:   a.lastErr,
+			Credits:   a.credits,
+			CreditsDay: a.creditsDay,
+			TokPrompt: a.tokPrompt,
+			TokCompletion: a.tokCompletion,
+			TokCached: a.tokCached,
+			Calls: a.calls,
 		})
 		a.mu.Unlock()
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,9 @@ import (
 
 // adminOverview 面板总览。
 func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
+	// 顺带刷新过期（>45s）的积分快照：面板一开就能看到上游真实余额。
+	h.cfg.Pool.RefreshCreditsStale(r.Context())
+
 	total, healthy, disabled, cooling, credits := h.cfg.Pool.Stats()
 	models := h.modelList()
 	ids := make([]map[string]any, 0, len(models))
@@ -39,9 +43,11 @@ func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 type uidBody struct {
-	UID     string `json:"uid"`
-	Account string `json:"account"`
-	Reason  string `json:"reason"`
+	UID       string  `json:"uid"`
+	Account   string  `json:"account"`
+	Reason    string  `json:"reason"`
+	Credits   float64 `json:"credits"`
+	ResetUsed bool    `json:"reset_used"`
 }
 
 func readUIDBody(r *http.Request) (uidBody, error) {
@@ -291,4 +297,47 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// adminHistory 调用历史（最新在前）+ 最近若干条的聚合指标。
+func (h *Handler) adminHistory(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	if h.hist == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"records": []CallRecord{}, "summary": map[string]any{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"records": h.hist.List(limit),
+		"summary": h.hist.Summary(limit),
+	})
+}
+
+// adminCreditBalances 查询账号积分余额（真实上游数据）。?uid= 只刷一个，?refresh=1 强制刷新。
+func (h *Handler) adminCreditBalances(w http.ResponseWriter, r *http.Request) {
+	uid := r.URL.Query().Get("uid")
+	force := r.URL.Query().Get("refresh") == "1"
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	if uid != "" {
+		if force {
+			h.cfg.Pool.RefreshCredits(ctx, uid)
+		}
+		for _, a := range h.cfg.Pool.List() {
+			if a["uid"] == uid || a["name"] == uid {
+				writeJSON(w, http.StatusOK, map[string]any{"account": a})
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+		return
+	}
+	if force {
+		h.cfg.Pool.RefreshCreditsStale(ctx)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": h.cfg.Pool.List()})
 }

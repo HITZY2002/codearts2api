@@ -47,6 +47,9 @@ type Config struct {
 	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
 	OAuthCallbackHost string
+	// HistoryFile 调用历史 JSONL 路径；HistoryLimit 内存保留条数。
+	HistoryFile  string
+	HistoryLimit int
 }
 
 var dynamicModelsCache struct {
@@ -101,6 +104,8 @@ type Handler struct {
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
+
+	hist *History // 调用历史（模型/首字/命中率/扣减积分）
 }
 
 // pendingLogin WebUI 登录中间状态。
@@ -151,6 +156,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
 		convAcct: map[string]string{},
+		hist:     NewHistory(cfg.HistoryFile, cfg.HistoryLimit),
 	}
 	h.loadChats()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -163,7 +169,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /panel", h.servePanel)
 	h.mux.HandleFunc("GET /panel/", h.servePanel)
 	h.mux.HandleFunc("GET /admin/api/overview", h.withAuth(h.adminOverview))
+	h.mux.HandleFunc("GET /admin/api/history", h.withAuth(h.adminHistory))
 	h.mux.HandleFunc("POST /admin/api/credits", h.withAuth(h.adminCredits))
+	h.mux.HandleFunc("GET /admin/api/credits/balance", h.withAuth(h.adminCreditBalances))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
 	h.mux.HandleFunc("POST /admin/api/keepalive", h.withAuth(h.adminKeepalive))
 	h.mux.HandleFunc("POST /admin/api/reload", h.withAuth(h.adminReload))
@@ -656,6 +664,22 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	callStart := time.Now()
+	tw := &telemetryWriter{ResponseWriter: w}
+	w = tw
+	var (
+		callModel  string
+		callAcct   string
+		callUsage  map[string]any
+		callStream bool
+	)
+	defer func() {
+		if callModel == "" {
+			return
+		}
+		h.recordCall(callModel, callAcct, callStream, tw, callStart, callUsage)
+	}()
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -693,6 +717,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
 	// 为整条 Agent 工具链固定 CodeArts 内置 chat_id 与账号亲和。V2 接口
 	// 不保留语义上下文，所以每轮仍重放完整 OpenAI 历史。
+	callModel, callStream = model, req.Stream
 	explicitChat := validChatID(req.ConversationID)
 	stickyAcct := ""
 	if explicitChat {
@@ -792,8 +817,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var serr error
 		authRetried := false
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
+		callAcct = acct.Name
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
+		queueRotated := false
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
 			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
 			if serr == nil {
@@ -816,8 +843,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
+				// 上游该账号排队已满（TPM/并发会话）：池里还有没试过的健康账号就立刻换号，
+				// 换不了（单账号池 / 其他号也满了）才原地等待重试。
+				if h.cfg.Pool.HasUntriedHealthy(tried) {
+					log.Printf("upstream queue limit account=%s, rotating to next account", acct.Name)
+					tried[acct.Name] = true
+					stickyAcct = ""
+					lastErr = serr
+					h.cfg.Pool.ReleaseLock(acct.Name)
+					queueRotated = true
+					break
+				}
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
-				// 释放锁让其他请求有机会，等待后重新获取
 				h.cfg.Pool.ReleaseLock(acct.Name)
 				select {
 				case <-time.After(h.cfg.QueueRetryDelay):
@@ -832,6 +869,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			break // 非并发错误，跳出重试
+		}
+		if queueRotated {
+			// 排队已满导致的换号：不要冷却账号，直接换下一个。
+			lastErr = serr
+			continue
 		}
 		var comp *upstream.RawCompletion
 		readCompletion := serr == nil && !req.Stream
@@ -891,6 +933,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
 			}
 			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
+				if comp.Usage != nil {
+					callUsage = comp.Usage
+				} else {
+					callUsage = usageEstimate(msgs, comp)
+				}
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
@@ -933,6 +980,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		storeChat()
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
+		if comp.Usage != nil {
+			callUsage = comp.Usage
+		} else {
+			callUsage = usageEstimate(msgs, comp)
+		}
 		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
 		return
 	}

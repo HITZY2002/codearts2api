@@ -49,8 +49,9 @@ input{font:inherit}
 .btn.ghost{background:transparent;box-shadow:none}
 .btn.danger{border-color:color-mix(in srgb,var(--bad) 45%,var(--line));color:#b91c1c}
 .btn.danger:hover{background:color-mix(in srgb,var(--bad) 8%,#fff);border-color:var(--bad)}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
-@media (max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
+.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:18px}
+@media (max-width:1200px){.grid{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:520px){.grid{grid-template-columns:1fr}}
 .stat{position:relative;overflow:hidden;background:var(--card);border:1px solid rgba(255,255,255,.8);border-radius:var(--radius);padding:15px 16px 13px;box-shadow:var(--shadow);backdrop-filter:blur(var(--blur));-webkit-backdrop-filter:blur(var(--blur))}
 .stat::before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:linear-gradient(180deg,var(--accent),transparent);border-radius:4px}
@@ -154,7 +155,9 @@ input{font:inherit}
     <div class="stat"><div class="k">账号总数</div><div class="v" id="sTotal">—</div></div>
     <div class="stat"><div class="k">健康可用</div><div class="v" id="sHealthy">—</div></div>
     <div class="stat"><div class="k">冷却 / 禁用</div><div class="v" id="sBad">—</div></div>
-    <div class="stat"><div class="k">自动签到 / 新手领取</div><div class="v" id="sCredits">—</div></div>
+    <div class="stat"><div class="k">剩余积分</div><div class="v" id="sCreditsRemain" style="color:#0b7a41">—</div><div class="sub" id="sCreditsSub">—</div></div>
+    <div class="stat"><div class="k">已用积分</div><div class="v" id="sCreditsUsed">—</div></div>
+    <div class="stat"><div class="k">累计 token</div><div class="v" id="sTokens">—</div></div>
   </div>
 
   <div class="card">
@@ -170,13 +173,17 @@ input{font:inherit}
         <thead>
           <tr>
             <th>账号</th>
+            <th>剩余积分</th>
+            <th>已用 / 总量</th>
+            <th>调用</th>
+            <th>token 用量</th>
             <th>签到 / 新手福利</th>
             <th>状态</th>
             <th>原因 / 冷却至</th>
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="acctBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        <tbody id="acctBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -184,6 +191,27 @@ input{font:inherit}
   <div class="card">
     <div class="card-h"><h2>模型</h2><span class="muted" id="modelCount"></span></div>
     <div class="card-b"><div class="chips" id="modelChips"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">
+      <h2>调用历史</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="chips" id="histSummary"></span>
+        <button class="btn" id="btnRefillCredits">刷新余额</button>
+        <button class="btn" id="btnHist">刷新</button>
+      </div>
+    </div>
+    <div class="card-b" style="padding:0;overflow-x:auto">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>时间</th><th>模型</th><th>流式</th><th>首字</th><th>总耗时</th><th>命中率</th><th>prompt / completion</th><th>账号</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="histBody"><tr><td colspan="9" class="empty">暂无调用</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card">
@@ -289,6 +317,16 @@ function fmtTime(t){
   } catch { return t; }
 }
 
+function creditColor(remain, total){ const r = Number(remain||0), t = Number(total||0); if(!t) return ""; const p = r/t; return p<0.1 ? "#b3261e" : p<0.3 ? "#8a5a06" : "#0b7a41"; }
+function breakdownText(a){ const b = a.credits_breakdown || {}; const parts = []; if(b.basic) parts.push("基础套餐 剩 "+fmtCredits(b.basic.remain)+"/"+fmtCredits(b.basic.total)); if(b.bonus) parts.push("活动赠送 剩 "+fmtCredits(b.bonus.remain)+"/"+fmtCredits(b.bonus.total)); if(b.on_demand && Number(b.on_demand.total||0)>0) parts.push("按需购买 剩 "+fmtCredits(b.on_demand.remain)+"/"+fmtCredits(b.on_demand.total)); if(b.expires_at) parts.push("有效期至 "+b.expires_at); return parts.join(" · ") || "上游未返回分池明细"; }
+function creditAge(accts){ const ts = accts.map(a=>Number(a.credits_fetched_at||0)).filter(Boolean); if(!ts.length) return ""; const d = Math.max.apply(null, ts)*1000; const s = Math.round((Date.now()-d)/1000); return s<60 ? s+" 秒前" : Math.round(s/60)+" 分钟前"; }
+function fmtInt(n){ return Number(n||0).toLocaleString('en-US'); }
+function fmtCredits(n){
+  const v = Number(n);
+  if (!isFinite(v)) return "0";
+  return v.toLocaleString("zh-CN", {maximumFractionDigits: 2});
+}
+
 function shortUID(u){
   if (!u) return "—";
   return u.length > 14 ? u.slice(0,8) + "…" + u.slice(-4) : u;
@@ -299,7 +337,17 @@ function render(data){
   $("sTotal").textContent = st.total ?? 0;
   $("sHealthy").textContent = st.healthy ?? 0;
   $("sBad").textContent = `${st.cooling??0} / ${st.disabled??0}`;
-  $("sCredits").textContent = data.schedule?.watch?.enabled && data.schedule?.watch?.credits_auto_claim ? "已开启" : "已关闭";
+  const accts = data.accounts || [];
+  const remainSum = accts.reduce((n,a)=>n+Number(a.credits_remain||0),0);
+  const usedSum = accts.reduce((n,a)=>n+Number(a.credits_used||0),0);
+  const totalSum = accts.reduce((n,a)=>n+Number(a.credits_total||0),0);
+  const tokSum = accts.reduce((n,a)=>n+Number(a.tokens_prompt||0)+Number(a.tokens_completion||0),0);
+  const callsSum = accts.reduce((n,a)=>n+Number(a.calls||0),0);
+  $("sCreditsRemain").textContent = fmtCredits(remainSum);
+  $("sCreditsSub").textContent = "总量 " + fmtCredits(totalSum) + (creditAge(accts) ? " · 更新于 " + creditAge(accts) : "");
+  $("sCreditsUsed").textContent = fmtCredits(usedSum);
+  $("sTokens").textContent = fmtInt(tokSum);
+  $("sTokens").textContent = fmtInt(tokSum) + " · " + fmtInt(callsSum) + " 次";
   $("updatedAt").textContent = "更新于 " + new Date().toLocaleTimeString();
   $("baseUrl").textContent = location.origin + BASE + "/v1";
   $("subTitle").textContent = (data.service || SERVICE) + " · " + (data.region || "cn");
@@ -307,7 +355,7 @@ function render(data){
   const body = $("acctBody");
   const accounts = data.accounts || [];
   if (!accounts.length){
-    body.innerHTML = `<tr><td colspan="5" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
   } else {
     body.innerHTML = accounts.map(a => {
       const reason = a.reason || "—";
@@ -317,12 +365,17 @@ function render(data){
           <div><strong>${escapeHtml(a.nickname || "未命名")}</strong></div>
           <div class="mono muted" title="${escapeHtml(a.uid||"")}">${escapeHtml(shortUID(a.uid))}</div>
         </td>
+        <td><strong class="mono" style="color:${creditColor(a.credits_remain, a.credits_total)}" title="${escapeAttr(breakdownText(a))}">${fmtCredits(a.credits_remain)}</strong>${a.credits_err?` <span class="badge info" title="${escapeAttr(a.credits_err)}">?</span>`:""}</td>
+        <td><span class="mono muted">${fmtCredits(a.credits_used)} / ${fmtCredits(a.credits_total)}</span></td>
+        <td><span class="mono muted">${fmtInt(a.calls||0)}</span></td>
+        <td><span class="mono muted">${fmtInt((a.tokens_prompt||0)+(a.tokens_completion||0))}${a.tokens_cached?` <em style="font-style:normal;opacity:.65">(${fmtInt(a.tokens_cached)} 命中)</em>`:""}</span></td>
         <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div></td>
         <td>${statusBadge(a)}${a.err_count?` <span class="badge info">err ${a.err_count}</span>`:""}</td>
         <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(until)}</div></td>
         <td><div class="row-actions">
           <button class="btn" data-act="credits" data-uid="${escapeAttr(a.uid)}">校验</button>
           <button class="btn" data-act="checkin" data-uid="${escapeAttr(a.uid)}">签到</button>
+
           ${a.disabled
             ? `<button class="btn" data-act="enable" data-uid="${escapeAttr(a.uid)}">启用</button>`
             : `<button class="btn danger" data-act="disable" data-uid="${escapeAttr(a.uid)}">禁用</button>`}
@@ -357,11 +410,62 @@ async function loadOverview(){
   return data;
 }
 
+
+function credColor(total, left){
+  total = Number(total||0); left = Number(left||0);
+  if (total <= 0) return "var(--muted)";
+  const p = left / total;
+  if (p <= 0.1) return "var(--bad)";
+  if (p <= 0.3) return "var(--warn)";
+  return "var(--ok)";
+}
+
+function fmtHit(prompt, cached){
+  prompt = Number(prompt||0); cached = Number(cached||0);
+  if (!prompt) return "—";
+  return (cached / prompt * 100).toFixed(1) + "%";
+}
+
+async function loadHistory(){
+  const body = $("histBody");
+  let data;
+  try {
+    data = await api("/admin/api/history?limit=50");
+  } catch(e){
+    body.innerHTML = `<tr><td colspan="9" class="empty">${escapeHtml(e.message)}</td></tr>`;
+    return;
+  }
+  const recs = data.records || [];
+  const sum = data.summary || {};
+  $("histSummary").innerHTML = [
+    `<span class="chip">${sum.count||0} 次</span>`,
+    sum.avg_ttft_ms ? `<span class="chip">平均首字 ${sum.avg_ttft_ms} ms</span>` : "",
+    sum.hit_rate !== undefined ? `<span class="chip">命中率 ${sum.hit_rate}%</span>` : "",
+    `<span class="chip">token ${fmtInt(sum.prompt_tokens||0)} / ${fmtInt(sum.completion_tokens||0)}</span>`
+  ].join("");
+  if (!recs.length){
+    body.innerHTML = `<tr><td colspan="9" class="empty">暂无调用</td></tr>`;
+    return;
+  }
+  body.innerHTML = recs.map(r => `<tr>
+    <td class="mono muted">${escapeHtml(fmtTime(r.time))}</td>
+    <td class="mono">${escapeHtml(r.model||"—")}</td>
+    <td>${r.stream ? '<span class="badge info">流式</span>' : '<span class="badge">整包</span>'}</td>
+    <td class="mono">${r.ttft_ms} ms</td>
+    <td class="mono muted">${r.total_ms} ms</td>
+    <td class="mono">${fmtHit(r.prompt_tokens, r.cached_tokens)}</td>
+    <td class="mono muted">${fmtInt(r.prompt_tokens||0)} / ${fmtInt(r.completion_tokens||0)}${r.cached_tokens?` <em style="font-style:normal;opacity:.6">(${fmtInt(r.cached_tokens)})</em>`:""}</td>
+    <td class="mono muted" title="${escapeAttr(r.account||"")}">${escapeHtml((r.account||"—").slice(0,10))}</td>
+    <td>${r.status === 200 ? '<span class="badge ok">200</span>' : `<span class="badge bad">${r.status}</span>`}</td>
+  </tr>`).join("");
+}
+
 async function showApp(){
   $("loginView").classList.add("hidden");
   $("appView").classList.remove("hidden");
   try {
     await loadOverview();
+    await loadHistory();
   } catch (e) {
     toast("登录失败: " + e.message, false);
     clearKey();
@@ -383,14 +487,19 @@ $("loginBtn").onclick = async () => {
 };
 $("keyInput").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
 $("btnLogout").onclick = () => { clearKey(); showLogin(); toast("已退出"); };
+$("btnHist").onclick = () => { loadHistory().then(()=>toast("调用历史已刷新")); };
 $("btnRefresh").onclick = async () => {
-  try { await loadOverview(); toast("已刷新"); } catch(e){ toast(e.message,false); }
+  try { await loadOverview(); await loadHistory(); toast("已刷新"); } catch(e){ toast(e.message,false); }
 };
 
 async function runAction(path, body){
   try {
     const data = await api(path, {method:"POST", body: body?JSON.stringify(body):"{}"});
-    const msg = data.message || (data.ok ? "完成" : "完成(有失败)");
+    let msg = data.message || (data.ok ? "完成" : "完成(有失败)");
+    if (path.endsWith("/checkin") && Array.isArray(data.results)){
+      const got = data.results.reduce((n,r)=>n+Number(r.credits||0),0);
+      if (got > 0) msg += ` · 本次共领取 ${fmtCredits(got)} 积分`;
+    }
     toast(msg, !!data.ok);
     await loadOverview();
     return data;
@@ -400,6 +509,7 @@ async function runAction(path, body){
 }
 
 $("btnCredits").onclick = () => runAction("/admin/api/credits", {});
+$("btnRefillCredits").onclick = async () => { try { await api("/admin/api/credits/balance?refresh=1"); await load(); toast("积分余额已刷新"); } catch(e) { toast("刷新失败: " + e.message); } };
 $("btnCheckin").onclick = () => runAction("/admin/api/checkin", {});
 $("btnKeepalive").onclick = () => runAction("/admin/api/keepalive", {});
 $("btnReload").onclick = () => runAction("/admin/api/reload", {});
@@ -416,6 +526,7 @@ $("acctBody").addEventListener("click", async (e) => {
     else if (act === "enable") await runAction("/admin/api/accounts/enable", {uid});
     else if (act === "disable") await runAction("/admin/api/accounts/disable", {uid, reason:"manual disable from panel"});
     else if (act === "clear") await runAction("/admin/api/accounts/clear-cooldown", {uid});
+
   } finally {
     btn.disabled = false;
   }
