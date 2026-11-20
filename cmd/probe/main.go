@@ -42,9 +42,10 @@ func main() {
 	switch mode {
 	case "raw-role":
 		body := map[string]any{
-			"model":    model,
-			"stream":   true,
-			"messages": []any{map[string]any{"role": "user", "content": msg}},
+		"model":          model,
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
+		"messages":       []any{map[string]any{"role": "user", "content": msg}},
 		}
 		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	case "raw-text":
@@ -62,7 +63,7 @@ func main() {
 		}
 		rc, err = c.SendChatV2(context.Background(), body, "", cred, cred.SecurityToken, upstream.IsBenefitModel(a.UserID, model))
 	default:
-		rc, err = c.ChatStream(context.Background(), chatID, []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model, upstream.IsBenefitModel(a.UserID, model))
+		rc, err = c.ChatStream(context.Background(), []upstream.ChatMessage{{Type: "text", Text: msg}}, "", cred, a.UserName, model, upstream.IsBenefitModel(a.UserID, model))
 	}
 	if err != nil {
 		panic(err)
@@ -100,7 +101,8 @@ func main() {
 					}
 				}
 			}
-			if n <= 3 || strings.Contains(line, "DONE") || strings.Contains(line, "error_code") || strings.Contains(line, "error_msg") {
+			if n <= 3 || strings.Contains(line, "DONE") || strings.Contains(line, "error_code") || strings.Contains(line, "error_msg") ||
+				strings.Contains(line, "credit_cost") {
 				if len(line) > 300 {
 					fmt.Println(line[:300], "...")
 				} else {

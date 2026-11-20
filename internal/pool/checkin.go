@@ -13,6 +13,11 @@ type CheckinClient interface {
 	Checkin(context.Context, upstream.SignCredential) (upstream.CheckinResult, error)
 }
 
+// KeepaliveClient performs a read-only signed request for idle accounts.
+type KeepaliveClient interface {
+	FetchCreditCampaigns(context.Context, upstream.SignCredential) ([]upstream.CreditCampaign, error)
+}
+
 type CheckinStatus struct {
 	OK        bool      `json:"ok"`
 	Message   string    `json:"message"`
@@ -44,7 +49,8 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 		}
 		return upstream.CheckinResult{}, err
 	}
-	token, ak, sk := a.Auth.Credentials()
+	authz := a.AuthSnapshot()
+	token, ak, sk := authz.Credentials()
 	client := p.cfg.CheckinClient
 	if client == nil {
 		client = a.Client
@@ -107,10 +113,40 @@ func (p *Pool) DailyCheckinStatus(ctx context.Context, name string) (upstream.Da
 	if !ok {
 		return upstream.DailyCheckinStatus{}, fmt.Errorf("token invalid; re-login required")
 	}
-	token, ak, sk := account.Auth.Credentials()
+	authz := account.AuthSnapshot()
+	token, ak, sk := authz.Credentials()
 	return account.Client.FetchDailyCheckinStatus(ctx, upstream.SignCredential{
 		SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
 	})
+}
+
+// Keepalive verifies an idle account with a read-only upstream request. The
+// local heartbeat timestamp advances only after the upstream request succeeds.
+func (p *Pool) Keepalive(ctx context.Context, name string) error {
+	account := p.Get(name)
+	if account == nil {
+		return fmt.Errorf("account not found")
+	}
+	ok, err := p.Validate(account)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("token invalid; re-login required")
+	}
+	authz := account.AuthSnapshot()
+	token, ak, sk := authz.Credentials()
+	client := p.cfg.KeepaliveClient
+	if client == nil {
+		client = account.Client
+	}
+	if _, err := client.FetchCreditCampaigns(ctx, upstream.SignCredential{
+		SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
+	}); err != nil {
+		return err
+	}
+	p.PingKeepalive(name)
+	return nil
 }
 
 func sameLocalDate(a, b time.Time) bool {

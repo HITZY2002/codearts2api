@@ -26,10 +26,11 @@ func toolChoiceTestHandler(t *testing.T, endpoint string) (*Handler, *pool.Pool)
 	if err != nil {
 		t.Fatal(err)
 	}
+	useFreshTestCatalogs(p)
 	for _, acct := range p.Accounts() {
 		acct.Client = upstream.NewWithChatEndpoint(time.Second, endpoint)
 	}
-	return NewHandler(Config{Pool: p, DefaultModel: "glm-5.2", MaxRotate: 2, ErrThreshold: 1}), p
+	return NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, DefaultModel: "glm-5.2", MaxRotate: 2, ErrThreshold: 1}), p
 }
 
 func assertToolChoicePoolHealthy(t *testing.T, p *pool.Pool) {
@@ -72,7 +73,7 @@ func TestChatCompletionsPreservesNamedToolChoice(t *testing.T) {
 				"tool_choice":{"type":"function","function":{"name":"get_weather"}}
 			}`, stream)
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+			h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
 			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"get_weather"`) || !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
 				t.Fatalf("named tool request failed: status=%d body=%s", rec.Code, rec.Body.String())
 			}
@@ -108,7 +109,7 @@ func TestChatCompletionsRejectsInvalidNamedToolBeforeUpstream(t *testing.T) {
 			h, p := toolChoiceTestHandler(t, backend.URL)
 			payload := fmt.Sprintf(`{"messages":[{"role":"user","content":"hi"}],"tools":%s,"tool_choice":{"type":"function","function":{"name":"target"}}}`, tools)
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+			h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
 			if rec.Code != http.StatusBadRequest || attempts.Load() != 0 {
 				t.Fatalf("invalid named tool contacted upstream: status=%d attempts=%d body=%s", rec.Code, attempts.Load(), rec.Body.String())
 			}
@@ -147,7 +148,7 @@ func TestChatCompletionsParamInvalidDoesNotRotateOrCoolAccounts(t *testing.T) {
 				payload := fmt.Sprintf(`{"messages":[{"role":"user","content":"hi"}],"stream":%t}`, stream)
 				for i := 0; i < 3; i++ {
 					rec := httptest.NewRecorder()
-					h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+					h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
 					wantStatus := http.StatusBadRequest
 					if kind == "late_sse" && stream {
 						wantStatus = http.StatusOK // The stream headers were already sent.
@@ -165,7 +166,7 @@ func TestChatCompletionsParamInvalidDoesNotRotateOrCoolAccounts(t *testing.T) {
 				}
 				fail.Store(false)
 				rec := httptest.NewRecorder()
-				h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"normal request"}]} `)))
+				h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"normal request"}]} `)))
 				if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"ok"`) {
 					t.Fatalf("normal request failed after parameter errors: status=%d body=%s", rec.Code, rec.Body.String())
 				}
@@ -185,7 +186,7 @@ func TestChatCompletionsServerErrorsStillCoolAccounts(t *testing.T) {
 	defer backend.Close()
 	h, p := toolChoiceTestHandler(t, backend.URL)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]} `)))
+	h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]} `)))
 	_, healthy, disabled, cooling, _ := p.Stats()
 	if rec.Code < 500 || attempts.Load() != 2 || healthy != 0 || disabled != 0 || cooling != 2 {
 		t.Fatalf("server errors lost failover/cooldown behavior: status=%d attempts=%d healthy=%d disabled=%d cooling=%d", rec.Code, attempts.Load(), healthy, disabled, cooling)

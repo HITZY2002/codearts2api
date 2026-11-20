@@ -19,7 +19,14 @@ import (
 const (
 	modelAccessErrorJSON = `{"error_code":"TM.000010051","error_msg":"您当前无权调用该模型，请联系企业管理员开通。"}`
 	modelAccessTestReply = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	testHandlerAPIKey    = "test-key"
 )
+
+func authenticatedTestRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", "Bearer "+testHandlerAPIKey)
+	return req
+}
 
 func TestModelIDFallback(t *testing.T) {
 	for _, tc := range []struct {
@@ -152,16 +159,17 @@ func modelAccessTestHandler(t *testing.T, endpoint string, paths ...string) (*Ha
 	if err != nil {
 		t.Fatal(err)
 	}
+	useFreshTestCatalogs(p)
 	for i, acct := range p.Accounts() {
 		acct.Client = upstream.NewWithChatEndpoint(time.Second, endpoint+paths[i])
 	}
-	return NewHandler(Config{Pool: p, ErrThreshold: 1, MaxRotate: len(paths)}), p
+	return NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey, ErrThreshold: 1, MaxRotate: len(paths)}), p
 }
 
 func modelAccessTestChat(h *Handler, model string, stream bool) *httptest.ResponseRecorder {
 	body := fmt.Sprintf(`{"model":%q,"stream":%t,"messages":[{"role":"user","content":%q}]}`, model, stream, "hi "+model)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 	return rec
 }
 

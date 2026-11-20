@@ -234,6 +234,7 @@ func applyCompletionMetrics(rec *requestRecorder, msgs []upstream.ChatMessage, c
 	if comp.CreditUsage != nil {
 		cost := comp.CreditUsage.CreditCost
 		rec.record.CreditCost = &cost
+		rec.record.UpstreamMsgID = comp.CreditUsage.MsgID
 		rec.record.BillingPromptTokens = comp.CreditUsage.PromptTokenUsed
 		rec.record.BillingCompletionTokens = comp.CreditUsage.CompletionTokenUsed
 		rec.record.BillingCachedTokens = comp.CreditUsage.CachedTokenUsed

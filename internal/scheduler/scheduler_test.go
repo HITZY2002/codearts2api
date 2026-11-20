@@ -25,6 +25,13 @@ func (c *completedCheckinClient) Checkin(context.Context, upstream.SignCredentia
 	return upstream.CheckinResult{OK: true, Skipped: true, Message: "今日已签到"}, nil
 }
 
+type readOnlyKeepaliveClient struct{ calls int }
+
+func (c *readOnlyKeepaliveClient) FetchCreditCampaigns(context.Context, upstream.SignCredential) ([]upstream.CreditCampaign, error) {
+	c.calls++
+	return []upstream.CreditCampaign{}, nil
+}
+
 func TestAutoCheckinOptOutAndRetry(t *testing.T) {
 	c := &failingCheckinClient{}
 	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")
@@ -61,5 +68,24 @@ func TestAutoCheckinRunsOncePerDay(t *testing.T) {
 	scheduler.Tick(context.Background())
 	if client.calls != 1 {
 		t.Fatalf("same-day checkin calls=%d, want 1", client.calls)
+	}
+}
+
+func TestKeepaliveTickUsesRealReadOnlyRequest(t *testing.T) {
+	client := &readOnlyKeepaliveClient{}
+	account := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{account}, pool.Config{
+		KeepaliveClient: client, KeepaliveWindow: time.Nanosecond,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	New(Config{Pool: p}).KeepaliveTick(context.Background())
+	if client.calls != 1 {
+		t.Fatalf("keepalive upstream calls=%d, want 1", client.calls)
+	}
+	if p.NeedKeepalive("u1") {
+		t.Fatal("successful upstream keepalive did not refresh the heartbeat")
 	}
 }

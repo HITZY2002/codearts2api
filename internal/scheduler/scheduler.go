@@ -42,6 +42,20 @@ func New(cfg Config) *Scheduler {
 	return &Scheduler{cfg: cfg}
 }
 
+// UpdateConfig applies watchdog settings without restarting the process.
+func (s *Scheduler) UpdateConfig(cfg Config) {
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 30 * time.Minute
+	}
+	if cfg.RefreshSkew <= 0 {
+		cfg.RefreshSkew = 30 * time.Minute
+	}
+	if cfg.KeepaliveInterval <= 0 {
+		cfg.KeepaliveInterval = 15 * time.Minute
+	}
+	s.cfg = cfg
+}
+
 // Run 启动定时循环。
 func (s *Scheduler) Run(ctx context.Context) {
 	if !s.cfg.Enabled {
@@ -56,12 +70,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
+	keepaliveTicker := time.NewTicker(s.cfg.KeepaliveInterval)
+	defer keepaliveTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.Tick(ctx)
+		case <-keepaliveTicker.C:
+			s.KeepaliveTick(ctx)
 		}
 	}
 }
@@ -77,16 +95,17 @@ func (s *Scheduler) Tick(ctx context.Context) {
 		}
 		ok, _ := s.cfg.Pool.Validate(acct)
 		if ok {
-			remaining := acct.Auth.Remaining().Round(time.Minute)
+			authz := acct.AuthSnapshot()
+			remaining := authz.Remaining().Round(time.Minute)
 			log.Printf("token account=%s ok remaining=%s", acct.Name, remaining)
 
 			// ticket 登录不返回 refresh_token；这种账号跳过无意义的周期刷新。
-			if acct.Auth.Refresh() != "" {
+			if authz.Refresh() != "" {
 				if err := s.cfg.Pool.CheckAndRefreshTokenWithin(acct.Name, s.cfg.RefreshSkew); err != nil {
 					log.Printf("proactive refresh failed account=%s err=%v", acct.Name, err)
 				} else if remaining <= s.cfg.RefreshSkew {
 					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,
-						acct.Auth.Remaining().Round(time.Minute))
+						authz.Remaining().Round(time.Minute))
 				}
 			}
 			if s.cfg.CreditsAutoClaim {
@@ -102,6 +121,26 @@ func (s *Scheduler) Tick(ctx context.Context) {
 			}
 		} else {
 			log.Printf("token account=%s invalid/disabled", acct.Name)
+		}
+	}
+}
+
+// KeepaliveTick performs a real read-only upstream request for idle accounts.
+func (s *Scheduler) KeepaliveTick(ctx context.Context) {
+	for _, acct := range s.cfg.Pool.Accounts() {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if !s.cfg.Pool.Enabled(acct.Name) || !s.cfg.Pool.NeedKeepalive(acct.Name) {
+			continue
+		}
+		keepaliveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := s.cfg.Pool.Keepalive(keepaliveCtx, acct.Name)
+		cancel()
+		if err != nil {
+			log.Printf("keepalive failed account=%s err=%v", acct.Name, err)
+		} else {
+			log.Printf("keepalive account=%s ok", acct.Name)
 		}
 	}
 }

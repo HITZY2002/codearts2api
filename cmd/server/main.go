@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+
+	settingsPath := filepath.Join(filepath.Dir(*cfgPath), "data", "settings.json")
+	if cfg.StateFile != "" {
+		settingsPath = filepath.Join(filepath.Dir(cfg.StateFile), "settings.json")
+	}
+	settings, err := server.OpenSettings(settingsPath, settingsFromConfig(*cfg))
+	if err != nil {
+		log.Fatalf("load settings: %v", err)
+	}
+	applySettingsToConfig(cfg, settings.Get())
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -61,7 +72,7 @@ func main() {
 		log.Fatalf("build pool: %v", err)
 	}
 
-	c := upstream.New(120 * time.Second)
+	c := upstream.New(poolConfig.UpstreamTimeout)
 	c.SetBenefitAutoClaim(cfg.BenefitAutoClaim)
 
 	sch := scheduler.New(scheduler.Config{
@@ -97,7 +108,7 @@ func main() {
 			"refresh_skew_minutes": cfg.Watch.RefreshSkewM,
 			"keepalive_interval":   cfg.Watch.KeepaliveInterval,
 			"max_concurrent":       cfg.MaxConcurrent,
-			"keepalive_window":     "10m",
+			"keepalive_window":     poolConfig.KeepaliveWindow.String(),
 		},
 		AuthDir:                    cfg.AuthDir,
 		Listen:                     cfg.Listen,
@@ -109,6 +120,8 @@ func main() {
 		SnapshotInterval:           time.Duration(cfg.Observability.SnapshotIntervalSeconds) * time.Second,
 		LoginConfig:                loginConfig(cfg),
 		OAuthCallbackHost:          cfg.OAuthCallbackHost,
+		Settings:                   settings,
+		Scheduler:                  sch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -178,4 +191,42 @@ func loginConfig(cfg *Config) upstream.LoginConfig {
 		}
 	}
 	return lc
+}
+
+func settingsFromConfig(cfg Config) server.Settings {
+	settings := server.DefaultSettings()
+	settings.DefaultModel = cfg.DefaultModel
+	settings.MaxConcurrent = cfg.MaxConcurrent
+	settings.QueueRetrySeconds = cfg.QueueRetrySeconds
+	settings.QueueMaxAttempts = cfg.QueueMaxAttempts
+	settings.BenefitAutoClaim = cfg.BenefitAutoClaim
+	settings.CreditsAutoClaim = cfg.CreditsAutoClaim
+	settings.WatchEnabled = cfg.Watch.Enabled
+	settings.PollMinutes = cfg.Watch.PollMinutes
+	settings.RefreshSkewMinutes = cfg.Watch.RefreshSkewM
+	settings.KeepaliveIntervalMinutes = cfg.Watch.KeepaliveInterval
+	settings.KeepaliveWindowMinutes = int(poolConfigKeepaliveWindow(cfg).Minutes())
+	return settings
+}
+
+func applySettingsToConfig(cfg *Config, settings server.Settings) {
+	cfg.DefaultModel = settings.DefaultModel
+	cfg.MaxConcurrent = settings.MaxConcurrent
+	cfg.QueueRetrySeconds = settings.QueueRetrySeconds
+	cfg.QueueMaxAttempts = settings.QueueMaxAttempts
+	cfg.BenefitAutoClaim = settings.BenefitAutoClaim
+	cfg.CreditsAutoClaim = settings.CreditsAutoClaim
+	cfg.Watch.Enabled = settings.WatchEnabled
+	cfg.Watch.PollMinutes = settings.PollMinutes
+	cfg.Watch.RefreshSkewM = settings.RefreshSkewMinutes
+	cfg.Watch.KeepaliveInterval = settings.KeepaliveIntervalMinutes
+	cfg.KeepaliveWindow = fmt.Sprintf("%dm", settings.KeepaliveWindowMinutes)
+}
+
+func poolConfigKeepaliveWindow(cfg Config) time.Duration {
+	duration, err := time.ParseDuration(cfg.KeepaliveWindow)
+	if err != nil || duration <= 0 {
+		return 10 * time.Minute
+	}
+	return duration
 }

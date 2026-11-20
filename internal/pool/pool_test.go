@@ -1,8 +1,13 @@
 package pool
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +29,87 @@ func TestAddAccountInitializesConcurrency(t *testing.T) {
 	p.ReleaseLock("u1")
 }
 
+func TestSaveStateSerializesConcurrentWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	p, err := New([]*auth.Auth{a}, Config{}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			p.Cooldown("u1", CoolSoft, time.Second, "test")
+		}()
+		go func() {
+			defer wg.Done()
+			p.AddAccount(auth.New(fmt.Sprintf("u-%d", i), "user", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""))
+		}()
+	}
+	wg.Wait()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		t.Fatalf("state is not valid JSON: %v", err)
+	}
+	if len(entries) != 17 {
+		t.Fatalf("state entries=%d, want 17", len(entries))
+	}
+}
+
+func TestAuthSnapshotDuringCredentialReplacement(t *testing.T) {
+	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	p, err := New([]*auth.Auth{a}, Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			p.AddAccount(auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_, _, _ = p.Get("u1").AuthSnapshot().Credentials()
+		}
+	}()
+	wg.Wait()
+}
+
+func TestAcquireLockWaitReturnsWhenAccountRemoved(t *testing.T) {
+	p, err := New(nil, Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if p.AcquireLockWait("missing", time.Second) {
+		t.Fatal("missing account acquired a lock")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("missing account waited %s", elapsed)
+	}
+}
+
+func TestConfiguredUpstreamTimeout(t *testing.T) {
+	p, err := New(nil, Config{UpstreamTimeout: 7 * time.Second}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.cfg.UpstreamTimeout != 7*time.Second {
+		t.Fatalf("upstream timeout=%s", p.cfg.UpstreamTimeout)
+	}
+}
+
 func TestSyncToDirInitializesConcurrency(t *testing.T) {
 	p, err := New(nil, Config{MaxConcurrent: 1}, "")
 	if err != nil {
@@ -36,6 +122,41 @@ func TestSyncToDirInitializesConcurrency(t *testing.T) {
 		t.Fatal("synced account did not receive a concurrency slot")
 	}
 	p.ReleaseLock("u1")
+}
+
+func TestPickExcludingPrefersLeastUtilized(t *testing.T) {
+	p, err := New(nil, Config{MaxConcurrent: 2}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry := time.Now().Add(time.Hour).Format(time.RFC3339)
+	p.SyncToDir([]*auth.Auth{
+		auth.New("u1", "user1", "domain", "token", "ak", "sk", expiry, "", "verifier"),
+		auth.New("u2", "user2", "domain", "token", "ak", "sk", expiry, "", "verifier"),
+	})
+
+	// u1 半载、u2 空闲：新会话应摊到 u2，而不是配置序第一个 u1。
+	if !p.AcquireLockWait("u1", 0) {
+		t.Fatal("acquire u1 failed")
+	}
+	if got := p.PickExcluding(nil); got == nil || got.Name != "u2" {
+		t.Fatalf("expected least-utilized u2, got %v", got)
+	}
+
+	// 同为半载时保持配置顺序。
+	if !p.AcquireLockWait("u2", 0) {
+		t.Fatal("acquire u2 failed")
+	}
+	if got := p.PickExcluding(nil); got == nil || got.Name != "u1" {
+		t.Fatalf("expected config-order tie-break u1, got %v", got)
+	}
+
+	// tried 排除仍然生效。
+	if got := p.PickExcluding(map[string]bool{"u1": true}); got == nil || got.Name != "u2" {
+		t.Fatalf("expected u2 after excluding u1, got %v", got)
+	}
+	p.ReleaseLock("u1")
+	p.ReleaseLock("u2")
 }
 
 func TestValidateKeepsAccountEnabledAfterRetryableRefreshFailure(t *testing.T) {

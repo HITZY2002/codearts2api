@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCreditsAutoClaimConfigAndEnv(t *testing.T) {
@@ -27,6 +28,14 @@ func TestCreditsAutoClaimConfigAndEnv(t *testing.T) {
 	t.Setenv("CA2A_CREDITS_AUTO_CLAIM", "0")
 	if cfg, err := Load(""); err != nil || cfg.CreditsAutoClaim {
 		t.Fatalf("env opt-out ignored: err=%v", err)
+	}
+}
+
+func TestUpstreamTimeoutFlowsIntoPoolConfig(t *testing.T) {
+	cfg := Default()
+	cfg.Upstream.TimeoutSeconds = 7
+	if got := cfg.ToPoolConfig().UpstreamTimeout; got != 7*time.Second {
+		t.Fatalf("pool upstream timeout=%s, want 7s", got)
 	}
 }
 

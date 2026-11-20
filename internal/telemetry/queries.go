@@ -158,7 +158,7 @@ func (s *Store) ListRequests(filter RequestFilter) ([]RequestLog, int64, error) 
 		return nil, 0, err
 	}
 	limit, offset := normalizePagination(filter.Limit, filter.Offset, 500)
-	query := `SELECT id, request_id, created_at, endpoint, method, client_ip, status_code,
+	query := `SELECT id, request_id, chat_id, upstream_msg_id, created_at, endpoint, method, client_ip, status_code,
 		stream, model, account_uid, account_name, attempts, queue_wait_ms, first_output_ms,
 		total_ms, prompt_tokens, completion_tokens, total_tokens, usage_estimated, credit_cost,
 		billing_prompt_tokens, billing_completion_tokens, billing_cached_tokens,
@@ -175,7 +175,7 @@ func (s *Store) ListRequests(filter RequestFilter) ([]RequestLog, int64, error) 
 		var req RequestLog
 		var stream, usageEstimated int
 		if err := rows.Scan(
-			&req.ID, &req.RequestID, &req.CreatedAt, &req.Endpoint, &req.Method,
+			&req.ID, &req.RequestID, &req.ChatID, &req.UpstreamMsgID, &req.CreatedAt, &req.Endpoint, &req.Method,
 			&req.ClientIP, &req.StatusCode, &stream, &req.Model, &req.AccountUID,
 			&req.AccountName, &req.Attempts, &req.QueueWaitMs, &req.FirstOutputMs,
 			&req.TotalMs, &req.PromptTokens, &req.CompletionTokens, &req.TotalTokens,

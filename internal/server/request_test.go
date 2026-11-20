@@ -207,35 +207,15 @@ func TestFingerprintStableAndReplay(t *testing.T) {
 	}
 }
 
-func TestConversationIDStaysStableAsOpenAIHistoryGrows(t *testing.T) {
-	first := openAIMessage{Role: "user", Text: "开始一个长时间代码审计"}
-	round1 := &chatRequest{Messages: []openAIMessage{
-		{Role: "system", Text: "time=1"},
-		first,
-	}}
-	round2 := &chatRequest{Messages: []openAIMessage{
-		{Role: "system", Text: "time=2"},
-		first,
-		{Role: "assistant", ToolCalls: []openAIToolCall{{ID: "call_1", Name: "bash", Arguments: `{"command":"pwd"}`}}},
-		{Role: "tool", ToolCallID: "call_1", Text: "/workspace"},
-	}}
-
-	id1 := conversationIDFor(round1, "")
-	id2 := conversationIDFor(round2, "")
-	if id1 == "" || id1 != id2 || !validChatID(id1) {
-		t.Fatalf("conversation IDs are not stable valid chat IDs: %q vs %q", id1, id2)
+func TestConversationIDDoesNotInferAffinityFromFirstMessage(t *testing.T) {
+	first := openAIMessage{Role: "user", Text: "你好"}
+	one := &chatRequest{Messages: []openAIMessage{first}}
+	two := &chatRequest{Messages: []openAIMessage{first}}
+	if id := conversationIDFor(one, ""); id != "" {
+		t.Fatalf("implicit first-message affinity returned %q", id)
 	}
-}
-
-func TestConversationIDSeparatesTitleChatFromToolAgent(t *testing.T) {
-	first := openAIMessage{Role: "user", Text: "inspect the repository"}
-	title := &chatRequest{Messages: []openAIMessage{first}}
-	agent := &chatRequest{
-		Messages: []openAIMessage{first},
-		Tools:    []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}},
-	}
-	if conversationIDFor(title, "") == conversationIDFor(agent, "") {
-		t.Fatal("title generation and tool agent must not share CodeArts built-in chat state")
+	if conversationIDFor(one, "session-one") == conversationIDFor(two, "session-two") {
+		t.Fatal("explicit client sessions must not share a conversation ID")
 	}
 }
 

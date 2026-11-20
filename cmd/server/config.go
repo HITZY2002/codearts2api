@@ -287,6 +287,12 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
+	if c.KeepaliveWindow == "" {
+		c.KeepaliveWindow = "10m"
+	}
+	if _, err := time.ParseDuration(c.KeepaliveWindow); err != nil {
+		return fmt.Errorf("keepalive_window: %w", err)
+	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = "glm-5.2"
 	}
@@ -340,5 +346,6 @@ func (c *Config) ToPoolConfig() pool.Config {
 		RefreshSkew:     time.Duration(c.Watch.RefreshSkewM) * time.Minute,
 		MaxConcurrent:   c.MaxConcurrent,
 		KeepaliveWindow: dur,
+		UpstreamTimeout: time.Duration(c.Upstream.TimeoutSeconds) * time.Second,
 	}
 }

@@ -289,8 +289,33 @@ func fingerprintOf(msgs []openAIMessage) string {
 	return fp
 }
 
-// conversationIDFor 为不带会话 ID 的 OpenAI 客户端提供稳定的 CodeArts chat_id。
-// Agent 工具链的历史会持续增长，但首条 user 消息不变，因此可作为会话锚点。
+// upstreamTurnKey identifies one logical user turn, not one HTTP request.
+// Tool continuations append assistant/tool messages after the latest user
+// message; hashing only through that user message keeps the turn stable.
+func upstreamTurnKey(req *chatRequest) string {
+	if req == nil || len(req.Messages) == 0 {
+		return ""
+	}
+	lastUser := -1
+	for i, m := range req.Messages {
+		if m.Role == "user" {
+			lastUser = i
+		}
+	}
+	prefix := req.Messages
+	if lastUser >= 0 {
+		prefix = req.Messages[:lastUser+1]
+	}
+	fp := fingerprintOf(prefix)
+	if req.ConversationID != "" {
+		return req.ConversationID + ":" + fp
+	}
+	return fp
+}
+
+// conversationIDFor returns an explicit client conversation identity. Requests
+// without one get a fresh upstream chat ID in the handler, preventing two
+// unrelated conversations with the same first message from sharing state.
 func conversationIDFor(req *chatRequest, headerValue string) string {
 	for _, explicit := range []string{req.ConversationID, headerValue} {
 		explicit = strings.TrimSpace(explicit)
@@ -302,18 +327,6 @@ func conversationIDFor(req *chatRequest, headerValue string) string {
 		}
 		sum := sha256.Sum256([]byte(explicit))
 		return hex.EncodeToString(sum[:16])
-	}
-	for _, message := range req.Messages {
-		if message.Role == "user" {
-			anchor := canonical(message)
-			if len(req.Tools) > 0 {
-				// OpenCode 会用同一用户消息先请求无工具的会话标题，再启动工具 Agent。
-				// 两者必须分开，否则标题生成会污染内置 Agent 会话。
-				anchor += "\x00tools"
-			}
-			sum := sha256.Sum256([]byte(anchor))
-			return hex.EncodeToString(sum[:16])
-		}
 	}
 	return ""
 }

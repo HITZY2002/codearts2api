@@ -138,10 +138,11 @@ func New(timeout time.Duration) *Client {
 		timeout = 120 * time.Second
 	}
 	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          20,
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 120 * time.Second,
+		ResponseHeaderTimeout: timeout,
 	}
 	c := &Client{
 		http:        &http.Client{Timeout: timeout, Transport: tr},
@@ -170,6 +171,12 @@ func (c *Client) chatEndpoint() string {
 		return c.chatURL
 	}
 	return c.snapURL(EpChatV2)
+}
+
+// CreditUsageEnabled reports whether the client points at the production gateway.
+// Test endpoints do not have the separate credit usage route.
+func (c *Client) CreditUsageEnabled() bool {
+	return c.chatURL == ""
 }
 
 // SetBenefitAutoClaim 设置模型发现时是否自动领取限时福利（默认 false）。
@@ -407,6 +414,8 @@ type ChatMessage struct {
 // ChatOptions 是需要原样传给 OpenAI 兼容上游的可选生成参数。
 type ChatOptions struct {
 	ReasoningEffort string
+	MessageID       string
+	SessionID       string
 	MaxTokens       *int
 	Temperature     *float64
 	TopP            *float64
@@ -441,23 +450,24 @@ func CanonicalModel(id string) string {
 	}
 }
 
+// ClientVersion 对齐官方桌面客户端版本号（CodeArts resources/app.asar 内
+// package.json 的 version），用于 x-ot-client-version 头。
+const ClientVersion = "0.2.9"
+
 // ChatHeadersV2 组装 /api/v2/chat/completions 请求头。
-// 与官方 AgentKernel 一致：x-auth-token 鉴权 + AK/SK 签名，无 Agent-Type。
-func ChatHeadersV2(token, traceID, language string) map[string]string {
+// 与官方 agent-kernel 一致：x-auth-token 鉴权 + AK/SK 签名，无 Agent-Type。
+// 官方不发 app-id / X-Language / is_confidential，这里也不发。
+func ChatHeadersV2(token, traceID string) map[string]string {
 	if traceID == "" {
 		traceID = fmt.Sprintf("%x", time.Now().UnixNano())
 	}
-	if language == "" {
-		language = "zh-cn"
-	}
 	return map[string]string{
-		"Content-Type":    "application/json",
-		"Accept":          "text/event-stream",
-		"x-auth-token":    token,
-		"x-snap-traceid":  traceID,
-		"X-Language":      language,
-		"app-id":          "CodeAgent3.0",
-		"is_confidential": "false",
+		"Content-Type":        "application/json",
+		"Accept":              "text/event-stream",
+		"x-auth-token":        token,
+		"x-snap-traceid":      traceID,
+		"x-ot-client-type":    "desktop",
+		"x-ot-client-version": ClientVersion,
 	}
 }
 
@@ -466,27 +476,24 @@ func ChatHeadersV2(token, traceID, language string) map[string]string {
 //
 // benefit 由调用方按「发起请求的账号」判定（见 IsBenefitModel）：限时福利模型
 // 必须带 maas_type: benefit 头，判定依据是账号自己的模型目录，不能全局共享。
-func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error) {
-	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{}, benefit)
+func (c *Client) ChatStream(ctx context.Context, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error) {
+	return c.ChatStreamWithOptions(ctx, messages, traceID, cred, userName, model, ChatOptions{}, benefit)
 }
 
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
-func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
-	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendModelChatV2(ctx, body, model, traceID, cred, chatID, sessionIDFor(chatID), benefit)
+func (c *Client) ChatStreamWithOptions(ctx context.Context, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
+	body := chatBodyV2(messages, model, opts)
+	return c.sendModelChatV2(ctx, body, model, traceID, cred, opts.SessionID, opts.MessageID, benefit)
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
-func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOptions) map[string]any {
+// 官方 kernel 不发 chat_id / prompt_cache_key，这里也不发。
+func chatBodyV2(messages []ChatMessage, model string, opts ChatOptions) map[string]any {
 	body := map[string]any{
-		"model":            CanonicalModel(model),
-		"stream":           true,
-		"messages":         chatMessagesToOpenAI(messages),
-		"prompt_cache_key": chatID,
-		"tool_stream":      true,
-	}
-	if chatID != "" {
-		body["chat_id"] = chatID
+		"model":       CanonicalModel(model),
+		"stream":      true,
+		"messages":    chatMessagesToOpenAI(messages),
+		"tool_stream": true,
 	}
 	if opts.ReasoningEffort != "" {
 		body["reasoning_effort"] = opts.ReasoningEffort
@@ -536,12 +543,6 @@ func chatMessagesToOpenAI(msgs []ChatMessage) []map[string]any {
 	return out
 }
 
-// sessionIDFor 由 chatID 派生的稳定会话标识（prompt cache 亲和）。
-func sessionIDFor(chatID string) string {
-	sum := sha256.Sum256([]byte("codearts-session:" + chatID))
-	return hex.EncodeToString(sum[:16])
-}
-
 // SendChatV2 发送自定义 OpenAI 兼容 body 到 /api/v2/chat/completions。
 // 鉴权：x-auth-token（STS security token）+ 华为云 SDK-HMAC-SHA256 AK/SK 签名。
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
@@ -564,7 +565,7 @@ type chatModelKey struct {
 	benefit bool
 }
 
-func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model, traceID string, cred SignCredential, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model, traceID string, cred SignCredential, sessionID, msgID string, benefit bool) (io.ReadCloser, error) {
 	canonical := CanonicalModel(model)
 	lower := strings.ToLower(canonical)
 	key := chatModelKey{id: lower, benefit: benefit}
@@ -577,7 +578,7 @@ func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model
 	}
 
 	body["model"] = first
-	rc, err := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	rc, err := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, sessionID, msgID, benefit)
 	if err == nil || alternate == first || !isModelIDError(err.Error()) {
 		return rc, err
 	}
@@ -585,7 +586,7 @@ func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model
 	// InferHub can report an ID spelling mismatch as a permission error.
 	// Retry once with the other spelling on the same account and route.
 	body["model"] = alternate
-	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
+	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, sessionID, msgID, benefit)
 	if retryErr == nil {
 		c.chatModelIDs.Store(key, alternate)
 	} else if IsModelAccessErrorMessage(err.Error()) && isModelIDError(retryErr.Error()) {
@@ -606,27 +607,33 @@ func isModelIDError(message string) bool {
 
 // sendChatV2 发送聊天请求并返回 SSE 流。
 //
-// chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
 // benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
-func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+// sessionID 为官方 x-ot-session-id（按账号+会话派生），同样在签名前写入。
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, sessionID, msgID string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
+	for k, v := range ChatHeadersV2(userToken, traceID) {
 		httpReq.Header.Set(k, v)
+	}
+	if msgID != "" {
+		httpReq.Header.Set("user-msg-id", msgID)
+	}
+	if sessionID != "" {
+		httpReq.Header.Set("x-ot-session-id", sessionID)
+	}
+	// 官方 header 组装函数对 model-name 缺省回退到 model-id；网关没有显示名
+	// 目录，两者同值即官方回退行为。
+	if m, ok := body["model"].(string); ok && m != "" {
+		httpReq.Header.Set("model-id", m)
+		httpReq.Header.Set("model-name", m)
 	}
 	if benefit {
 		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
 	}
 	signRequest(httpReq, raw, cred)
-	if chatID != "" {
-		httpReq.Header.Set("Chat-Id", chatID)
-	}
-	if sessionID != "" {
-		httpReq.Header.Set("Session-Id", sessionID)
-	}
 	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -713,6 +720,8 @@ func embeddedSSEError(payload map[string]any) *ApiError {
 	status := http.StatusBadGateway
 	low := strings.ToLower(combined)
 	switch {
+	case strings.Contains(low, "401") || strings.Contains(low, "unauthorized") || strings.Contains(low, "未授权"):
+		status = http.StatusUnauthorized
 	case strings.Contains(low, "429") || strings.Contains(low, "tm.00001041") ||
 		strings.Contains(low, "tpm") || strings.Contains(low, "并发会话"):
 		status = http.StatusTooManyRequests

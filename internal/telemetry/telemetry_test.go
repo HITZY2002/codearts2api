@@ -17,7 +17,7 @@ func TestRequestLogLifecycle(t *testing.T) {
 	firstOutput := int64(573)
 	if err := store.RecordRequest(RequestLog{
 		RequestID:               "req-1",
-		CreatedAt:               time.Now().UnixMilli(),
+		CreatedAt:               time.Now().Add(-time.Hour).UnixMilli(),
 		Endpoint:                "/v1/chat/completions",
 		Method:                  "POST",
 		ClientIP:                "127.0.0.1",

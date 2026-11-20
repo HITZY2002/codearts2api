@@ -2,7 +2,9 @@
 package server
 
 import (
+	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,6 +22,7 @@ import (
 
 	"codearts2api/internal/auth"
 	"codearts2api/internal/pool"
+	"codearts2api/internal/scheduler"
 	"codearts2api/internal/telemetry"
 	"codearts2api/internal/upstream"
 )
@@ -37,11 +40,13 @@ type Config struct {
 	// 也可能嵌在 HTTP 200 SSE 内。默认每 10s 重试一次、最多 30 次（约 5 分钟）。
 	QueueRetryDelay  time.Duration
 	QueueMaxAttempts int
-	DefaultModel     string
-	ConvStateFile    string
-	WatchInfo        map[string]any
-	AuthDir          string
-	Listen           string
+	// QueueReacquireTimeout bounds the wait for a slot after a queue retry.
+	QueueReacquireTimeout time.Duration
+	DefaultModel          string
+	ConvStateFile         string
+	WatchInfo             map[string]any
+	AuthDir               string
+	Listen                string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
 	OAuthClient *upstream.Client
 	// Telemetry 可选 SQLite 观测存储。
@@ -54,6 +59,10 @@ type Config struct {
 	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
 	OAuthCallbackHost string
+	// Settings 是 WebUI 设置页的运行时配置存储。
+	Settings *SettingsStore
+	// Scheduler allows settings changes to reach the token watchdog.
+	Scheduler *scheduler.Scheduler
 }
 
 var dynamicModelsCache struct {
@@ -95,6 +104,26 @@ const (
 
 const maxBodyBytes = 8 << 20
 
+const (
+	maxConversationBindings = 4096
+	conversationBindingTTL  = 7 * 24 * time.Hour
+)
+
+type conversationBinding struct {
+	Account   string    `json:"account"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type turnIDBinding struct {
+	ID        string    `json:"id"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type conversationState struct {
+	Conversations map[string]conversationBinding `json:"conversations"`
+	Turns         map[string]turnIDBinding       `json:"turns,omitempty"`
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg   Config
@@ -102,26 +131,17 @@ type Handler struct {
 	oauth *oauthStore
 
 	convMu sync.Mutex
-	chats  map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
-	convAcct map[string]string
-
-	loginMu sync.Mutex
-	logins  map[string]*pendingLogin
-}
-
-// pendingLogin WebUI 登录中间状态。
-type pendingLogin struct {
-	TicketID string
-	Secret   string
-	Verifier string
-	Port     int
-	Done     bool
-	Err      string
+	convAcct map[string]conversationBinding
+	// 上游消息 ID 按账号 + 用户轮次复用；跨账号不复用，避免积分归属错误。
+	turnIDs map[string]turnIDBinding
 }
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
+	if cfg.Settings == nil {
+		cfg.Settings = newSettingsStore("", fallbackSettings(cfg))
+	}
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
@@ -142,6 +162,9 @@ func NewHandler(cfg Config) *Handler {
 		// 取 30 次（约 5 分钟）作为默认，可用 queue_max_attempts 调整。
 		cfg.QueueMaxAttempts = 30
 	}
+	if cfg.QueueReacquireTimeout <= 0 {
+		cfg.QueueReacquireTimeout = 30 * time.Second
+	}
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = "glm-5.2"
 	}
@@ -156,10 +179,10 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
-		chats: map[string]string{}, logins: map[string]*pendingLogin{},
-		convAcct: map[string]string{},
+		convAcct: map[string]conversationBinding{},
+		turnIDs:  map[string]turnIDBinding{},
 	}
-	h.loadChats()
+	h.loadConversations()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withTelemetry(h.withAuth(h.chatCompletions)))
 	h.mux.HandleFunc("GET /v1/models", h.withTelemetry(h.withAuth(h.models)))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -188,6 +211,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/api/metrics/overview", h.withAuth(h.adminMetricsOverview))
 	h.mux.HandleFunc("GET /admin/api/metrics/series", h.withAuth(h.adminMetricsSeries))
 	h.mux.HandleFunc("POST /admin/api/observability/purge", h.withAuth(h.adminObservabilityPurge))
+	h.mux.HandleFunc("GET /admin/api/settings", h.withAuth(h.adminSettingsGet))
+	h.mux.HandleFunc("POST /admin/api/settings", h.withAuth(h.adminSettingsUpdate))
 	h.mux.HandleFunc("GET /oauth/callback", h.oauthCallback)
 	return h
 }
@@ -198,18 +223,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.APIKey != "" {
-			authz := r.Header.Get("Authorization")
-			const prefix = "Bearer "
-			if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
-			}
-			key := authz[len(prefix):]
-			if subtle.ConstantTimeCompare([]byte(key), []byte(h.cfg.APIKey)) != 1 {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-				return
-			}
+		if h.cfg.APIKey == "" {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "server_misconfigured", "API key is not configured")
+			return
+		}
+		authz := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if len(authz) < len(prefix) || !strings.EqualFold(authz[:len(prefix)], prefix) {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		key := authz[len(prefix):]
+		if subtle.ConstantTimeCompare([]byte(key), []byte(h.cfg.APIKey)) != 1 {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
 		}
 		next(w, r)
 	}
@@ -232,20 +259,19 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	log.Printf("oauth callback hit: has_code=%t has_secret=%t has_redirect=%t", code != "", secret != "", redirect != "")
 	// portal 第一次回调：带 secret + redirect，要求 307 跳转（登录页链路的一部分）。
 	if secret != "" && redirect != "" {
-		// 用 redirect 里的 ticket_id 定位 pending login，并把华为云下发的 secret 换进去
-		// （ticket 轮询必须用 portal 的 secret，而不是本地生成的）。
-		if u, err := url.Parse(redirect); err == nil {
-			tid := u.Query().Get("ticket_id")
-			if tid != "" {
-				h.oauth.enableTicketFallbackByTicket(tid, secret)
-				h.loginMu.Lock()
-				if p, ok := h.logins[tid]; ok {
-					p.Secret = secret
-					log.Printf("oauth callback: updated secret for ticket=%s", shortID(tid))
-				}
-				h.loginMu.Unlock()
-			}
+		next, nextErr := url.Parse(redirect)
+		portal, portalErr := url.Parse(h.cfg.LoginConfig.PortalHost)
+		ticketID := ""
+		if nextErr == nil {
+			ticketID = next.Query().Get("ticket_id")
 		}
+		if nextErr != nil || portalErr != nil || next.Scheme != "https" || next.User != nil ||
+			!strings.EqualFold(next.Host, portal.Host) || ticketID == "" ||
+			!h.oauth.enableTicketFallbackByTicket(ticketID, secret) {
+			http.Error(w, "invalid OAuth continuation", http.StatusBadRequest)
+			return
+		}
+		log.Printf("oauth callback: updated secret for ticket=%s", shortID(ticketID))
 		http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
 		return
 	}
@@ -347,7 +373,7 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
 		return err
 	}
-	if p := h.cfg.Pool.AddAccount(a); p != nil && p.Auth != nil {
+	if p := h.cfg.Pool.AddAccount(a); p != nil && p.AuthSnapshot() != nil {
 		// 刚登录的账号先不探测：用户很可能马上就要用，探测占用的上游会话
 		// 槽位释放很慢，会把第一个真实请求挤到排队。
 		noteTraffic(a.UserID)
@@ -551,7 +577,11 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 
 	var sets [][]upstream.ModelInfo
 	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct.Auth == nil || !h.cfg.Pool.Healthy(acct.Name) {
+		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		authz := acct.AuthSnapshot()
+		if authz == nil {
 			continue
 		}
 		if !upstream.AccountCatalogStale(acct.UID) {
@@ -560,7 +590,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 				continue
 			}
 		}
-		infos, err := h.cfg.Upstream.FetchModels(acct.Auth) // 成功即写入该账号目录
+		infos, err := h.cfg.Upstream.FetchModels(authz) // 成功即写入该账号目录
 		if err != nil {
 			log.Printf("model discovery failed for account %s: %v", acct.Name, err)
 			if h.cfg.Telemetry != nil {
@@ -640,13 +670,17 @@ func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.A
 // 刚发现过的账号不会被重复打，上游某一路挂了也不会每次请求都空等超时。
 func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
 	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct == nil || acct.Auth == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		authz := acct.AuthSnapshot()
+		if authz == nil {
 			continue
 		}
 		if !upstream.AccountCatalogStale(acct.UID) {
 			continue
 		}
-		if _, err := h.cfg.Upstream.FetchModels(acct.Auth); err != nil {
+		if _, err := h.cfg.Upstream.FetchModels(authz); err != nil {
 			log.Printf("lazy model discovery failed for account %s: %v", acct.Name, err)
 		}
 	}
@@ -722,17 +756,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
-	// 为整条 Agent 工具链固定 CodeArts 内置 chat_id 与账号亲和。V2 接口
-	// 不保留语义上下文，所以每轮仍重放完整 OpenAI 历史。
+	// 显式会话 ID 用于账号亲和与响应侧 X-Codearts-Chat-Id；上游不接收 chat_id。
+	// V2 不保留语义上下文，所以每轮仍重放完整 OpenAI 历史。
 	explicitChat := validChatID(req.ConversationID)
 	stickyAcct := ""
 	if explicitChat {
 		h.convMu.Lock()
-		stickyAcct = h.convAcct[req.ConversationID]
+		stickyAcct = h.convAcct[req.ConversationID].Account
 		h.convMu.Unlock()
 	}
 	msgs := buildUpstreamMessages(req, toolsOn)
+	turnKey := upstreamTurnKey(req)
 
 	// 已经确认「所有健康账号都用不了这个模型」时直接快速失败：不必再打上游、
 	// 也不必把账号轮转一遍（轮转只会拿到同样的 not registered / benefit not found）。
@@ -760,13 +794,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.Get(stickyAcct)
 			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
 				stickyAcct = ""
-				acct = h.cfg.Pool.PickExcluding(tried)
+				acct = h.pickAccount(tried, model)
 			} else {
 				tried[acct.Name] = true
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.pickAccount(tried, model)
 		}
 		if acct == nil {
 			break
@@ -785,18 +819,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
 			continue
 		}
+		lockHeld := true
+		releaseLock := func() {
+			if lockHeld {
+				h.cfg.Pool.ReleaseLock(acct.Name)
+				lockHeld = false
+			}
+		}
 		if rec != nil {
 			rec.record.QueueWaitMs = time.Since(queueStart).Milliseconds()
 		}
 
 		ok, verr := h.cfg.Pool.Validate(acct)
 		if verr == nil && !ok {
-			h.cfg.Pool.ReleaseLock(acct.Name)
+			releaseLock()
 			lastErr = errors.New("token invalid")
 			continue
 		}
 		if verr != nil {
-			h.cfg.Pool.ReleaseLock(acct.Name)
+			releaseLock()
 			lastErr = verr
 			continue
 		}
@@ -807,12 +848,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		chatID := req.ConversationID
-		// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
+		// chat_id 仅用于本网关亲和/日志/响应头，统一为 32 位十六进制；无显式 id 时每次新建。
 		if !validChatID(chatID) {
 			chatID = randHex(32)
 		}
+		msgID := h.upstreamMsgIDFor(acct.UID, turnKey)
 
-		token, accessKeyID, secretAccessKey := acct.Auth.Credentials()
+		authz := acct.AuthSnapshot()
+		token, accessKeyID, secretAccessKey := authz.Credentials()
 		cred := upstream.SignCredential{
 			AccessKeyID:     accessKeyID,
 			SecretAccessKey: secretAccessKey,
@@ -820,6 +863,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		chatOpts := upstream.ChatOptions{
 			ReasoningEffort: req.ReasoningEffort,
+			MessageID:       msgID,
+			SessionID:       upstreamSessionID(acct.UID, chatID),
 			MaxTokens:       req.MaxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
@@ -839,14 +884,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if rec != nil {
 				rec.record.Attempts++
 			}
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			if serr == nil && rec != nil {
+				rec.record.UpstreamMsgID = msgID
+			}
 			if serr == nil {
 				break
 			}
 			var ae *upstream.ApiError
-			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && acct.Auth.Refresh() != "" {
+			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && authz.Refresh() != "" {
 				if rerr := h.cfg.Pool.RefreshToken(acct.Name); rerr == nil {
-					token, accessKeyID, secretAccessKey = acct.Auth.Credentials()
+					authz = acct.AuthSnapshot()
+					token, accessKeyID, secretAccessKey = authz.Credentials()
 					cred = upstream.SignCredential{
 						AccessKeyID:     accessKeyID,
 						SecretAccessKey: secretAccessKey,
@@ -862,17 +911,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
-				h.cfg.Pool.ReleaseLock(acct.Name)
+				releaseLock()
 				select {
 				case <-time.After(h.cfg.QueueRetryDelay):
 				case <-r.Context().Done():
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
 				}
-				if !h.cfg.Pool.AcquireLockWait(acct.Name, 30*time.Second) {
+				if !h.cfg.Pool.AcquireLockWait(acct.Name, h.cfg.QueueReacquireTimeout) {
 					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
 					break
 				}
+				lockHeld = true
 				continue
 			}
 			break // 非并发错误，跳出重试
@@ -891,7 +941,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if modelDenied {
 				markUnusable(acct.UID, model, modelAccessDeniedReason)
 			}
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			releaseLock() // 释放槽位再换号
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
@@ -908,10 +958,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastErr = serr
-			if readCompletion {
-				h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, serr.Error())
-				continue
-			}
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
@@ -922,28 +968,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		noteTraffic(acct.UID)
 
+		fetchCreditUsage := func() *upstream.CreditUsage {
+			if !acct.Client.CreditUsageEnabled() {
+				return nil
+			}
+			queryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			usage, err := acct.Client.FetchCreditUsage(queryCtx, msgID, cred)
+			if err != nil {
+				log.Printf("credit usage query failed account=%s msg=%s: %v", acct.Name, msgID, err)
+				return nil
+			}
+			return usage
+		}
+
 		w.Header().Set("X-Codearts-Chat-Id", chatID)
+		if rec != nil {
+			rec.record.ChatID = chatID
+		}
 
 		storeChat := func() {
 			// 仅缓存显式会话，便于同 conversation_id 续聊；不把一次性测连写进账号默认会话。
 			if !explicitChat {
 				return
 			}
-			h.convMu.Lock()
-			h.chats[acct.Name] = chatID
-			h.convAcct[req.ConversationID] = acct.Name // 黏性路由：续接锁定同账号
-			h.convMu.Unlock()
-			h.saveChats()
+			h.storeConversation(req.ConversationID, acct.Name)
 		}
 		if req.Stream {
+			var streamedComp *upstream.RawCompletion
 			var usage func(*upstream.RawCompletion) map[string]any
 			if req.IncludeUsage {
 				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
 			}
 			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
+				streamedComp = comp
 				storeChat()
-				applyCompletionMetrics(rec, msgs, comp)
-				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
 			}, usage)
 			rc.Close()
@@ -952,23 +1011,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if rec != nil && rec.record.ErrorType == "" {
 					rec.record.ErrorType = "stream_error"
 				}
-				if upstreamUnavailableReason(werr) == modelAccessDeniedReason {
-					markUnusable(acct.UID, model, modelAccessDeniedReason)
-				} else if !isParamInvalidError(werr) {
-					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-				}
+				h.handleUpstreamError(acct, model, werr)
 			} else {
 				markUsable(acct.UID, model)
 				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+			releaseLock()
+			if werr == nil && streamedComp != nil {
+				if streamedComp.CreditUsage == nil {
+					streamedComp.CreditUsage = fetchCreditUsage()
+				}
+				applyCompletionMetrics(rec, msgs, streamedComp)
+			}
 			return
 		}
 
 		markUsable(acct.UID, model)
-		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
+		releaseLock()
 
 		content, finish := comp.Content, comp.Finish
+		if comp.CreditUsage == nil {
+			comp.CreditUsage = fetchCreditUsage()
+		}
 		applyCompletionMetrics(rec, msgs, comp)
 		calls := fromUpstreamToolCalls(comp.ToolCalls)
 		// 原生 tool_calls 是 GLM-5.2 的主路径。仅保留文本协议解析作为
@@ -1004,7 +1068,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
-// Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
+// 会话亲和只在网关侧维护；多轮语义由完整 messages 承载。
 func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessage {
 	_ = toolsOn // 保留参数以稳定内部调用面；工具 schema 由 ChatOptions 原生传递。
 	keepCalls, keepResults := pairedToolMessages(req.Messages)
@@ -1183,7 +1247,13 @@ func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err erro
 		return false
 	}
 	var ae *upstream.ApiError
-	if errors.As(err, &ae) {
+	if !errors.As(err, &ae) {
+		var streamErr *upstream.UpstreamError
+		if errors.As(err, &streamErr) {
+			ae = streamErr.APIError()
+		}
+	}
+	if ae != nil {
 		// 「模型对这个账号不可用」是账号能力问题，不是账号故障，必须在状态码分支
 		// **之前**判断：not registered / benefit not found 会被嵌入错误包装成
 		// 5xx，落到下面的 `ae.Status >= 500` 就把健康账号冷却 10 分钟——实测
@@ -1289,6 +1359,7 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 func randHex(n int) string {
 	b := make([]byte, (n+1)/2)
 	if _, err := crand.Read(b); err != nil {
+		log.Printf("crypto/rand failed; using timestamp-only chat ID: %v", err)
 		seed := fmt.Sprintf("%x", time.Now().UnixNano())
 		for len(seed) < n {
 			seed += seed
@@ -1310,7 +1381,7 @@ func validChatID(s string) bool {
 	return true
 }
 
-func (h *Handler) loadChats() {
+func (h *Handler) loadConversations() {
 	if h.cfg.ConvStateFile == "" {
 		return
 	}
@@ -1318,16 +1389,118 @@ func (h *Handler) loadChats() {
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(raw, &h.chats)
+	var state conversationState
+	if json.Unmarshal(raw, &state) != nil {
+		return
+	}
+	now := time.Now()
+	for id, binding := range state.Conversations {
+		if validChatID(id) && binding.Account != "" && !binding.UpdatedAt.IsZero() && now.Sub(binding.UpdatedAt) < conversationBindingTTL {
+			h.convAcct[id] = binding
+		}
+	}
+	for key, binding := range state.Turns {
+		if binding.ID != "" && !binding.UpdatedAt.IsZero() && now.Sub(binding.UpdatedAt) < conversationBindingTTL {
+			h.turnIDs[key] = binding
+		}
+	}
+	h.pruneConversationsLocked(now)
 }
 
-func (h *Handler) saveChats() {
+func (h *Handler) storeConversation(id, account string) {
+	if !validChatID(id) || account == "" {
+		return
+	}
+	h.convMu.Lock()
+	now := time.Now()
+	h.pruneConversationsLocked(now)
+	h.convAcct[id] = conversationBinding{Account: account, UpdatedAt: now}
+	err := h.saveConversationsLocked()
+	h.convMu.Unlock()
+	if err != nil {
+		log.Printf("save conversation state: %v", err)
+	}
+}
+
+// upstreamSessionID 派生官方 x-ot-session-id：同一账号+同一会话稳定不变，
+// 换账号即换会话 ID（官方会话与账号 1:1，计费/亲和都按签名账号归属）。
+func upstreamSessionID(accountUID, chatID string) string {
+	sum := sha256.Sum256([]byte("codearts-session:" + accountUID + ":" + chatID))
+	return hex.EncodeToString(sum[:16])
+}
+
+// upstreamMsgIDFor returns a stable upstream message ID for one account and
+// one logical user turn. The same account reuses it across tool continuations
+// and retries; a different account gets its own ID because credit usage is
+// queried with that account's credentials.
+func (h *Handler) upstreamMsgIDFor(accountUID, turnKey string) string {
+	if accountUID == "" || turnKey == "" {
+		return upstream.NewUpstreamMsgID(time.Now())
+	}
+	key := accountUID + "\x00" + turnKey
+	h.convMu.Lock()
+	now := time.Now()
+	h.pruneConversationsLocked(now)
+	if binding, ok := h.turnIDs[key]; ok && binding.ID != "" {
+		id := binding.ID
+		h.convMu.Unlock()
+		return id
+	}
+	id := upstream.NewUpstreamMsgID(now)
+	h.turnIDs[key] = turnIDBinding{ID: id, UpdatedAt: now}
+	err := h.saveConversationsLocked()
+	h.convMu.Unlock()
+	if err != nil {
+		log.Printf("save turn id state: %v", err)
+	}
+	return id
+}
+
+func (h *Handler) pruneConversationsLocked(now time.Time) {
+	for id, binding := range h.convAcct {
+		if binding.UpdatedAt.IsZero() || now.Sub(binding.UpdatedAt) >= conversationBindingTTL {
+			delete(h.convAcct, id)
+		}
+	}
+	for len(h.convAcct) >= maxConversationBindings {
+		oldestID := ""
+		var oldest time.Time
+		for id, binding := range h.convAcct {
+			if oldestID == "" || binding.UpdatedAt.Before(oldest) {
+				oldestID, oldest = id, binding.UpdatedAt
+			}
+		}
+		delete(h.convAcct, oldestID)
+	}
+	for key, binding := range h.turnIDs {
+		if binding.UpdatedAt.IsZero() || now.Sub(binding.UpdatedAt) >= conversationBindingTTL {
+			delete(h.turnIDs, key)
+		}
+	}
+	for len(h.turnIDs) >= maxConversationBindings {
+		oldestKey := ""
+		var oldest time.Time
+		for key, binding := range h.turnIDs {
+			if oldestKey == "" || binding.UpdatedAt.Before(oldest) {
+				oldestKey, oldest = key, binding.UpdatedAt
+			}
+		}
+		delete(h.turnIDs, oldestKey)
+	}
+}
+
+// saveConversationsLocked serializes and writes while convMu is held, keeping
+// both the map snapshot and the shared temporary file exclusive to one writer.
+func (h *Handler) saveConversationsLocked() error {
 	if h.cfg.ConvStateFile == "" {
-		return
+		return nil
 	}
-	raw, _ := json.MarshalIndent(h.chats, "", "  ")
+	raw, err := json.MarshalIndent(conversationState{Conversations: h.convAcct, Turns: h.turnIDs}, "", "  ")
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(h.cfg.ConvStateFile+".tmp", raw, 0o600); err != nil {
-		return
+		return err
 	}
-	_ = os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
+	return os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
 }

@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -86,6 +88,18 @@ func TestAggregateCodeArtsSnapshot(t *testing.T) {
 	}
 	if rc.Content != "你好世界" {
 		t.Fatalf("content=%q", rc.Content)
+	}
+}
+
+func TestStreamRejectsRewrittenSnapshot(t *testing.T) {
+	stream := strings.NewReader("data: {\"text\":\"abc\"}\n\ndata: {\"text\":\"ax\"}\n\n")
+	rec := httptest.NewRecorder()
+	err := Stream(rec, stream, "glm-5.2")
+	if err == nil || !strings.Contains(err.Error(), "replaced already streamed content") {
+		t.Fatalf("rewritten snapshot error=%v", err)
+	}
+	if !strings.Contains(rec.Body.String(), `"content":"abc"`) || !strings.Contains(rec.Body.String(), "event: error") {
+		t.Fatalf("rewritten snapshot response=%s", rec.Body.String())
 	}
 }
 
@@ -166,24 +180,174 @@ func TestPKCE(t *testing.T) {
 }
 
 func TestChatHeaders(t *testing.T) {
-	h := ChatHeadersV2("tok", "trace-1", "zh-cn")
-	if h["x-auth-token"] != "tok" || h["Accept"] != "text/event-stream" || h["app-id"] != "CodeAgent3.0" {
+	h := ChatHeadersV2("tok", "trace-1")
+	if h["x-auth-token"] != "tok" || h["Accept"] != "text/event-stream" ||
+		h["x-ot-client-type"] != "desktop" || h["x-ot-client-version"] != ClientVersion {
 		t.Fatalf("headers=%v", h)
 	}
 	if _, has := h["Agent-Type"]; has {
 		t.Fatalf("v2 headers must not contain Agent-Type: %v", h)
 	}
+	for _, absent := range []string{"app-id", "X-Language", "is_confidential"} {
+		if _, has := h[absent]; has {
+			t.Fatalf("official kernel does not send %s: %v", absent, h)
+		}
+	}
 }
 
-func TestChatBodyV2CarriesBuiltInAgentChatID(t *testing.T) {
+func TestChatStreamSendsOfficialIdentityHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.Header.Clone()
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	c := NewWithChatEndpoint(5*time.Second, srv.URL)
+	rc, err := c.ChatStreamWithOptions(context.Background(),
+		[]ChatMessage{{Role: "user", Content: "hi"}}, "trace",
+		SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"}, "user",
+		"glm-5.2", ChatOptions{MessageID: "msg_test_123", SessionID: "sess-test-123"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	h := got.Clone()
+	mu.Unlock()
+	if h.Get("x-ot-session-id") != "sess-test-123" {
+		t.Fatalf("x-ot-session-id=%q", h.Get("x-ot-session-id"))
+	}
+	if h.Get("model-id") != "GLM-5.2" || h.Get("model-name") != "GLM-5.2" {
+		t.Fatalf("model headers: id=%q name=%q", h.Get("model-id"), h.Get("model-name"))
+	}
+	if h.Get("x-ot-client-version") != ClientVersion {
+		t.Fatalf("x-ot-client-version=%q", h.Get("x-ot-client-version"))
+	}
+	authz := h.Get("Authorization")
+	for _, signed := range []string{"x-ot-session-id", "model-id", "model-name", "user-msg-id"} {
+		if !strings.Contains(authz, signed) {
+			t.Fatalf("SignedHeaders must cover %s: %s", signed, authz)
+		}
+	}
+}
+
+func TestNewUpstreamMsgIDShape(t *testing.T) {
+	id := NewUpstreamMsgID(time.Now())
+	if len(id) != 30 || !strings.HasPrefix(id, "msg_") {
+		t.Fatalf("unexpected msg id: %q", id)
+	}
+	for _, value := range id[4:] {
+		if !(value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z') {
+			t.Fatalf("invalid msg id suffix: %q", id)
+		}
+	}
+}
+
+func TestNewUpstreamMsgIDSequence(t *testing.T) {
+	// Use a timestamp far ahead of any other test so the first call resets
+	// the global clock state to a known millisecond.
+	base := time.Now().Add(48 * time.Hour)
+	first := NewUpstreamMsgID(base)
+	second := NewUpstreamMsgID(base)
+	stamp1, err := strconv.ParseUint(first[4:16], 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp2, err := strconv.ParseUint(second[4:16], 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMS := uint64(base.UnixMilli()) & ((1 << 36) - 1)
+	if stamp1>>12 != wantMS || stamp2>>12 != wantMS {
+		t.Fatalf("millisecond mismatch: %x %x want %x", stamp1>>12, stamp2>>12, wantMS)
+	}
+	if stamp1&0xFFF != 1 || stamp2&0xFFF != 2 {
+		t.Fatalf("sequence mismatch: %x %x", stamp1&0xFFF, stamp2&0xFFF)
+	}
+	if first[16:] == second[16:] {
+		t.Fatalf("random suffix collided: %q", first)
+	}
+}
+
+func TestChatStreamSendsUserMsgID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("user-msg-id") != "msg_test_1234567890" {
+			t.Errorf("missing user-msg-id: %q", r.Header.Get("user-msg-id"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	c := NewWithChatEndpoint(time.Second, srv.URL)
+	rc, err := c.ChatStreamWithOptions(context.Background(),
+		[]ChatMessage{{Role: "user", Content: "hi"}}, "trace",
+		SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"}, "user",
+		"glm-5.2", ChatOptions{MessageID: "msg_test_1234567890"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFetchCreditUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != EpCreditUsage || r.URL.Query().Get("type") != "msg" ||
+			r.URL.Query().Get("id") != "msg_test_1234567890" {
+			t.Errorf("wrong credit usage URL: %s", r.URL)
+		}
+		if r.Header.Get("Agent-Type") != "PromptCenter" || r.Header.Get("X-Security-Token") != "token" {
+			t.Error("missing signed PromptCenter credentials")
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"creditCost":0.37,"cacheHitRatio":0.61,"promptTokenUsed":10,"completionTokenUsed":2,"cachedTokenUsed":6,"totalTokenUsed":12,"requestCount":2}}`))
+	}))
+	defer srv.Close()
+
+	c := New(time.Second)
+	c.snapBase = srv.URL
+	usage, err := c.FetchCreditUsage(context.Background(), "msg_test_1234567890", SignCredential{
+		AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.CreditCost != 0.37 || usage.CacheHitRatio != 0.61 || usage.TotalTokenUsed != 12 || usage.RequestCount != 2 {
+		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+func TestNewUsesConfiguredHTTPTimeout(t *testing.T) {
+	client := New(7 * time.Second)
+	if client.http.Timeout != 7*time.Second {
+		t.Fatalf("client timeout=%s", client.http.Timeout)
+	}
+	transport := client.http.Transport.(*http.Transport)
+	if transport.ResponseHeaderTimeout != 7*time.Second {
+		t.Fatalf("response header timeout=%s", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestChatBodyV2OmitsGatewayOnlyFields(t *testing.T) {
 	body := chatBodyV2(
-		"0123456789abcdef0123456789abcdef",
 		[]ChatMessage{{Type: "text", Text: "continue after tool result"}},
 		"glm-5.2",
 		ChatOptions{},
 	)
-	if body["chat_id"] != "0123456789abcdef0123456789abcdef" {
-		t.Fatalf("chat_id missing from upstream body: %#v", body)
+	for _, absent := range []string{"chat_id", "prompt_cache_key"} {
+		if _, has := body[absent]; has {
+			t.Fatalf("official kernel does not send %s: %#v", absent, body)
+		}
 	}
 	if body["model"] != "GLM-5.2" {
 		t.Fatalf("model not canonicalized: %#v", body)
