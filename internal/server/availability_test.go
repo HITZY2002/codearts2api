@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -154,7 +156,7 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 		Code: 502, Status: 502, Path: "/api/v2/chat/completions",
 		Message: "InferHub.002002009.404 The model is not registered, please request other model",
 	}
-	if !h.handleUpstreamError(p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
+	if !h.handleUpstreamError(nil, p.Get("u-cool"), "GLM-5.2-ArkTS-SPARK", err404) {
 		t.Error("模型级错误应返回 true，让调用方立即结束轮转")
 	}
 
@@ -164,5 +166,53 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 	st, reason := modelAvailability("u-cool", "GLM-5.2-ArkTS-SPARK")
 	if st != availUnusable || reason == "" {
 		t.Errorf("应记为模型不可用，got state=%v reason=%q", st, reason)
+	}
+}
+
+// 客户端断开/取消（点「停止」、网络闪断）不是账号故障：不记账、不冷却。
+// 此前普通 error 落到 NoteError，累计 3 次把健康账号冷却 10 分钟。
+func TestClientDisconnectNotPenalized(t *testing.T) {
+	a := &auth.Auth{UserID: "u-cancel", UserName: "u-cancel", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(5 * time.Second), ErrCooldown: time.Minute, ErrThreshold: 3})
+	acct := p.Get("u-cancel")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil).WithContext(ctx)
+	cancel() // 模拟客户端已断开
+
+	for i := 0; i < 5; i++ {
+		if h.handleUpstreamError(req, acct, "glm-5.2", errors.New("client gone")) {
+			t.Fatal("客户端断开不应判为模型级错误")
+		}
+	}
+	for i, v := range p.List() {
+		if name := v["name"].(string); name == "u-cancel" {
+			if n, _ := v["err_count"].(int); n != 0 {
+				t.Errorf("断开不应计入 err_count，第 %d 次 got=%d", i+1, n)
+			}
+			if cooling, _ := v["cooling"].(bool); cooling {
+				t.Error("断开不得触发冷却")
+			}
+		}
+	}
+
+	// 反例：请求 context 正常时，同样的普通错误必须照常记账（3 次到阈值冷却）。
+	okReq := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	for i := 0; i < 3; i++ {
+		h.handleUpstreamError(okReq, acct, "glm-5.2", errors.New("upstream hiccup"))
+	}
+	for _, v := range p.List() {
+		if name := v["name"].(string); name == "u-cancel" {
+			if n, _ := v["err_count"].(int); n < 3 {
+				t.Errorf("正常错误应累计 err_count，got=%d", n)
+			}
+			if cooling, _ := v["cooling"].(bool); !cooling {
+				t.Error("达到阈值后应冷却")
+			}
+		}
 	}
 }

@@ -109,9 +109,27 @@ func TestChatCompletionsStreamsNativeToolCallsWithoutBuffering(t *testing.T) {
 		close(releaseUpstream)
 		t.Fatal(err)
 	}
-	if !strings.Contains(firstEvent, `"reasoning_content":"checking"`) {
+	// OpenAI 规范首 chunk 带 role（引导块注入），首个上游内容分块必须紧随其后：
+	// 流式不被缓冲的判定移到第二个事件上。
+	if !strings.Contains(firstEvent, `"role":"assistant"`) {
 		close(releaseUpstream)
-		t.Fatalf("first streamed event=%q", firstEvent)
+		t.Fatalf("first streamed event should be the leading role chunk, got %q", firstEvent)
+	}
+	secondEvent := ""
+	for {
+		line, rerr := reader.ReadString('\n')
+		if rerr != nil {
+			close(releaseUpstream)
+			t.Fatal(rerr)
+		}
+		if strings.TrimSpace(line) != "" {
+			secondEvent = line
+			break
+		}
+	}
+	if !strings.Contains(secondEvent, `"reasoning_content":"checking"`) {
+		close(releaseUpstream)
+		t.Fatalf("second streamed event=%q", secondEvent)
 	}
 
 	close(releaseUpstream)
@@ -119,7 +137,7 @@ func TestChatCompletionsStreamsNativeToolCallsWithoutBuffering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream := firstEvent + string(rest)
+	stream := firstEvent + secondEvent + string(rest)
 	if !strings.Contains(stream, `"tool_calls"`) || !strings.Contains(stream, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("native tool stream was not preserved: %s", stream)
 	}

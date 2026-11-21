@@ -257,6 +257,51 @@ func replaceSnapshot(content *textBuffer, t string, upErr *error, check bool) {
 	content.WriteString(t)
 }
 
+// textFrom 从 JSON 对象按序取第一个出现的字符串字段。
+func textFrom(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// chunkError 识别错误帧。扁平形态：error_code/code 为非 "0" 字符串即错误；
+// 嵌套形态：OpenAI 风格 error 对象。官方内核对 v2 流内错误做的是 in-band
+// 检测（agent-kernel.exe crates\llm\adapters\src\lib.rs，"In-band stream
+// error"），扁平与嵌套两种形态都要识别。返回 nil 表示这不是错误帧，
+// 调用方继续按正常帧处理（error_code=0 的帧是正常帧）。
+func chunkError(payload map[string]any) *UpstreamError {
+	if payload == nil {
+		return nil
+	}
+	if code := textFrom(payload, "error_code", "code"); code != "" {
+		if code == "0" {
+			return nil
+		}
+		return &UpstreamError{Code: code, Msg: firstNonEmpty(textFrom(payload, "error_msg", "message", "msg"), "request failed")}
+	}
+	eobj, ok := payload["error"].(map[string]any)
+	if !ok {
+		// error 为字符串（非标准信封）：整串即错误消息。
+		if es, isStr := payload["error"].(string); isStr && es != "" {
+			return &UpstreamError{Code: "error", Msg: es}
+		}
+		return nil
+	}
+	msg := textFrom(eobj, "message", "error_msg", "msg")
+	code := textFrom(eobj, "error_code", "code")
+	if code == "0" {
+		return nil
+	}
+	if code == "" {
+		// 无错误码：error 对象本身就是失败信号（对齐官方 "provider reported a stream error"）
+		return &UpstreamError{Code: "error", Msg: firstNonEmpty(msg, "provider reported a stream error")}
+	}
+	return &UpstreamError{Code: code, Msg: firstNonEmpty(msg, "request failed")}
+}
+
 // applyEvent 把单事件应用到聚合状态。
 func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event, data string, checkSnapshot bool) {
 	event = strings.ToLower(strings.TrimSpace(event))
@@ -281,9 +326,10 @@ func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event
 			}
 			return
 		}
-		// 纯 data 行（CodeArts 部分响应无 event 前缀）
-		if code := text("error_code", "code"); code != "" && code != "0" {
-			*upErr = &UpstreamError{Code: code, Msg: firstNonEmpty(text("error_msg", "message", "msg"), "request failed")}
+		// 纯 data 行（CodeArts 部分响应无 event 前缀）：扁平 error_code 与
+		// 嵌套 error 对象（官方内核同款 in-band 检测）都要识别。
+		if ue := chunkError(payload); ue != nil {
+			*upErr = ue
 			return
 		}
 		// OpenAI 风格 delta：{choices:[{delta:{content,reasoning_content}}]} → 增量追加
@@ -334,8 +380,8 @@ func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event
 		// 纯 structured QA 帧（无 text）：仅正文仍空时取 answer，避免整段 JSON 当回复
 		tryFillStructuredAnswer(content, payload)
 	case "onanswer", "answer", "delta", "message", "content":
-		if code := text("error_code", "code"); code != "" && code != "0" {
-			*upErr = &UpstreamError{Code: code, Msg: firstNonEmpty(text("error_msg", "message", "msg"), "request failed")}
+		if ue := chunkError(payload); ue != nil {
+			*upErr = ue
 			return
 		}
 		delta, finishReason := deltaFromChunk(payload)
@@ -364,9 +410,35 @@ func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event
 		if t := text("text", "reasoning", "content", "thinking"); t != "" {
 			reason.WriteString(t)
 		}
+	case "error":
+		// 上游显式错误事件（见文件头注释）：此前无分支，会被聚合成
+		// 「空内容成功」。结构化载荷交给 chunkError（error_code=0 视为正常帧）。
+		if ue := chunkError(payload); ue != nil {
+			*upErr = ue
+			return
+		}
+		if payload != nil {
+			// error_code=0 是正常帧；除此之外，error 事件里任何无可识别
+			// 错误码的结构化载荷都不能当成功流（独立验证发现的吞错误缺口）。
+			if code := textFrom(payload, "error_code", "code"); code == "" {
+				if _, hasErr := payload["error"]; !hasErr {
+					*upErr = &UpstreamError{Code: "error", Msg: firstNonEmpty(
+						textFrom(payload, "message", "error_msg", "msg"),
+						strings.TrimSpace(data), "request failed")}
+				}
+			}
+			return
+		}
+		if msg := strings.TrimSpace(data); msg != "" {
+			// 纯文本/非 JSON 载荷：整段 data 即错误消息。
+			*upErr = &UpstreamError{Code: "error", Msg: msg}
+			return
+		}
+		// 空载荷的 error 事件同样不能当作成功流。
+		*upErr = &UpstreamError{Code: "error", Msg: "request failed"}
 	case "done", "end", "finish":
-		if code := text("error_code", "code"); code != "" && code != "0" {
-			*upErr = &UpstreamError{Code: code, Msg: firstNonEmpty(text("error_msg", "message", "msg"), "request failed")}
+		if ue := chunkError(payload); ue != nil {
+			*upErr = ue
 			return
 		}
 		if f := text("finish_reason", "finish", "reason"); f != "" {
@@ -388,8 +460,9 @@ func tryFillStructuredAnswer(content *textBuffer, obj map[string]any) {
 	}
 }
 
-// unwrapQAContent 移除可能的 ```markdown 或 ```json 等包装，
+// unwrapQAContent 移除 v1 通道已知的 ```markdown / ```json 包装，
 // 若内容本身是结构化问答 JSON，则直接提取 answer。
+// 其他语言的围栏与裸围栏是模型正文，原样保留（对齐官方内核行为）。
 func unwrapQAContent(s string) string {
 	trimmed := strings.TrimSpace(s)
 	// 裸 JSON 字符串：模型把整段 QA JSON 写进 text
@@ -404,7 +477,11 @@ func unwrapQAContent(s string) string {
 		if len(lines) >= 3 {
 			first := strings.ToLower(strings.TrimSpace(lines[0]))
 			last := strings.ToLower(strings.TrimSpace(lines[len(lines)-1]))
-			if (strings.HasPrefix(first, "```markdown") || strings.HasPrefix(first, "```json") || strings.HasPrefix(first, "```")) && last == "```" {
+			// 仅剥 v1 通道已知的 ```markdown / ```json 包装（逆向 docstring）。
+			// 其他围栏（```python、裸 ``` 等）是模型自己的代码块，必须保留：
+			// 官方内核对正文不做任何围栏处理（agent-kernel.exe llm adapters
+			// 无围栏逻辑，```markdown 字符串全部来自系统提示词模板）。
+			if (strings.HasPrefix(first, "```markdown") || strings.HasPrefix(first, "```json")) && last == "```" {
 				content := strings.Join(lines[1:len(lines)-1], "\n")
 				if obj, ok := parseQAJSON(content); ok {
 					if ans, ok := obj["answer"].(string); ok {
@@ -610,6 +687,12 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		return nil
 	}
 
+	// OpenAI 规范：流式首个 delta 带 role。注入引导 chunk（对齐官方 SDK 行为），
+	// 后续上游若自带 role 也不再重复透传。
+	if werr := writeChunk(map[string]any{"role": "assistant", "content": ""}, ""); werr != nil {
+		return werr
+	}
+
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -654,9 +737,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 				break
 			}
 			delta := map[string]any{}
-			if role, ok := nativeDelta["role"].(string); ok && role != "" {
-				delta["role"] = role
-			}
+			// role 已由引导 chunk 注入，上游自带 role 不重复透传。
 			if content.Len() > beforeLen {
 				delta["content"] = content.tail(beforeLen)
 			}

@@ -961,6 +961,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 		}
 		if serr != nil {
+			if isClientDisconnect(r, serr) {
+				// 客户端已断开：不记账、不轮转。换号续传不可能成功，
+				// 且每轮 AcquireLockWait 最长阻塞 180s，纯属空耗。
+				releaseLock()
+				if rec != nil {
+					rec.record.ErrorType = "client_cancelled"
+				}
+				return
+			}
 			if rec != nil && rec.record.ErrorType == "" {
 				rec.record.ErrorType = "upstream_error"
 			}
@@ -985,7 +994,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastErr = serr
-			if h.handleUpstreamError(acct, model, serr) {
+			if h.handleUpstreamError(r, acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
 					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
@@ -1035,10 +1044,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			if werr != nil {
 				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if rec != nil && rec.record.ErrorType == "" {
-					rec.record.ErrorType = "stream_error"
+				if isClientDisconnect(r, werr) {
+					// 用户点「停止」/断网不是账号故障：不记账、不冷却
+					//（否则累计 3 次会把健康账号冷却 10 分钟）。
+					if rec != nil {
+						rec.record.ErrorType = "client_cancelled"
+					}
+				} else {
+					if rec != nil && rec.record.ErrorType == "" {
+						rec.record.ErrorType = "stream_error"
+					}
+					h.handleUpstreamError(r, acct, model, werr)
 				}
-				h.handleUpstreamError(acct, model, werr)
 			} else {
 				markUsable(acct.UID, model)
 				h.cfg.Pool.NoteSuccess(acct.Name)
@@ -1115,7 +1132,12 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 	for i, m := range req.Messages {
 		switch m.Role {
 		case "system", "user":
-			out = append(out, upstream.ChatMessage{Role: m.Role, Content: m.Text})
+			var content any = m.Text
+			if len(m.ContentParts) > 0 {
+				// 多模态分片数组原样透传（官方 v2 接受 OpenAI content 形态）。
+				content = m.ContentParts
+			}
+			out = append(out, upstream.ChatMessage{Role: m.Role, Content: content})
 		case "assistant":
 			reasoning := m.ReasoningContent
 			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
@@ -1278,10 +1300,22 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 	return resp
 }
 
+// isClientDisconnect 判断错误是否由客户端断开/取消引起（流式 UI 点「停止」、
+// 网络闪断是常态操作）。这类情况不是账号故障：不记账、不冷却、不轮转换号。
+func isClientDisconnect(r *http.Request, err error) bool {
+	if r != nil && r.Context().Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
 // handleUpstreamError 记录错误并决定是否处罚账号。
 // 返回 true 表示这是「模型对这个账号不可用」的模型级错误：调用方应立即结束
 // 轮转并向客户端返回明确错误（换账号也是同样的结果）。
-func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
+func (h *Handler) handleUpstreamError(r *http.Request, acct *pool.Account, model string, err error) bool {
+	if isClientDisconnect(r, err) {
+		return false
+	}
 	if isParamInvalidError(err) {
 		return false
 	}

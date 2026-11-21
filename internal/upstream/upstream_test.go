@@ -552,3 +552,124 @@ func TestSigner(t *testing.T) {
 		t.Fatalf("headers=%v", req.Header)
 	}
 }
+
+// 上游 event: error 事件此前无分支：upErr 永不置位，错误被吞成
+// 200 + 空内容的「成功」流。回归：必须传播为 UpstreamError。
+func TestAggregateErrorEvent(t *testing.T) {
+	stream := "data: {\"text\":\"部分回答\"}\n" +
+		"event: error\ndata: {\"error_code\":\"500\",\"error_msg\":\"upstream boom\"}\n\n"
+	rc, err := AggregateRaw(bytes.NewBufferString(stream))
+	var ue *UpstreamError
+	if err == nil || !errors.As(err, &ue) || ue.Msg != "upstream boom" {
+		t.Fatalf("event: error 应传播为 UpstreamError, got err=%v rc=%+v", err, rc)
+	}
+}
+
+// error_code=0 的 error 事件是正常帧，不得报错。
+func TestAggregateErrorEventZeroCodeIgnored(t *testing.T) {
+	stream := "data: {\"text\":\"你好\"}\n" +
+		"event: error\ndata: {\"error_code\":\"0\",\"error_msg\":\"\"}\n\n"
+	rc, err := AggregateRaw(bytes.NewBufferString(stream))
+	if err != nil {
+		t.Fatalf("error_code=0 不应报错: %v", err)
+	}
+	if rc.Content != "你好" {
+		t.Fatalf("content=%q", rc.Content)
+	}
+}
+
+// 纯文本/非 JSON 载荷的 error 事件：整段 data 即错误消息。
+func TestAggregateErrorEventPlainPayload(t *testing.T) {
+	stream := "event: error\ndata: internal server error\n\n"
+	_, err := AggregateRaw(bytes.NewBufferString(stream))
+	var ue *UpstreamError
+	if err == nil || !errors.As(err, &ue) || ue.Msg != "internal server error" {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// 流式转发：event: error 必须以 SSE 错误事件结束并向上返回错误，
+// 而不是发 [DONE] 当作成功。
+func TestStreamErrorEvent(t *testing.T) {
+	stream := "event: onAnswer\ndata: {\"text\":\"hi\"}\n\n" +
+		"event: error\ndata: {\"error_code\":\"500\",\"error_msg\":\"boom\"}\n\n"
+	rec := httptest.NewRecorder()
+	err := StreamCapture(rec, bytes.NewBufferString(stream), "m", nil)
+	var ue *UpstreamError
+	if err == nil || !errors.As(err, &ue) || ue.Msg != "boom" {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "event: error") {
+		t.Fatalf("客户端应收到 event: error, body=%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"finish_reason"`) && !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Fatalf("错误流仍应以 [DONE] 收尾, body=%s", rec.Body.String())
+	}
+}
+
+// 嵌套 error 对象（OpenAI 风格 in-band 错误）：官方内核对 v2 流内错误就是
+// 这种检测（agent-kernel.exe llm adapters，"In-band stream error"），网关此前
+// 只查扁平 error_code，嵌套形态会被吞成空内容成功。
+func TestInBandNestedErrorChunk(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}\n" +
+		"data: {\"error\":{\"code\":\"500\",\"message\":\"boom\"}}\n\n"
+	_, err := AggregateRaw(bytes.NewBufferString(stream))
+	var ue *UpstreamError
+	if err == nil || !errors.As(err, &ue) || ue.Msg != "boom" || ue.Code != "500" {
+		t.Fatalf("嵌套 error 对象应传播为 UpstreamError, got err=%v", err)
+	}
+}
+
+// 嵌套 error 对象只有 message：仍按失败处理（对齐官方 "provider reported a stream error"）。
+func TestInBandNestedErrorMessageOnly(t *testing.T) {
+	stream := "data: {\"error\":{\"message\":\"quota exceeded\"}}\n\n"
+	_, err := AggregateRaw(bytes.NewBufferString(stream))
+	var ue *UpstreamError
+	if err == nil || !errors.As(err, &ue) || ue.Msg != "quota exceeded" {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// 嵌套 error 对象 code=0：正常帧。
+func TestInBandNestedErrorZeroCode(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n" +
+		"data: {\"error\":{\"code\":\"0\"}}\n\n"
+	rc, err := AggregateRaw(bytes.NewBufferString(stream))
+	if err != nil {
+		t.Fatalf("code=0 不应报错: %v", err)
+	}
+	if rc.Content != "你好" {
+		t.Fatalf("content=%q", rc.Content)
+	}
+}
+
+// 语言围栏是模型正文：官方内核对正文不做任何围栏处理（逆向确认），
+// 此前 ```python 等整块输出会被误剥围栏，markdown 渲染退化。
+// 载荷用 json.Marshal 构造，确保 text 里的换行是合法的 JSON \n 转义。
+func TestFencePreservedForLanguageBlocks(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"text": "```python\nprint(1)\n```"})
+	done, _ := json.Marshal(map[string]any{"text": "[DONE]", "error_code": "0"})
+	stream := "data: " + string(body) + "\n" + "data: " + string(done) + "\n"
+	rc, err := AggregateRaw(bytes.NewBufferString(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "```python\nprint(1)\n```"
+	if rc.Content != want {
+		t.Fatalf("语言围栏应原样保留: got %q want %q", rc.Content, want)
+	}
+}
+
+// v1 通道已知的 ```markdown 包装仍然剥离（保留旧行为）。
+func TestMarkdownWrapperStillStripped(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{"text": "```markdown\n# 你好\n```"})
+	done, _ := json.Marshal(map[string]any{"text": "[DONE]", "error_code": "0"})
+	stream := "data: " + string(body) + "\n" + "data: " + string(done) + "\n"
+	rc, err := AggregateRaw(bytes.NewBufferString(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.Content != "# 你好" {
+		t.Fatalf("markdown 包装应剥离: got %q", rc.Content)
+	}
+}

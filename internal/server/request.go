@@ -22,8 +22,11 @@ type openAIToolCall struct {
 
 // openAIMessage 拍平后的一条消息。
 type openAIMessage struct {
-	Role             string
-	Text             string
+	Role string
+	Text string
+	// ContentParts user 多模态分片（text / image_url），nil 表示纯文本。
+	// 上游 v2 接受 content 数组（官方内核 image-analyze 同款形态），原样透传。
+	ContentParts     []map[string]any
 	ReasoningContent string
 	ToolCalls        []openAIToolCall
 	ToolCallID       string // role=tool 时对应的 call id
@@ -133,12 +136,21 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 	if err := json.Unmarshal(rm, &probe); err != nil {
 		return openAIMessage{}, err
 	}
+	parts, text, cerr := parseContentParts(probe.Content)
+	if cerr != nil {
+		return openAIMessage{}, cerr
+	}
 	m := openAIMessage{
 		Role:             strings.ToLower(strings.TrimSpace(probe.Role)),
-		Text:             flattenContent(probe.Content),
+		Text:             text,
 		ReasoningContent: probe.ReasoningContent,
 		ToolCallID:       probe.ToolCallID,
 		Name:             probe.Name,
+	}
+	// 仅 user 消息透传多模态分片；其余角色维持纯文本（assistant/tool 的
+	// content 数组对上游无意义）。
+	if len(parts) > 0 && m.Role == "user" {
+		m.ContentParts = parts
 	}
 	if len(probe.ToolCalls) > 0 && string(probe.ToolCalls) != "null" {
 		var calls []struct {
@@ -160,6 +172,48 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 		}
 	}
 	return m, nil
+}
+
+// parseContentParts 解析 content：string → (nil, s, nil)；分片数组 →
+// (parts, 拼接文本, nil)。支持的形态与官方内核 image-analyze 对齐
+// （text / image_url.data|https，agent-kernel.exe vlm_caller.rs 逆向确认）。
+// 其余分片类型显式报错——旧版静默丢弃 image_url，VL 模型"看不懂"且无提示。
+func parseContentParts(raw json.RawMessage) ([]map[string]any, string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, "", nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return nil, s, nil
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil, "", nil // 非 string 非数组：维持旧行为置空
+	}
+	var sb strings.Builder
+	out := make([]map[string]any, 0, len(parts))
+	for _, p := range parts {
+		switch t, _ := p["type"].(string); t {
+		case "text":
+			txt, _ := p["text"].(string)
+			sb.WriteString(txt)
+			out = append(out, map[string]any{"type": "text", "text": txt})
+		case "image_url":
+			iu, ok := p["image_url"].(map[string]any)
+			if !ok {
+				return nil, "", errors.New(`image_url part missing "image_url" object`)
+			}
+			if u, _ := iu["url"].(string); u == "" {
+				return nil, "", errors.New(`image_url part has empty "url"`)
+			}
+			sb.WriteString("[image]")
+			// image_url 对象整体保留（含 detail 等 OpenAI 字段），原样透传。
+			out = append(out, map[string]any{"type": "image_url", "image_url": iu})
+		default:
+			return nil, "", fmt.Errorf("unsupported content part type %q", t)
+		}
+	}
+	return out, sb.String(), nil
 }
 
 // flattenContent 拍平 string / 分片 content 为纯文本。
@@ -243,6 +297,13 @@ func canonical(m openAIMessage) string {
 	sb.WriteString(m.Role)
 	sb.WriteString("\x00")
 	sb.WriteString(m.Text)
+	if len(m.ContentParts) > 0 {
+		// 不同图片 = 不同轮次：把分片纳入指纹，避免同文本不同图共享 msg_id。
+		if raw, err := json.Marshal(m.ContentParts); err == nil {
+			sb.WriteString("\x00")
+			sb.WriteString(string(raw))
+		}
+	}
 	for _, c := range m.ToolCalls {
 		sb.WriteString("\x00")
 		sb.WriteString(c.ID)

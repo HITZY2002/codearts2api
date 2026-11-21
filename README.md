@@ -58,7 +58,14 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 
 流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前返回一次
 `choices: []` 的 usage chunk；其余 chunk 的 `usage` 为 `null`。未启用时不返回 usage。
-流式和非流式均优先使用上游 usage；上游未提供时按文本长度估算，估算值不是精确 token 计数。
+网关已向上游请求真实 usage（官方同款 `stream_options.include_usage`），流式和非流式
+均优先透传上游真实值；上游未返回时按文本长度估算兜底，估算值不是精确 token 计数。
+
+多模态：user 消息 content 数组中的 `text` 与 `image_url` 分片透传给 VL 模型
+（与官方内核 image-analyze 同款形态，`image_url` 对象整体保留、含 `detail`）；
+其余分片类型（如 `input_audio`）返回 400。`stop` / `frequency_penalty` /
+`presence_penalty` / `response_format` / `seed` / `logprobs` / `n` 等参数静默
+忽略（恒单 choice）。
 
 工具调用支持 `tool_choice` 的 `auto` / `none` / `required` 及指定函数对象。
 指定函数时，网关只向上游发送该函数的定义，并转换为上游支持的字符串 `required`；
