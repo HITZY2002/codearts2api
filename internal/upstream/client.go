@@ -482,6 +482,15 @@ func ChatHeadersV2(token, traceID string) map[string]string {
 	}
 }
 
+// randTokenID 生成 32 位十六进制随机 ID（与官方 chat_id 等定长 hex 形态一致）。
+func randTokenID() string {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		return fmt.Sprintf("%x%x", time.Now().UnixNano(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 // ChatStream 发送 /api/v2/chat/completions（OpenAI 兼容，AK/SK 签名 + x-auth-token）
 // 并返回 SSE 流（调用方负责 Close）。
 //
@@ -499,12 +508,15 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, messages []ChatMessa
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
 // 官方 kernel 不发 chat_id / prompt_cache_key，这里也不发。
+// stream_options.include_usage 与官方 chat_core.rs 同款：上游会回真实
+// usage chunk（choices 为空），网关 usageEstimate 优先采用真实值。
 func chatBodyV2(messages []ChatMessage, model string, opts ChatOptions) map[string]any {
 	body := map[string]any{
-		"model":       CanonicalModel(model),
-		"stream":      true,
-		"messages":    chatMessagesToOpenAI(messages),
-		"tool_stream": true,
+		"model":          CanonicalModel(model),
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
+		"messages":       chatMessagesToOpenAI(messages),
+		"tool_stream":    true,
 	}
 	if opts.ReasoningEffort != "" {
 		body["reasoning_effort"] = opts.ReasoningEffort
@@ -635,6 +647,13 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	if sessionID != "" {
 		httpReq.Header.Set("x-ot-session-id", sessionID)
 	}
+	// 官方计费头族补齐（agent-kernel.exe billing.rs 邻近字符串清单中语义
+	// 确定的子集）：trace/span 每请求随机，created-time 为当前时刻。
+	// x-ot-parent-session-id / x-ot-function / client-ip / user-session-id
+	// 语义不明，不臆造，保持缺省。
+	httpReq.Header.Set("x-ot-trace-id", randTokenID())
+	httpReq.Header.Set("x-ot-span-id", randTokenID())
+	httpReq.Header.Set("created-time", time.Now().UTC().Format(time.RFC3339Nano))
 	// 官方 header 组装函数对 model-name 缺省回退到 model-id；网关没有显示名
 	// 目录，两者同值即官方回退行为。
 	if m, ok := body["model"].(string); ok && m != "" {
