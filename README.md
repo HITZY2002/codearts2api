@@ -51,6 +51,7 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 ```
 
 浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。
+面板登录态随 API Key 持久化（仅鉴权失败会清除；网络抖动保留登录，刷新即可恢复）。
 多轮语义由完整 `messages` 承载（上游 V2 不保留服务端上下文）。body 里传
 `conversation_id` 或请求头 `X-Codearts-Chat-Id: <id>` 可锁定同一账号续接（黏性路由），
 并复用该轮的上游消息 ID；不传时每次请求独立路由（随机 chatID，没有按账号的隐式续接）。
@@ -74,11 +75,22 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 
 ### 模型列表与限时福利
 
-`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
-同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
+`/v1/models` 统一返回**全小写、去重后的模型 ID**（如 `glm-5.2`、`qwen3-vl-235b`）；
+调用聊天接口时若传入大写或混合大小写模型名，服务端会自动归一匹配到上游精确 ID。限时福利
 （免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
 `maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
 列表是各账号可用模型的并集，实际路由会优先挑目录里真有这个模型的账号）。
+
+面板「设置」页及「模型列表」页可控制 `/v1/models` 的返回内容（持久化到 `data/settings.json`，
+立即生效）：
+
+| 设置项 | 说明 | 默认 |
+|--------|------|------|
+| `models_return_benefit` | 是否返回限时福利模型（关闭后自动领取仍可独立开关） | `true` |
+| `models_hidden` | 隐藏指定模型（逗号分隔 ID，大小写不敏感） | 空 |
+
+关闭福利模型返回可解决「自动领取关闭后，福利模型仍列出但调用必然失败」的误导；
+隐藏列表用于剔除已下架但仍被上游发现产出的模型 ID。
 
 福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
 
@@ -121,9 +133,13 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 
 ### 观测与可视化面板
 
-WebUI 已重构为 Vue 3 + Naive UI 面板，内置亮色/暗色/跟随系统三种主题。默认将
-请求元数据、系统事件和账号快照写入 `./data/observability.db`（SQLite）。面板显示
-请求量、成功率、首字延迟、总耗时、Token 用量、账号健康、模型可用性和最近事件。
+WebUI 为 Vue 3 轻量自绘控制台（new-api 风格：顶栏 + 分组侧边栏 + 数据看板），
+全部组件与图表手写，零第三方 UI/图表依赖，产物约 161KB（gzip 传输约 56KB，
+旧版 Naive UI + ECharts 方案为 1.26MB / 387KB）。服务端对静态资源做运行时 gzip
+并按内容哈希长缓存（`immutable`）。内置亮色/暗色/跟随系统三种主题，桌面端侧边栏
+可折叠、移动端为抽屉导航。默认将请求元数据、系统事件和账号快照写入
+`./data/observability.db`（SQLite）。面板显示请求量、成功率、首字延迟、总耗时、
+Token 用量、账号健康和最近事件。
 
 日志只保存请求元数据，不保存 prompt、completion、Authorization 或 API Key。
 积分消耗字段来自抓包确认的聊天 `done.credit_cost_for_web`，不会二次推算。
@@ -232,7 +248,7 @@ internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向�
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
 internal/server/   OpenAI 兼容路由
-web/ui/           WebUI 源码（Vue 3 + Naive UI）
+web/ui/           WebUI 源码（Vue 3 自绘组件 + 手写 SVG 图表）
 internal/server/webui/dist/ 内嵌 WebUI 构建产物
 deploy/            systemd unit 样例
 docs/              逆向过程与接口清单
