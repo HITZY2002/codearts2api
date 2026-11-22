@@ -24,7 +24,7 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 		wantCredits  float64
 	}{
 		{name: "fresh", status: "ELIGIBLE", claimable: true, wantOK: true, wantWrote: true, wantWrites: []string{EpCreditClaim, EpCreditConfirm}, wantCredits: 150},
-		{name: "unconfirmed", status: "CLAIMED", wantOK: true, wantWrote: true, wantWrites: []string{EpCreditConfirm}},
+		{name: "unconfirmed", status: "CLAIMED", wantOK: true, wantWrote: true, wantWrites: []string{EpCreditConfirm}, wantCredits: 150},
 		{name: "confirmed", status: "CONFIRMED", wantOK: true},
 		{name: "consumed", status: "CONSUMED", wantOK: true},
 		{name: "not eligible", wantOK: true},

@@ -33,6 +33,10 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	}
 	a.checkinMu.Lock()
 	defer a.checkinMu.Unlock()
+	return p.checkinLocked(ctx, a)
+}
+
+func (p *Pool) checkinLocked(ctx context.Context, a *Account) (upstream.CheckinResult, error) {
 	if err := ctx.Err(); err != nil {
 		return upstream.CheckinResult{}, err
 	}
@@ -42,7 +46,7 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	if disabled {
 		return upstream.CheckinResult{}, fmt.Errorf("account disabled")
 	}
-	ok, err := p.Validate(a)
+	ok, err := p.ValidateContext(ctx, a)
 	if err != nil || !ok {
 		if err == nil {
 			err = fmt.Errorf("token invalid; re-login required")
@@ -61,14 +65,14 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	}
 	attemptedAt := time.Now()
 	a.mu.Lock()
-	if err == nil {
+	if err == nil && result.OK {
 		a.checkinAttemptedAt = attemptedAt
 	}
-	if result.Wrote || (err != nil && !result.OK) {
+	if result.Wrote || err != nil || !result.OK {
 		a.checkin = &CheckinStatus{OK: result.OK, Message: result.Message, CheckedAt: attemptedAt}
 	}
 	a.mu.Unlock()
-	if err == nil {
+	if err == nil && result.OK {
 		p.saveState()
 	}
 	if p.cfg.Telemetry != nil && (err != nil || !result.OK || result.Wrote) {
@@ -76,7 +80,7 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 		if err != nil || !result.OK {
 			level = "error"
 		}
-		_ = p.cfg.Telemetry.RecordEvent("credit_checkin", level, name, "", result.Message, nil)
+		_ = p.cfg.Telemetry.RecordEvent("credit_checkin", level, a.Name, "", result.Message, nil)
 	}
 	return result, err
 }
@@ -87,6 +91,9 @@ func (p *Pool) CheckinIfDue(ctx context.Context, name string) (upstream.CheckinR
 	if account == nil {
 		return upstream.CheckinResult{}, false, fmt.Errorf("account not found")
 	}
+	account.checkinMu.Lock()
+	defer account.checkinMu.Unlock()
+
 	now := time.Now()
 	account.mu.Lock()
 	attempted := account.checkinAttemptedAt
@@ -96,7 +103,7 @@ func (p *Pool) CheckinIfDue(ctx context.Context, name string) (upstream.CheckinR
 			OK: true, Skipped: true, Message: "今日已检查签到",
 		}, false, nil
 	}
-	result, err := p.Checkin(ctx, name)
+	result, err := p.checkinLocked(ctx, account)
 	return result, true, err
 }
 
@@ -106,7 +113,7 @@ func (p *Pool) DailyCheckinStatus(ctx context.Context, name string) (upstream.Da
 	if account == nil {
 		return upstream.DailyCheckinStatus{}, fmt.Errorf("account not found")
 	}
-	ok, err := p.Validate(account)
+	ok, err := p.ValidateContext(ctx, account)
 	if err != nil {
 		return upstream.DailyCheckinStatus{}, err
 	}
@@ -127,7 +134,7 @@ func (p *Pool) Keepalive(ctx context.Context, name string) error {
 	if account == nil {
 		return fmt.Errorf("account not found")
 	}
-	ok, err := p.Validate(account)
+	ok, err := p.ValidateContext(ctx, account)
 	if err != nil {
 		return err
 	}

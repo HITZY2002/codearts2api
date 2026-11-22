@@ -12,3 +12,9 @@ services:
       - ./auths:/app/auths
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7866/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

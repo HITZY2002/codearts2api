@@ -1,5 +1,6 @@
 <script setup>
 import { computed, h } from 'vue'
+import UiAlert from '../components/ui/UiAlert.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import UiCard from '../components/ui/UiCard.vue'
 import UiDataTable from '../components/ui/UiDataTable.vue'
@@ -7,7 +8,7 @@ import UiSelect from '../components/ui/UiSelect.vue'
 import UiTag from '../components/ui/UiTag.vue'
 import {
   changeLogPage, changeLogPageSize, detailOpen, filterOptions, loading, logFilters,
-  logPage, logPageSize, logTotal, logs, reloadLogs, selectedLog
+  logPage, logPageSize, logTotal, logs, observabilityDisabled, reloadLogs, selectedLog
 } from '../store'
 import { formatDuration, formatNumber, formatTime, latencyTone, statusType } from '../utils'
 
@@ -24,8 +25,15 @@ function resetFilters() {
   reloadLogs()
 }
 
-const statusOptions = [200, 400, 401, 403, 429, 500].map(value => ({ label: String(value), value }))
+const statusOptions = [200, 400, 401, 403, 429, 500, 502, 503, 504].map(value => ({ label: String(value), value }))
 const streamOptions = [{ label: '流式', value: true }, { label: '非流式', value: false }]
+const creditFormatter = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 6 })
+function formatCreditCost(value) {
+  if (value == null) return '—'
+  const num = Number(value)
+  if (!Number.isFinite(num)) return String(value)
+  return creditFormatter.format(num)
+}
 
 const logColumns = [
   { title: '时间', key: 'created_at', width: 172, render: row => h('span', { class: 'num' }, formatTime(row.created_at)) },
@@ -42,7 +50,7 @@ const logColumns = [
     ])
   },
   { title: 'Token', key: 'total_tokens', width: 100, align: 'right', render: row => h('span', { class: 'num' }, formatNumber(row.total_tokens)) },
-  { title: '积分', key: 'credit_cost', width: 78, align: 'right', render: row => h('span', { class: 'num' }, row.credit_cost == null ? '—' : formatNumber(row.credit_cost)) },
+  { title: '积分', key: 'credit_cost', width: 88, align: 'right', render: row => h('span', { class: 'num' }, formatCreditCost(row.credit_cost)) },
   { title: '上游消息 ID', key: 'upstream_msg_id', minWidth: 170, render: row => h('span', { class: 'mono truncate-cell', title: row.upstream_msg_id || '' }, row.upstream_msg_id || '—') },
   { title: 'IP', key: 'client_ip', width: 118 },
   {
@@ -58,12 +66,15 @@ const logColumns = [
       <template #header-extra>
         <UiTag type="primary">{{ formatNumber(logTotal) }}</UiTag>
       </template>
+      <div v-if="observabilityDisabled" style="padding: 14px 18px 0">
+        <UiAlert type="info">当前服务端已关闭可观测数据库（observability.enabled = false），请求日志不可用。</UiAlert>
+      </div>
       <div class="filters-bar">
         <div class="filters-bar-left">
           <UiSelect v-model="logFilters.status_code" clearable size="sm" placeholder="状态码" :options="statusOptions" @update:model-value="reloadLogs" />
-          <UiSelect v-model="logFilters.model" clearable filterable size="sm" placeholder="模型" :options="filterOptions('model')" @update:model-value="reloadLogs" />
-          <UiSelect v-model="logFilters.account_uid" clearable filterable size="sm" placeholder="账号" :options="filterOptions('account_uid')" @update:model-value="reloadLogs" />
-          <UiSelect v-model="logFilters.error_type" clearable size="sm" placeholder="错误类型" :options="filterOptions('error_type')" @update:model-value="reloadLogs" />
+          <UiSelect v-model="logFilters.model" clearable filterable size="sm" placeholder="模型" :options="filterOptions('model', logs, logFilters.model)" @update:model-value="reloadLogs" />
+          <UiSelect v-model="logFilters.account_uid" clearable filterable size="sm" placeholder="账号" :options="filterOptions('account_uid', logs, logFilters.account_uid)" @update:model-value="reloadLogs" />
+          <UiSelect v-model="logFilters.error_type" clearable size="sm" placeholder="错误类型" :options="filterOptions('error_type', logs, logFilters.error_type)" @update:model-value="reloadLogs" />
           <UiSelect v-model="logFilters.stream" clearable size="sm" placeholder="流式" :options="streamOptions" @update:model-value="reloadLogs" />
         </div>
         <div v-if="hasActiveFilters" class="filters-bar-right">

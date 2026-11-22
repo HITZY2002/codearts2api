@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -40,14 +41,16 @@ const (
 	// （成功 markUsable / 失败 markUnusable），探测只是空闲时补齐，避免与用户
 	// 抢上游那 3 个并发会话槽位（槽位释放实测 >15s）。
 	probeIdleBefore = 10 * time.Minute
-	// probeGap 两次探测之间的间隔。探针本身是串行的，但它占用的上游会话槽位
-	// 释放很慢（实测 >15s）：连续探 3 个就占满单账号的 3 个并发会话，紧随其后的
-	// 真实请求会被上游判为 TM.00001041 并开始排队。留出释放窗口再探下一个。
-	probeGap = 20 * time.Second
 	// probeConcurrency 并发探测数。探测本身会占上游会话槽位（单账号 3 个并发），
 	// 且账号并发锁默认 max_concurrent=1，所以这里也用 1：慢一点，但不能干扰真实请求。
 	probeConcurrency = 1
 )
+
+// probeGap 两次探测之间的间隔（var 仅为测试可注入缩短）。探针本身是串行的，
+// 但它占用的上游会话槽位释放很慢（实测 >15s）：连续探 3 个就占满单账号的
+// 3 个并发会话，紧随其后的真实请求会被上游判为 TM.00001041 并开始排队。
+// 留出释放窗口再探下一个；生产值必须 >= 15s（TestProbeGapExists 钳制）。
+var probeGap = 20 * time.Second
 
 type availState int
 
@@ -64,7 +67,10 @@ type availEntry struct {
 }
 
 // probesStop 在服务退出时关闭，让带 sleep 的探测循环尽快结束。
-var probesStop = make(chan struct{})
+var (
+	probesStop     = make(chan struct{})
+	probesStopOnce sync.Once
+)
 
 var availability = struct {
 	sync.Mutex
@@ -148,6 +154,10 @@ func upstreamUnavailableReason(err error) string {
 // 拿不到锁就让位给真实请求，等下一轮再试——否则用户请求会被探测挤成
 // TM.00001041「并发会话数已达上限」。
 func (h *Handler) probeModel(acct *pool.Account, model string) {
+	h.probeModelCtx(context.Background(), acct, model)
+}
+
+func (h *Handler) probeModelCtx(parentCtx context.Context, acct *pool.Account, model string) {
 	if acct == nil || acct.AuthSnapshot() == nil {
 		return
 	}
@@ -177,7 +187,7 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 	authz := acct.AuthSnapshot()
 	token, ak, sk := authz.Credentials()
 	cred := upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, probeTimeout)
 	defer cancel()
 	rc, err := acct.Client.ProbeModel(ctx, model, cred, upstream.IsBenefitModel(acct.UID, model))
 	if err != nil {
@@ -200,12 +210,35 @@ func (h *Handler) probeModel(acct *pool.Account, model string) {
 		return
 	}
 	defer rc.Close()
-	// 读到首个事件即可：200 也要看内容，上游会把错误塞在 200 的 SSE 里。
-	br := bufio.NewReaderSize(rc, 64*1024)
+	// 读到首个 data 事件（或非 SSE 首行）为止，上限 64KB / 128 行：
+	// 200 也要看内容，上游可能把错误塞在心跳/注释行之后的 SSE data 事件里。
+	const (
+		maxProbeHeadBytes = 64 * 1024
+		maxProbeHeadLines = 128
+	)
+	br := bufio.NewReaderSize(io.LimitReader(rc, maxProbeHeadBytes+1), maxProbeHeadBytes)
 	var head strings.Builder
-	for i := 0; i < 6; i++ {
+	for i := 0; i < maxProbeHeadLines && head.Len() < maxProbeHeadBytes; i++ {
 		line, err := br.ReadString('\n')
-		head.WriteString(line)
+		if len(line) > 0 {
+			remain := maxProbeHeadBytes - head.Len()
+			if len(line) > remain {
+				line = line[:remain]
+			}
+			head.WriteString(line)
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data:") {
+			if payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")); payload != "" {
+				break
+			}
+		} else if trimmed != "" && !strings.HasPrefix(trimmed, ":") &&
+			!strings.HasPrefix(trimmed, "event:") &&
+			!strings.HasPrefix(trimmed, "id:") &&
+			!strings.HasPrefix(trimmed, "retry:") {
+			// 非 SSE 响应体（如纯 JSON 错误）读到首条有效内容即可判定。
+			break
+		}
 		if err != nil {
 			break
 		}
@@ -250,6 +283,10 @@ func (h *Handler) StartAvailabilityProber(ctx context.Context) { h.startAvailabi
 // 只在有账号且拿到目录后才干活，避免空转打上游。
 func (h *Handler) startAvailabilityProber(ctx context.Context) {
 	go func() {
+		<-ctx.Done()
+		probesStopOnce.Do(func() { close(probesStop) })
+	}()
+	go func() {
 		// 启动后先等服务预热：立刻探测会和刚接入的客户端抢账号槽位。
 		select {
 		case <-ctx.Done():
@@ -258,20 +295,28 @@ func (h *Handler) startAvailabilityProber(ctx context.Context) {
 		}
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
-		h.sweepAvailability()
+		h.sweepAvailabilityCtx(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				h.sweepAvailability()
+				h.sweepAvailabilityCtx(ctx)
 			}
 		}
 	}()
 }
 
 // sweepAvailability 对所有健康账号的已发现模型做一轮探测（跳过已有结论的）。
+//
+// 与流量学习触发的 probeUnknownAsync 同走 runProbes：探测之间保留 probeGap
+// 释放窗口，并响应 probesStop。此前 sweep 是背靠背的裸循环——待探测组合多时
+// 连续占满上游会话槽位，真实请求会被 TM.00001041 排队。
 func (h *Handler) sweepAvailability() {
+	h.sweepAvailabilityCtx(context.Background())
+}
+
+func (h *Handler) sweepAvailabilityCtx(ctx context.Context) {
 	availability.Lock()
 	if time.Since(availability.lastSweep) < probeInterval/2 {
 		availability.Unlock()
@@ -280,9 +325,7 @@ func (h *Handler) sweepAvailability() {
 	availability.lastSweep = time.Now()
 	availability.Unlock()
 
-	for _, acct := range h.pendingProbes() {
-		h.probeModel(acct.acct, acct.model)
-	}
+	h.runProbesCtx(ctx, h.pendingProbes())
 }
 
 // pendingProbe 一个待探测的「账号 + 模型」。
@@ -314,6 +357,10 @@ func (h *Handler) pendingProbes() []pendingProbe {
 
 // runProbes 并发执行待探测列表（上限 probeConcurrency）。
 func (h *Handler) runProbes(items []pendingProbe) {
+	h.runProbesCtx(context.Background(), items)
+}
+
+func (h *Handler) runProbesCtx(ctx context.Context, items []pendingProbe) {
 	if len(items) == 0 {
 		return
 	}
@@ -321,11 +368,20 @@ func (h *Handler) runProbes(items []pendingProbe) {
 	var wg sync.WaitGroup
 	first := true
 	for _, it := range items {
+		// 跳过明确繁忙或刚有流量的账号，避免空等 probeGap 长时间占住 sweeping 标志。
+		if it.acct == nil || it.acct.AuthSnapshot() == nil ||
+			h.cfg.Pool.Busy(it.acct.Name) || trafficIdleFor(it.acct.UID) < probeIdleBefore {
+			continue
+		}
 		// 让上一个探针占用的上游会话先释放，再探下一个。
 		if !first {
 			select {
 			case <-time.After(probeGap):
+			case <-ctx.Done():
+				wg.Wait()
+				return
 			case <-probesStop:
+				wg.Wait()
 				return
 			}
 		}
@@ -335,7 +391,7 @@ func (h *Handler) runProbes(items []pendingProbe) {
 		go func(it pendingProbe) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			h.probeModel(it.acct, it.model)
+			h.probeModelCtx(ctx, it.acct, it.model)
 		}(it)
 	}
 	wg.Wait()

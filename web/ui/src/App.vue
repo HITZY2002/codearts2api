@@ -129,8 +129,8 @@ function selectPage(key) {
         <button class="icon-btn" :title="themeTitle" @click="cycleTheme">
           <Icon :name="themeIcon" :size="16" />
         </button>
-        <button class="icon-btn" title="刷新数据" @click="login()">
-          <Icon name="refresh" :size="16" />
+        <button class="icon-btn" title="刷新数据" :disabled="loading" @click="loadAll()">
+          <Icon name="refresh" :size="16" :class="{ spin: loading }" />
         </button>
         <button class="icon-btn" title="退出登录" @click="logout">
           <Icon name="logout" :size="16" />

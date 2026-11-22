@@ -2,33 +2,45 @@
 import { computed, ref } from 'vue'
 import DonutChart from '../components/DonutChart.vue'
 import TrendChart from '../components/TrendChart.vue'
+import UiAlert from '../components/ui/UiAlert.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import UiCard from '../components/ui/UiCard.vue'
 import UiSegmented from '../components/ui/UiSegmented.vue'
 import UiStatTile from '../components/ui/UiStatTile.vue'
-import { loading, logs, metrics, range, rangeOptions, reloadDashboard, runAction, series } from '../store'
+import {
+  actionFeedback, actionLoading, dashboardLogs, metrics, observabilityDisabled,
+  range, rangeOptions, reloadDashboard, runAction, series
+} from '../store'
 import { CHART_PALETTE, formatNumber } from '../utils'
 
 const spark = key => series.value.map(item => item[key] ?? 0)
 
 // ---- 性能健康 ----
 const successTone = computed(() => {
+  if (!metrics.value.total_requests) return 'idle'
   const rate = metrics.value.success_rate
   if (rate >= 0.95) return 'ok'
   if (rate >= 0.8) return 'warn'
   return 'bad'
 })
 const successBadgeTone = computed(() => {
+  if (successTone.value === 'idle') return 'info'
   if (successTone.value === 'ok') return 'success'
   if (successTone.value === 'warn') return 'warning'
   return 'error'
 })
+const successBadgeText = computed(() => {
+  if (!metrics.value.total_requests) return '暂无调用'
+  return `成功率 ${(metrics.value.success_rate * 100).toFixed(1)}%`
+})
 const healthDotColor = computed(() => {
+  if (successTone.value === 'idle') return 'var(--text-3)'
   if (successTone.value === 'ok') return 'var(--success)'
   if (successTone.value === 'warn') return 'var(--warning)'
   return 'var(--danger)'
 })
 const healthLabel = computed(() => {
+  if (successTone.value === 'idle') return '等待调用'
   if (successTone.value === 'ok') return '运行健康'
   if (successTone.value === 'warn') return '轻微波动'
   return '异常告警'
@@ -40,10 +52,10 @@ const errorRateText = computed(() => {
   return `错误率 ${((metrics.value.error_count / total) * 100).toFixed(1)}%`
 })
 
-// 模型调用占比（基于当前时间范围内最近一页日志，纯前端聚合）
+// 模型调用占比（基于当前时间范围内未筛选样本，不受日志页筛选/翻页污染）
 const modelStats = computed(() => {
   const counts = new Map()
-  for (const row of logs.value) {
+  for (const row of dashboardLogs.value) {
     if (row.model) counts.set(row.model, (counts.get(row.model) || 0) + 1)
   }
   const total = [...counts.values()].reduce((sum, n) => sum + n, 0) || 1
@@ -72,6 +84,9 @@ const sampleTotal = computed(() => modelStats.value.reduce((sum, m) => sum + m.c
 const trendLabels = computed(() =>
   series.value.map(item => {
     const d = new Date(item.bucket)
+    if (range.value >= 168) {
+      return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    }
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   })
 )
@@ -122,16 +137,32 @@ const latencyChart = computed(() => ({
         <UiSegmented v-model="range" :options="rangeOptions" @update:model-value="reloadDashboard" />
       </div>
       <div class="filters">
-        <UiButton variant="outline" size="sm" :loading="loading" @click="runAction('/admin/api/checkin')">全员签到</UiButton>
-        <UiButton variant="outline" size="sm" :loading="loading" @click="runAction('/admin/api/keepalive')">保活 Token</UiButton>
+        <UiButton
+          variant="outline" size="sm"
+          :loading="actionLoading === '/admin/api/checkin'"
+          :disabled="Boolean(actionLoading) && actionLoading !== '/admin/api/checkin'"
+          @click="runAction('/admin/api/checkin')"
+        >全员签到</UiButton>
+        <UiButton
+          variant="outline" size="sm"
+          :loading="actionLoading === '/admin/api/keepalive'"
+          :disabled="Boolean(actionLoading) && actionLoading !== '/admin/api/keepalive'"
+          @click="runAction('/admin/api/keepalive')"
+        >保活 Token</UiButton>
       </div>
     </div>
+
+    <UiAlert v-if="actionFeedback" :type="actionFeedback.type">{{ actionFeedback.message }}</UiAlert>
+
+    <UiAlert v-if="observabilityDisabled" type="info">
+      当前服务端已关闭可观测数据库（observability.enabled = false），监控指标、请求日志与事件暂不可用，账号/模型/设置管理不受影响。
+    </UiAlert>
 
     <div class="stat-grid">
       <UiStatTile
         label="请求总量"
         :value="formatNumber(metrics.total_requests)"
-        :badge="`成功率 ${(metrics.success_rate * 100).toFixed(1)}%`"
+        :badge="successBadgeText"
         :badge-tone="successBadgeTone"
         caption="统计周期内网关总调用"
         tone="blue"

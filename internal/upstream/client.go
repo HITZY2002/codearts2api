@@ -688,7 +688,7 @@ func preflightSSE(body io.ReadCloser) (io.ReadCloser, error) {
 	var prefix bytes.Buffer
 	sawRole := false
 	for prefix.Len() < 2<<20 {
-		line, err := br.ReadString('\n')
+		line, err := readLineLimited(br, 2<<20)
 		prefix.WriteString(line)
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "data:") {
@@ -858,8 +858,9 @@ func Log(format string, args ...any) {
 
 func truncateStr(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n])
 	}
 	return s
 }
@@ -887,7 +888,7 @@ func CallerIdentity(cred SignCredential) (uid, name, domain string, err error) {
 
 // CurrentUser 用 STS 凭证查账号身份：GET {snap}/snap-manager/v1/current/user。
 func CurrentUser(cred SignCredential) (uid, name, domain string, err error) {
-	raw, err := signedGet(SnapEngineApiHost+EpCurrentUser, cred, "")
+	raw, err := signedGet(SnapManagerHost+EpCurrentUser, cred, "")
 	if err != nil {
 		return "", "", "", err
 	}

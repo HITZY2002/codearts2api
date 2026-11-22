@@ -6,7 +6,7 @@ import UiCard from '../components/ui/UiCard.vue'
 import UiInput from '../components/ui/UiInput.vue'
 import UiInputNumber from '../components/ui/UiInputNumber.vue'
 import UiSwitch from '../components/ui/UiSwitch.vue'
-import { request } from '../api'
+import { loadAll, observabilityDisabled, request } from '../store'
 
 const settingsLoading = ref(false)
 const settingsSaving = ref(false)
@@ -14,6 +14,10 @@ const settingsMessage = ref('')
 const settingsError = ref(false)
 const settingsLoaded = ref(false)
 const settingsForm = ref(emptySettings())
+
+const purgeLoading = ref(false)
+const purgeMessage = ref('')
+const purgeError = ref(false)
 
 function emptySettings() {
   return {
@@ -49,6 +53,7 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  if (!settingsLoaded.value || settingsLoading.value) return
   settingsSaving.value = true
   settingsMessage.value = ''
   try {
@@ -60,11 +65,29 @@ async function saveSettings() {
     settingsLoaded.value = true
     settingsError.value = false
     settingsMessage.value = result.message || '设置已保存'
+    await loadAll()
   } catch (error) {
     settingsError.value = true
     settingsMessage.value = error.message
   } finally {
     settingsSaving.value = false
+  }
+}
+
+async function purgeObservability() {
+  purgeLoading.value = true
+  purgeMessage.value = ''
+  purgeError.value = false
+  try {
+    const result = await request('/admin/api/observability/purge', { method: 'POST', body: JSON.stringify({}) })
+    const stats = result.stats || {}
+    purgeMessage.value = `${result.message || '已清理'}（请求日志 ${stats.requests ?? 0} 条、事件 ${stats.events ?? 0} 条、快照 ${stats.snapshots ?? 0} 条）`
+    await loadAll()
+  } catch (error) {
+    purgeError.value = true
+    purgeMessage.value = `清理失败：${error.message}`
+  } finally {
+    purgeLoading.value = false
   }
 }
 
@@ -76,7 +99,7 @@ onMounted(loadSettings)
     <UiCard title="运行设置">
       <template #header-extra>
         <UiButton variant="outline" size="sm" :loading="settingsLoading" @click="loadSettings">重新加载</UiButton>
-        <UiButton variant="primary" size="sm" :loading="settingsSaving" @click="saveSettings">保存设置</UiButton>
+        <UiButton variant="primary" size="sm" :loading="settingsSaving" :disabled="settingsLoading || !settingsLoaded" @click="saveSettings">保存设置</UiButton>
       </template>
 
       <UiAlert v-if="settingsMessage" :type="settingsError ? 'error' : 'success'" style="margin-bottom: 18px">
@@ -193,6 +216,30 @@ onMounted(loadSettings)
         </section>
       </div>
     </UiCard>
+
+    <UiCard title="运维与数据维护">
+      <template #header-extra>
+        <UiButton
+          variant="outline"
+          size="sm"
+          :loading="purgeLoading"
+          :disabled="observabilityDisabled"
+          @click="purgeObservability"
+        >
+          清理观测数据
+        </UiButton>
+      </template>
+
+      <UiAlert v-if="observabilityDisabled" type="info" style="margin-bottom: 12px">
+        当前服务端已关闭可观测数据库（observability.enabled = false），无需清理。
+      </UiAlert>
+      <UiAlert v-if="purgeMessage" :type="purgeError ? 'error' : 'success'" style="margin-bottom: 12px">
+        {{ purgeMessage }}
+      </UiAlert>
+      <p class="maint-desc">
+        按服务端保留策略（retention_days / max_rows / max_db_bytes）立即清理过期的请求日志、系统事件与账号快照。
+      </p>
+    </UiCard>
   </div>
 </template>
 
@@ -209,4 +256,5 @@ onMounted(loadSettings)
 .section-head { display: grid; gap: 3px; }
 .section-head h4 { font-size: 14px; font-weight: 650; color: var(--text); }
 .section-head p { margin: 0; font-size: 12.5px; color: var(--text-3); }
+.maint-desc { margin: 0; font-size: 13px; color: var(--text-2); }
 </style>

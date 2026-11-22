@@ -65,7 +65,9 @@ func main() {
 			log.Printf("telemetry purge failed: %v", err)
 		}
 	}
+	lc := loginConfig(cfg)
 	poolConfig := cfg.ToPoolConfig()
+	poolConfig.LoginConfig = lc
 	poolConfig.Telemetry = telemetryStore
 	p, err := pool.New(auths, poolConfig, cfg.StateFile)
 	if err != nil {
@@ -118,7 +120,7 @@ func main() {
 		ObservabilityMaxRows:       cfg.Observability.MaxRows,
 		ObservabilityMaxDBBytes:    cfg.Observability.MaxDBBytes,
 		SnapshotInterval:           time.Duration(cfg.Observability.SnapshotIntervalSeconds) * time.Second,
-		LoginConfig:                loginConfig(cfg),
+		LoginConfig:                lc,
 		OAuthCallbackHost:          cfg.OAuthCallbackHost,
 		Settings:                   settings,
 		Scheduler:                  sch,
@@ -154,6 +156,7 @@ func main() {
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	if telemetryStore != nil {
 		defer telemetryStore.Close()
@@ -222,7 +225,11 @@ func settingsFromConfig(cfg Config) server.Settings {
 	if cfg.Watch.KeepaliveInterval > 0 {
 		settings.KeepaliveIntervalMinutes = cfg.Watch.KeepaliveInterval
 	}
-	settings.KeepaliveWindowMinutes = int(poolConfigKeepaliveWindow(cfg).Minutes())
+	keepaliveMins := int(poolConfigKeepaliveWindow(cfg).Minutes())
+	if keepaliveMins < 1 {
+		keepaliveMins = 1
+	}
+	settings.KeepaliveWindowMinutes = keepaliveMins
 	return settings
 }
 

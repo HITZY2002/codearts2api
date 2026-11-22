@@ -57,11 +57,14 @@ func TestLoadToleratesExampleConfigComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("带注释的示例配置应能加载: %v", err)
 	}
-	if cfg.Listen != ":7866" || cfg.AuthDir != "./auths" || cfg.DefaultModel != "snap-chat" {
+	if cfg.Listen != ":7866" || cfg.AuthDir != "./auths" || cfg.DefaultModel != "glm-5.2" {
 		t.Fatalf("示例配置字段未生效: %+v", cfg)
 	}
-	if cfg.Cooldown.SoftRate != "60s" || cfg.MaxConcurrent != 5 || cfg.Watch.PollMinutes != 30 {
+	if cfg.Cooldown.SoftRate != "60s" || cfg.MaxConcurrent != 1 || cfg.Watch.PollMinutes != 30 {
 		t.Fatalf("示例配置嵌套字段未生效: %+v", cfg)
+	}
+	if cfg.QueueRetrySeconds != 10 || cfg.QueueMaxAttempts != 30 {
+		t.Errorf("queue 配置未生效: retry=%d max=%d", cfg.QueueRetrySeconds, cfg.QueueMaxAttempts)
 	}
 	if cfg.KeepaliveWindow != "10m" {
 		t.Errorf("keepalive_window 未生效: %q", cfg.KeepaliveWindow)

@@ -88,7 +88,7 @@ func writeGzipped(w http.ResponseWriter, header http.Header, gz []byte) {
 func acceptsGzip(r *http.Request) bool {
 	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
 		fields := strings.Split(strings.TrimSpace(part), ";")
-		enc := strings.TrimSpace(fields[0])
+		enc := strings.ToLower(strings.TrimSpace(fields[0]))
 		if enc != "gzip" && enc != "*" {
 			continue
 		}

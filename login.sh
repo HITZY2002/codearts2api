@@ -9,14 +9,24 @@ cd "$(dirname "$0")"
 
 AUTH_DIR="./auths"
 EXTRA=()
-if [[ "${1:-}" == "-print-only" ]]; then
-    EXTRA+=("-print-only")
-    shift
-fi
-if [[ "${1:-}" == "-auth-dir" ]]; then
-    AUTH_DIR="${2:?usage: -auth-dir <dir>}"
-    EXTRA+=("-auth-dir" "$AUTH_DIR")
-fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -auth-dir)
+            AUTH_DIR="${2:?usage: -auth-dir <dir>}"
+            EXTRA+=("-auth-dir" "$AUTH_DIR")
+            shift 2
+            ;;
+        -auth-dir=*)
+            AUTH_DIR="${1#*=}"
+            EXTRA+=("$1")
+            shift
+            ;;
+        *)
+            EXTRA+=("$1")
+            shift
+            ;;
+    esac
+done
 mkdir -p "$AUTH_DIR"
 
 BIN=./bin/codearts2api-login

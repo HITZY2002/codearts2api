@@ -84,7 +84,6 @@ type Store struct {
 	db     *sql.DB
 	path   string
 	queue  chan operation
-	stop   chan struct{}
 	done   chan struct{}
 	mu     sync.Mutex
 	closed bool
@@ -201,7 +200,6 @@ func Open(path string) (*Store, error) {
 		db:    db,
 		path:  path,
 		queue: make(chan operation, 4096),
-		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
 	go s.worker()
@@ -209,22 +207,16 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) worker() {
-	for {
-		select {
-		case op := <-s.queue:
-			_ = op.fn()
-		case <-s.stop:
-			close(s.done)
-			return
-		}
+	for op := range s.queue {
+		_ = op.fn()
 	}
+	close(s.done)
 }
 
 func (s *Store) enqueue(op operation) error {
 	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if closed {
+	defer s.mu.Unlock()
+	if s.closed {
 		return fmt.Errorf("telemetry store is closed")
 	}
 	select {
@@ -249,7 +241,7 @@ func (s *Store) Flush() error {
 	return nil
 }
 
-// Close stops the writer and closes the database.
+// Close stops the writer, drains queued writes, and closes the database.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -257,9 +249,8 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.queue)
 	s.mu.Unlock()
-	_ = s.Flush()
-	close(s.stop)
 	<-s.done
 	return s.db.Close()
 }

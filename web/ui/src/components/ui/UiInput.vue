@@ -27,7 +27,7 @@ function clear() {
 </script>
 
 <template>
-  <span class="u-input-wrap">
+  <span class="u-input-wrap" :class="{ 'has-trail': showPassword || (clearable && model) }">
     <input
       class="u-input" :class="{ 'u-input--sm': size === 'sm' }"
       :type="actualType()" :value="model == null ? '' : model" :placeholder="placeholder" :disabled="disabled"
@@ -39,7 +39,7 @@ function clear() {
       </button>
     </span>
     <span v-if="showPassword" class="u-input-trail">
-      <button class="input-trail-btn" type="button" tabindex="-1" title="按住查看明文" @mousedown.prevent="reveal = !reveal">
+      <button class="input-trail-btn" type="button" tabindex="-1" title="切换明文显示" @mousedown.prevent="reveal = !reveal">
         <Icon :name="reveal ? 'eye-off' : 'eye'" :size="15" />
       </button>
     </span>

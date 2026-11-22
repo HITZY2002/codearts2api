@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ func TestRequestLogLifecycle(t *testing.T) {
 	firstOutput := int64(573)
 	if err := store.RecordRequest(RequestLog{
 		RequestID:               "req-1",
-		CreatedAt:               time.Now().Add(-time.Hour).UnixMilli(),
+		CreatedAt:               time.Now().Add(-48 * time.Hour).UnixMilli(),
 		Endpoint:                "/v1/chat/completions",
 		Method:                  "POST",
 		ClientIP:                "127.0.0.1",
@@ -72,7 +73,15 @@ func TestRequestLogLifecycle(t *testing.T) {
 		t.Fatalf("overview=%#v", overview)
 	}
 
-	if _, err := store.Purge(0, 1, 128<<20); err != nil {
+	// retentionDays=0 must not wipe rows.
+	if _, err := store.Purge(0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, total, err = store.ListRequests(RequestFilter{Limit: 10}); err != nil || total != 1 {
+		t.Fatalf("Purge(0,0,0) unexpectedly deleted rows: total=%d err=%v", total, err)
+	}
+
+	if _, err := store.Purge(1, 1, 128<<20); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Flush(); err != nil {
@@ -84,5 +93,44 @@ func TestRequestLogLifecycle(t *testing.T) {
 	}
 	if total != 0 {
 		t.Fatalf("purge left %d rows", total)
+	}
+}
+
+func TestStoreCloseDrainsQueue(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "drain.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 20
+	now := time.Now().UnixMilli()
+	for i := 0; i < n; i++ {
+		if err := store.RecordRequest(RequestLog{
+			RequestID:  fmt.Sprintf("req-drain-%d", i),
+			CreatedAt:  now + int64(i),
+			Endpoint:   "/v1/chat/completions",
+			Method:     "POST",
+			StatusCode: 200,
+			Model:      "glm-5.2",
+		}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	// Close without prior Flush must still drain all queued rows.
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	_, total, err := reopened.ListRequests(RequestFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != n {
+		t.Fatalf("Close dropped queued writes: got %d rows, want %d", total, n)
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,6 +112,11 @@ loginLoop:
 			}
 			break loginLoop
 		case <-ticker.C:
+			// 本机交互模式优先等待 authorization code 回调（避免抢先走 ticket 丢失 refresh_token）；
+			// 仅在 -print-only 远端模式或 portal 明确下发 secret 时才轮询 ticket。
+			if !*printOnly && !cb.hasPortalSecret() {
+				continue
+			}
 			t, terr := client.PollTicket(ctx, cfg, ticketID, cb.pollSecret(secret))
 			if terr == nil && t != nil && t.UserName != "" {
 				tok = t
@@ -119,17 +125,39 @@ loginLoop:
 		}
 	}
 
-	// 4. 落盘
+	// 4. 落盘（code 换票不带身份时主动补全 user_id/user_name）
 	cred := tok.Credentials
 	a := auth.New(tok.UserID, tok.UserName, tok.DomainID,
 		cred.SecurityToken, cred.AccessKeyID, cred.SecretAccessKey,
 		cred.Expiration, tok.RefreshToken, verifier)
 	a.SetClientID(cfg.ClientID)
 	a.SetDPoPPrivateKey(dpopPrivateJWK)
+	if a.UserID == "" || a.UserName == "" {
+		signCred := upstream.SignCredential{
+			AccessKeyID:     cred.AccessKeyID,
+			SecretAccessKey: cred.SecretAccessKey,
+			SecurityToken:   cred.SecurityToken,
+		}
+		uid, uname, domain, idErr := upstream.CallerIdentity(signCred)
+		if idErr != nil || uid == "" {
+			if cuID, cuName, cuDom, cuErr := upstream.CurrentUser(signCred); cuErr == nil && cuID != "" {
+				uid, uname, domain = cuID, cuName, cuDom
+			}
+		}
+		if uid != "" {
+			a.UserID = uid
+			if uname != "" {
+				a.UserName = uname
+			}
+			if domain != "" {
+				a.DomainID = domain
+			}
+		}
+	}
 	if err := auth.SaveNew(*authDir, a); err != nil {
 		log.Fatalf("save auth: %v", err)
 	}
-	fmt.Printf("\n✅ 登录成功：user_id=%s name=%s\n", tok.UserID, tok.UserName)
+	fmt.Printf("\n✅ 登录成功：user_id=%s name=%s\n", a.UserID, a.UserName)
 	fmt.Printf("凭证已保存：%s\n", filepath.Join(*authDir, a.FileName()))
 	if cred.Expiration != "" {
 		fmt.Printf("STS 有效期至：%s（到期前自动 refresh 续期）\n", cred.Expiration)
@@ -151,6 +179,13 @@ func (s *callbackState) setSecret(v string) {
 	s.mu.Unlock()
 }
 
+// hasPortalSecret 报告是否已收到 portal 下发的回调 secret。
+func (s *callbackState) hasPortalSecret() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.secret != ""
+}
+
 // pollSecret 返回 portal 下发的 secret；portal 没下发时退回本地生成的。
 func (s *callbackState) pollSecret(fallback string) string {
 	s.mu.Lock()
@@ -159,6 +194,16 @@ func (s *callbackState) pollSecret(fallback string) string {
 		return s.secret
 	}
 	return fallback
+}
+
+func isAllowedRedirect(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "huaweicloud.com" || strings.HasSuffix(host, ".huaweicloud.com") ||
+		host == "myhuaweicloud.com" || strings.HasSuffix(host, ".myhuaweicloud.com")
 }
 
 // serveCallback 处理本地回调（GET query 或 POST body 传 code）。
@@ -175,6 +220,10 @@ func serveCallback(ln net.Listener, redirectPath string, st *callbackState, ch c
 			st.setSecret(secret)
 		}
 		if code == "" && redirect != "" {
+			if !isAllowedRedirect(redirect) {
+				http.Error(w, "invalid redirect target", http.StatusBadRequest)
+				return
+			}
 			http.Redirect(w, r, redirect, http.StatusTemporaryRedirect)
 			return
 		}

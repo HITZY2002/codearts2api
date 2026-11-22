@@ -261,11 +261,21 @@ func (s *Store) MetricsOverview(from, to int64) (MetricsOverview, error) {
 }
 
 func (s *Store) scanDurations(column string, from, to int64, p50, p95, p99 *int64) error {
+	clauses := []string{column + " IS NOT NULL"}
+	args := []any{}
+	if from > 0 {
+		clauses = append(clauses, "created_at >= ?")
+		args = append(args, from)
+	}
+	if to > 0 {
+		clauses = append(clauses, "created_at <= ?")
+		args = append(args, to)
+	}
 	query := fmt.Sprintf(
-		"SELECT %s FROM request_logs WHERE %s IS NOT NULL AND created_at >= ? AND created_at <= ? ORDER BY %s",
-		column, column, column,
+		"SELECT %s FROM request_logs WHERE %s ORDER BY %s",
+		column, strings.Join(clauses, " AND "), column,
 	)
-	rows, err := s.db.Query(query, from, to)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -281,18 +291,16 @@ func (s *Store) scanDurations(column string, from, to int64, p50, p95, p99 *int6
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	*p50 = percentile(values, 0.50)
-	*p95 = percentile(values, 0.95)
-	*p99 = percentile(values, 0.99)
+	*p50 = percentileSorted(values, 0.50)
+	*p95 = percentileSorted(values, 0.95)
+	*p99 = percentileSorted(values, 0.99)
 	return nil
 }
 
-func percentile(values []int64, p float64) int64 {
-	if len(values) == 0 {
+func percentileSorted(sorted []int64, p float64) int64 {
+	if len(sorted) == 0 {
 		return 0
 	}
-	sorted := append([]int64(nil), values...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	index := int(float64(len(sorted)-1) * p)
 	if index < 0 {
 		index = 0
@@ -301,6 +309,15 @@ func percentile(values []int64, p float64) int64 {
 		index = len(sorted) - 1
 	}
 	return sorted[index]
+}
+
+func percentile(values []int64, p float64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]int64(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return percentileSorted(sorted, p)
 }
 
 // MetricsSeries aggregates request metadata into fixed time buckets.
@@ -356,20 +373,24 @@ type PurgeStats struct {
 	Snapshots int64 `json:"snapshots"`
 }
 
-func (s *Store) tableSize(table string, maxRows int) error {
+func (s *Store) tableSize(table string, maxRows int) (int64, error) {
 	var count int64
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
-		return err
+		return 0, err
 	}
 	if count <= int64(maxRows) {
-		return nil
+		return 0, nil
 	}
 	deleteCount := count - int64(maxRows)
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		"DELETE FROM "+table+" WHERE id IN (SELECT id FROM "+table+" ORDER BY id ASC LIMIT ?)",
 		deleteCount,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected, nil
 }
 
 func (s *Store) databaseBytes() (int64, error) {
@@ -386,43 +407,61 @@ func (s *Store) databaseBytes() (int64, error) {
 // Purge applies retention limits and returns deletion counts.
 func (s *Store) Purge(retentionDays int, maxRows int, maxBytes int64) (PurgeStats, error) {
 	var stats PurgeStats
-	cutoff := time.Now().AddDate(0, 0, -retentionDays).UnixMilli()
-	result, err := s.db.Exec("DELETE FROM request_logs WHERE created_at < ?", cutoff)
-	if err != nil {
-		return stats, err
+	if retentionDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -retentionDays).UnixMilli()
+		result, err := s.db.Exec("DELETE FROM request_logs WHERE created_at < ?", cutoff)
+		if err != nil {
+			return stats, err
+		}
+		stats.Requests, _ = result.RowsAffected()
+		result, err = s.db.Exec("DELETE FROM event_logs WHERE created_at < ?", cutoff)
+		if err != nil {
+			return stats, err
+		}
+		stats.Events, _ = result.RowsAffected()
+		result, err = s.db.Exec("DELETE FROM account_snapshots WHERE created_at < ?", cutoff)
+		if err != nil {
+			return stats, err
+		}
+		stats.Snapshots, _ = result.RowsAffected()
 	}
-	stats.Requests, _ = result.RowsAffected()
-	result, err = s.db.Exec("DELETE FROM event_logs WHERE created_at < ?", cutoff)
-	if err != nil {
-		return stats, err
-	}
-	stats.Events, _ = result.RowsAffected()
-	result, err = s.db.Exec("DELETE FROM account_snapshots WHERE created_at < ?", cutoff)
-	if err != nil {
-		return stats, err
-	}
-	stats.Snapshots, _ = result.RowsAffected()
 	if maxRows > 0 {
-		if err := s.tableSize("request_logs", maxRows); err != nil {
+		n, err := s.tableSize("request_logs", maxRows)
+		if err != nil {
 			return stats, err
 		}
-		if err := s.tableSize("event_logs", maxRows); err != nil {
+		stats.Requests += n
+		n, err = s.tableSize("event_logs", maxRows)
+		if err != nil {
 			return stats, err
 		}
-		if err := s.tableSize("account_snapshots", maxRows); err != nil {
+		stats.Events += n
+		n, err = s.tableSize("account_snapshots", maxRows)
+		if err != nil {
 			return stats, err
 		}
+		stats.Snapshots += n
 	}
 	if maxBytes > 0 {
 		size, err := s.databaseBytes()
 		if err == nil && size > maxBytes {
-			for _, table := range []string{"request_logs", "event_logs", "account_snapshots"} {
-				_, err := s.db.Exec(
-					"DELETE FROM " + table + " WHERE id IN (SELECT id FROM " + table + " ORDER BY id ASC LIMIT (SELECT COUNT(*)/5 FROM " + table + "))",
+			targets := []struct {
+				name string
+				dst  *int64
+			}{
+				{"request_logs", &stats.Requests},
+				{"event_logs", &stats.Events},
+				{"account_snapshots", &stats.Snapshots},
+			}
+			for _, t := range targets {
+				res, err := s.db.Exec(
+					"DELETE FROM " + t.name + " WHERE id IN (SELECT id FROM " + t.name + " ORDER BY id ASC LIMIT (SELECT COUNT(*)/5 FROM " + t.name + "))",
 				)
 				if err != nil {
 					return stats, err
 				}
+				affected, _ := res.RowsAffected()
+				*t.dst += affected
 			}
 			_, _ = s.db.Exec("VACUUM")
 		}

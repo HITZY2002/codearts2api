@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import UiAlert from '../components/ui/UiAlert.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import UiCard from '../components/ui/UiCard.vue'
@@ -34,11 +34,10 @@ const filtered = computed(() => {
   })
 })
 
-const hiddenList = computed(() => {
-  const raw = settingsSnapshot.value?.models_hidden || ''
+function parseHiddenList(raw) {
   const seen = new Set()
   const out = []
-  for (const part of raw.split(',')) {
+  for (const part of String(raw || '').split(',')) {
     const id = part.trim().toLowerCase()
     if (id && !seen.has(id)) {
       seen.add(id)
@@ -46,7 +45,9 @@ const hiddenList = computed(() => {
     }
   }
   return out
-})
+}
+
+const hiddenList = computed(() => parseHiddenList(settingsSnapshot.value?.models_hidden))
 
 async function loadSettings() {
   try {
@@ -57,13 +58,20 @@ async function loadSettings() {
   }
 }
 
-async function updateHiddenModels(nextList) {
+async function updateHiddenModels({ add = '', remove = '' }) {
   saving.value = true
   actionError.value = ''
   try {
     const latest = await request('/admin/api/settings')
     const baseSettings = latest.settings || settingsSnapshot.value
     if (!baseSettings) return
+    const current = parseHiddenList(baseSettings.models_hidden)
+    let nextList = current
+    if (add && !current.includes(add)) {
+      nextList = [...current, add]
+    } else if (remove) {
+      nextList = current.filter(item => item !== remove)
+    }
     const nextSettings = {
       ...baseSettings,
       models_hidden: nextList.join(', ')
@@ -84,26 +92,46 @@ async function updateHiddenModels(nextList) {
 function hideModel(id) {
   const target = String(id).trim().toLowerCase()
   if (!target || hiddenList.value.includes(target)) return
-  updateHiddenModels([...hiddenList.value, target])
+  updateHiddenModels({ add: target })
 }
 
 function unhideModel(id) {
   const target = String(id).trim().toLowerCase()
-  updateHiddenModels(hiddenList.value.filter(item => item !== target))
+  if (!target) return
+  updateHiddenModels({ remove: target })
 }
 
 async function copyModel(id) {
+  let copied = false
   try {
-    await navigator.clipboard?.writeText(id)
-    copiedId.value = id
-    clearTimeout(copyTimer)
-    copyTimer = setTimeout(() => { copiedId.value = '' }, 1400)
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(id)
+      copied = true
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = id
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      copied = document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
   } catch {
-    // 忽略剪贴板权限拒绝
+    copied = false
   }
+  if (!copied) {
+    actionError.value = '浏览器限制了剪贴板访问（非 HTTPS 环境请手动复制）'
+    return
+  }
+  actionError.value = ''
+  copiedId.value = id
+  clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => { copiedId.value = '' }, 1400)
 }
 
 onMounted(loadSettings)
+onBeforeUnmount(() => clearTimeout(copyTimer))
 </script>
 
 <template>

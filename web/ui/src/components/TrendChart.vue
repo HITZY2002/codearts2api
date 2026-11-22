@@ -66,9 +66,10 @@ const y2At = v => geom.value.m.top + geom.value.plotH * (1 - (v || 0) / y2Max.va
 
 const r2 = v => Math.round(v * 100) / 100
 
-function smoothPath(pts) {
+function smoothPath(pts, minY, maxY) {
   if (!pts.length) return ''
   if (pts.length === 1) return `M${pts[0][0]},${pts[0][1]}`
+  const clampY = y => Math.min(maxY, Math.max(minY, y))
   let d = `M${pts[0][0]},${pts[0][1]}`
   for (let i = 0; i < pts.length - 1; i++) {
     const p0 = pts[i - 1] || pts[i]
@@ -76,9 +77,9 @@ function smoothPath(pts) {
     const p2 = pts[i + 1]
     const p3 = pts[i + 2] || p2
     const c1x = p1[0] + (p2[0] - p0[0]) / 6
-    const c1y = p1[1] + (p2[1] - p0[1]) / 6
+    const c1y = clampY(p1[1] + (p2[1] - p0[1]) / 6)
     const c2x = p2[0] - (p3[0] - p1[0]) / 6
-    const c2y = p2[1] - (p3[1] - p1[1]) / 6
+    const c2y = clampY(p2[1] - (p3[1] - p1[1]) / 6)
     d += ` C${r2(c1x)},${r2(c1y)} ${r2(c2x)},${r2(c2y)} ${p2[0]},${p2[1]}`
   }
   return d
@@ -93,7 +94,7 @@ const lineSeries = computed(() => {
     .map((s, index) => {
       const yFn = s.yAxisIndex === 1 ? y2At : y1At
       const pts = s.data.map((v, i) => [r2(xAt(i)), r2(yFn(v))])
-      const linePath = smoothPath(pts)
+      const linePath = smoothPath(pts, m.top, baseY)
       const first = pts[0]
       const last = pts[pts.length - 1]
       const areaPath = pts.length && s.area ? `${linePath} L${last[0]},${r2(baseY)} L${first[0]},${r2(baseY)} Z` : ''
@@ -238,6 +239,15 @@ const tipRows = computed(() => {
         v-for="s in lineSeries" :key="`l${s.name}`" :d="s.linePath" fill="none"
         :stroke="s.color" stroke-width="2" stroke-linecap="round" :opacity="hover >= 0 ? 0.92 : 1"
       />
+
+      <!-- 单点数据圆点（单桶时折线路径长度为 0，始终显示圆点） -->
+      <g v-if="geom.n === 1 && hover < 0">
+        <circle
+          v-for="s in lineSeries" :key="`s${s.name}`"
+          :cx="s.pts[0]?.[0]" :cy="s.pts[0]?.[1]" r="3.6"
+          :fill="s.color" stroke="var(--card)" stroke-width="1.5"
+        />
+      </g>
 
       <!-- 悬停数据点 -->
       <g v-if="hover >= 0">

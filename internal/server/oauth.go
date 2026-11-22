@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -235,6 +234,7 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	// 远端若仍无法回调则回退到 ticket 轮询通道，不影响登录完成。
 	if h.cfg.OAuthCallbackHost != "" {
 		if p := portOfCallbackHost(h.cfg.OAuthCallbackHost); p != 0 {
+			port = p
 			authURL = rewriteAuthURLPort(authURL, p)
 		}
 	}
@@ -293,7 +293,7 @@ func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := h.cfg.OAuthClient.PollTicket(context.Background(), h.cfg.LoginConfig, sess.TicketID, sess.Secret)
+	tok, err := h.cfg.OAuthClient.PollTicket(r.Context(), h.cfg.LoginConfig, sess.TicketID, sess.Secret)
 	if err != nil || tok == nil || tok.UserName == "" || tok.Credentials.SecurityToken == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "status": "pending", "message": "等待浏览器完成登录…",

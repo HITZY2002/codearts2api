@@ -13,6 +13,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,26 @@ import (
 	"strings"
 	"time"
 )
+
+const maxSSELineBytes = 4 << 20 // 单行 SSE 上限 4 MiB，防止畸形无换行响应耗尽内存
+
+func readLineLimited(br *bufio.Reader, maxBytes int) (string, error) {
+	var buf bytes.Buffer
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if buf.Len()+len(chunk) > maxBytes {
+			return "", fmt.Errorf("sse line exceeds %d bytes", maxBytes)
+		}
+		buf.Write(chunk)
+		if err == nil || err == io.EOF {
+			return buf.String(), err
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return buf.String(), err
+	}
+}
 
 // UpstreamError 流内业务错误。
 type UpstreamError struct {
@@ -443,7 +464,7 @@ func applyEvent(content, reason *textBuffer, finish *string, upErr *error, event
 		}
 		if f := text("finish_reason", "finish", "reason"); f != "" {
 			*finish = f
-		} else {
+		} else if *finish == "" {
 			*finish = "stop"
 		}
 	}
@@ -531,7 +552,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 	)
 	var pendingEvent string
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLineLimited(br, maxSSELineBytes)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
@@ -632,9 +653,11 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			CreditUsage: creditUsage,
 		}
 	}
+	emittedFinish := false
 	writeChunk := func(delta map[string]any, fin string) error {
 		choice := map[string]any{"index": 0, "delta": delta}
 		if fin != "" {
+			emittedFinish = true
 			choice["finish_reason"] = fin
 		}
 		chunk := map[string]any{
@@ -657,6 +680,15 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		return nil
 	}
 	writeDONE := func(success bool) error {
+		if success && !emittedFinish {
+			fin := finish
+			if fin == "" {
+				fin = "stop"
+			}
+			if err := writeChunk(map[string]any{}, fin); err != nil {
+				return err
+			}
+		}
 		if success && usageFor != nil {
 			chunk := map[string]any{
 				"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
@@ -694,7 +726,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 	}
 
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLineLimited(br, maxSSELineBytes)
 		if err != nil && err != io.EOF {
 			streamErr = err
 			break
@@ -744,7 +776,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 			if reason.Len() > beforeReasonLen {
 				delta["reasoning_content"] = reason.tail(beforeReasonLen)
 			}
-			if toolCalls, ok := nativeDelta["tool_calls"]; ok {
+			if toolCalls, ok := nativeDelta["tool_calls"]; ok && toolCalls != nil {
 				delta["tool_calls"] = toolCalls
 			}
 			if len(delta) > 0 || nativeFinish != "" {

@@ -41,7 +41,7 @@ func signRequest(req *http.Request, body []byte, cred SignCredential) {
 	canonicalHeaders, signedHeaders := canonicalHeaders(req)
 	canonicalRequest := strings.Join([]string{
 		req.Method,
-		canonicalURI(req.URL.EscapedPath()),
+		canonicalURI(req.URL.Path),
 		canonicalQuery(req.URL.RawQuery),
 		canonicalHeaders,
 		signedHeaders,

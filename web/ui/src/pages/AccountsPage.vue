@@ -9,7 +9,7 @@ import UiInput from '../components/ui/UiInput.vue'
 import UiSelect from '../components/ui/UiSelect.vue'
 import UiTag from '../components/ui/UiTag.vue'
 import Icon from '../components/ui/Icon.vue'
-import { accountRows, loadAll } from '../store'
+import { accountRows, loadAll, loading } from '../store'
 import { loggedIn, request } from '../api'
 import { campaignStatusLabel, campaignStatusType, formatCredit, formatNumber, formatRemaining, formatTime } from '../utils'
 
@@ -26,6 +26,8 @@ const creditError = ref('')
 const accountSearch = ref('')
 const accountActionLoading = ref({})
 const accountActionFeedback = ref({})
+const reloadLoading = ref(false)
+const poolFeedback = ref(null) // { type: 'success' | 'error', message: string }
 
 // ---- OAuth 添加账号 ----
 const oauthLoading = ref(false)
@@ -42,6 +44,7 @@ const batchCheckinResults = ref([])
 const batchCheckinMessage = ref('')
 const batchCheckinError = ref(false)
 const batchCheckinPage = ref(1)
+const batchCheckinPageSize = ref(20)
 
 const batchSizeOptions = [1, 3, 5, 10].map(value => ({ label: `每批 ${value} 个账号`, value }))
 
@@ -77,10 +80,27 @@ function accountDisplayName(uid) {
   return accountRows.value.find(account => account.uid === uid)?.nickname || uid
 }
 
-function afterMutation() {
-  loadAll()
+async function afterMutation() {
+  await loadAll()
   creditLoaded.value = false
-  loadCreditBalances()
+  await loadCreditBalances()
+}
+
+async function reloadAccountsFromDisk() {
+  reloadLoading.value = true
+  poolFeedback.value = null
+  try {
+    const result = await request('/admin/api/reload', { method: 'POST', body: JSON.stringify({}) })
+    poolFeedback.value = {
+      type: 'success',
+      message: `${result.message || '已重载 auths'}（加载 ${result.loaded ?? 0} 个，池内 ${result.total ?? 0} 个，健康 ${result.healthy ?? 0} 个）`
+    }
+    await afterMutation()
+  } catch (error) {
+    poolFeedback.value = { type: 'error', message: `重载失败：${error.message}` }
+  } finally {
+    reloadLoading.value = false
+  }
 }
 
 async function runAccountAction(account, action) {
@@ -88,7 +108,10 @@ async function runAccountAction(account, action) {
   const actions = {
     validate: { path: '/admin/api/credits', label: '校验' },
     checkin: { path: '/admin/api/checkin', label: '签到' },
-    keepalive: { path: '/admin/api/keepalive', label: '保活' }
+    keepalive: { path: '/admin/api/keepalive', label: '保活' },
+    enable: { path: '/admin/api/accounts/enable', label: '启用' },
+    disable: { path: '/admin/api/accounts/disable', label: '禁用' },
+    clearCooldown: { path: '/admin/api/accounts/clear-cooldown', label: '清冷却' }
   }
   const selected = actions[action]
   accountActionLoading.value = { ...accountActionLoading.value, [uid]: action }
@@ -105,7 +128,7 @@ async function runAccountAction(account, action) {
       ...accountActionFeedback.value,
       [uid]: { type: feedbackType, message: `${selected.label}${ok ? '完成' : '失败'}：${message}` }
     }
-    afterMutation()
+    await afterMutation()
   } catch (error) {
     accountActionFeedback.value = {
       ...accountActionFeedback.value,
@@ -135,7 +158,7 @@ async function pollAccountLogin(sessionID) {
         method: 'POST',
         body: JSON.stringify({ session_id: sessionID })
       })
-      if (unmounted) return
+      if (unmounted || oauthSession.value?.session_id !== sessionID) return
       oauthStatus.value = result.message || ''
       oauthError.value = result.status === 'error'
       if (result.status === 'done' || result.status === 'error') {
@@ -147,7 +170,7 @@ async function pollAccountLogin(sessionID) {
         return
       }
     } catch (error) {
-      if (unmounted) return
+      if (unmounted || oauthSession.value?.session_id !== sessionID) return
       oauthStatus.value = error.message
       oauthError.value = true
       oauthSession.value = null
@@ -177,7 +200,8 @@ async function startAccountLogin() {
 }
 
 async function importAccountCallback() {
-  if (!oauthSession.value || !oauthCallbackURL.value) return
+  if (!oauthSession.value || !oauthCallbackURL.value || oauthLoading.value) return
+  oauthLoading.value = true
   try {
     const result = await request('/admin/api/oauth/import-callback', {
       method: 'POST',
@@ -190,6 +214,8 @@ async function importAccountCallback() {
     oauthError.value = result.status === 'error'
     if (result.next_url) {
       oauthSession.value = { ...oauthSession.value, auth_url: result.next_url }
+      oauthCallbackURL.value = ''
+      window.open(result.next_url, '_blank', 'noopener')
     }
     if (result.status === 'done') {
       oauthSession.value = null
@@ -199,6 +225,8 @@ async function importAccountCallback() {
   } catch (error) {
     oauthStatus.value = error.message
     oauthError.value = true
+  } finally {
+    oauthLoading.value = false
   }
 }
 
@@ -321,31 +349,55 @@ const accountColumns = [
       : '—'
   },
   {
-    title: '操作', key: 'actions', width: 190, fixed: 'right',
+    title: '操作', key: 'actions', width: 280, fixed: 'right',
     render: row => {
       const loadingAction = accountActionLoading.value[row.uid]
       const feedback = accountActionFeedback.value[row.uid]
+      const btns = [
+        h(UiButton, {
+          size: 'xs', variant: 'outline',
+          loading: loadingAction === 'validate',
+          disabled: Boolean(loadingAction) && loadingAction !== 'validate',
+          onClick: () => runAccountAction(row, 'validate')
+        }, { default: () => '校验' }),
+        h(UiButton, {
+          size: 'xs', variant: 'outline',
+          loading: loadingAction === 'checkin',
+          disabled: Boolean(loadingAction) && loadingAction !== 'checkin',
+          onClick: () => runAccountAction(row, 'checkin')
+        }, { default: () => '签到' }),
+        h(UiButton, {
+          size: 'xs', variant: 'outline',
+          loading: loadingAction === 'keepalive',
+          disabled: Boolean(loadingAction) && loadingAction !== 'keepalive',
+          onClick: () => runAccountAction(row, 'keepalive')
+        }, { default: () => '保活' })
+      ]
+      if (row.cooling) {
+        btns.push(h(UiButton, {
+          size: 'xs', variant: 'outline',
+          loading: loadingAction === 'clearCooldown',
+          disabled: Boolean(loadingAction) && loadingAction !== 'clearCooldown',
+          onClick: () => runAccountAction(row, 'clearCooldown')
+        }, { default: () => '清冷却' }))
+      }
+      if (row.disabled) {
+        btns.push(h(UiButton, {
+          size: 'xs', variant: 'primary',
+          loading: loadingAction === 'enable',
+          disabled: Boolean(loadingAction) && loadingAction !== 'enable',
+          onClick: () => runAccountAction(row, 'enable')
+        }, { default: () => '启用' }))
+      } else {
+        btns.push(h(UiButton, {
+          size: 'xs', variant: 'danger',
+          loading: loadingAction === 'disable',
+          disabled: Boolean(loadingAction) && loadingAction !== 'disable',
+          onClick: () => runAccountAction(row, 'disable')
+        }, { default: () => '禁用' }))
+      }
       return h('div', { class: 'account-actions' }, [
-        h('div', { class: 'row' }, [
-          h(UiButton, {
-            size: 'xs', variant: 'outline',
-            loading: loadingAction === 'validate',
-            disabled: Boolean(loadingAction) && loadingAction !== 'validate',
-            onClick: () => runAccountAction(row, 'validate')
-          }, { default: () => '校验' }),
-          h(UiButton, {
-            size: 'xs', variant: 'outline',
-            loading: loadingAction === 'checkin',
-            disabled: Boolean(loadingAction) && loadingAction !== 'checkin',
-            onClick: () => runAccountAction(row, 'checkin')
-          }, { default: () => '签到' }),
-          h(UiButton, {
-            size: 'xs', variant: 'outline',
-            loading: loadingAction === 'keepalive',
-            disabled: Boolean(loadingAction) && loadingAction !== 'keepalive',
-            onClick: () => runAccountAction(row, 'keepalive')
-          }, { default: () => '保活' })
-        ]),
+        h('div', { class: 'row' }, btns),
         feedback
           ? h('span', { class: ['account-action-feedback', feedback.type], title: feedback.message }, feedback.message)
           : null
@@ -368,6 +420,7 @@ onMounted(() => {
         </UiTag>
         <UiButton variant="outline" size="sm" @click="batchCheckinOpen = true">批量签到</UiButton>
         <UiButton variant="outline" size="sm" :loading="creditLoading" @click="loadCreditBalances">刷新余额</UiButton>
+        <UiButton variant="outline" size="sm" :loading="reloadLoading" @click="reloadAccountsFromDisk">重载账号</UiButton>
         <a
           v-if="oauthSession?.auth_url" class="u-btn u-btn--outline u-btn--sm"
           :href="oauthSession.auth_url" target="_blank" rel="noopener"
@@ -390,6 +443,10 @@ onMounted(() => {
         </div>
       </div>
 
+      <div v-if="poolFeedback" style="padding: 14px 18px 0">
+        <UiAlert :type="poolFeedback.type">{{ poolFeedback.message }}</UiAlert>
+      </div>
+
       <div v-if="creditError" style="padding: 14px 18px 0">
         <UiAlert type="warning">{{ creditError }}</UiAlert>
       </div>
@@ -408,7 +465,7 @@ onMounted(() => {
       </div>
 
       <UiDataTable
-        :columns="accountColumns" :data="filteredAccounts" :loading="loading" :scroll-x="1130"
+        :columns="accountColumns" :data="filteredAccounts" :loading="loading" :scroll-x="1220"
         :row-key="row => row.uid"
       />
     </UiCard>
@@ -430,9 +487,10 @@ onMounted(() => {
         :pagination="{
           local: true,
           page: batchCheckinPage,
-          pageSize: 20,
+          pageSize: batchCheckinPageSize,
           itemCount: batchCheckinResults.length,
-          onUpdatePage: p => { batchCheckinPage = p }
+          onUpdatePage: p => { batchCheckinPage = p },
+          onUpdatePageSize: s => { batchCheckinPageSize = s; batchCheckinPage = 1 }
         }"
       />
     </UiDrawer>
