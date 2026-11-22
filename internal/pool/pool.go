@@ -527,6 +527,30 @@ func (p *Pool) NoteSuccess(name string) {
 	}
 }
 
+// Remove 从账号池中移除指定账号并持久化状态。
+func (p *Pool) Remove(name string) (*Account, bool) {
+	p.mu.Lock()
+	var removed *Account
+	next := make([]*Account, 0, len(p.accounts))
+	for _, a := range p.accounts {
+		if removed == nil && (a.Name == name || a.UID == name) {
+			removed = a
+			continue
+		}
+		next = append(next, a)
+	}
+	if removed != nil {
+		p.accounts = next
+	}
+	p.mu.Unlock()
+	if removed != nil {
+		p.saveState()
+		log.Printf("pool account removed name=%s uid=%s", removed.Name, removed.UID)
+		return removed, true
+	}
+	return nil, false
+}
+
 // Disable 禁用账号（自动禁用：401/凭证失效等；刷新成功后自动解禁）。
 func (p *Pool) Disable(name, reason string) bool {
 	p.mu.Lock()

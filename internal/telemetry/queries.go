@@ -35,21 +35,29 @@ type EventFilter struct {
 	Offset     int
 }
 
+// ModelUsageStat aggregates request and token counts for a single model.
+type ModelUsageStat struct {
+	Model        string `json:"model"`
+	RequestCount int64  `json:"request_count"`
+	TotalTokens  int64  `json:"total_tokens"`
+}
+
 // MetricsOverview summarizes requests in a time range.
 type MetricsOverview struct {
-	TotalRequests    int64   `json:"total_requests"`
-	SuccessCount     int64   `json:"success_count"`
-	ErrorCount       int64   `json:"error_count"`
-	SuccessRate      float64 `json:"success_rate"`
-	TTFTP50Ms        int64   `json:"ttft_p50_ms"`
-	TTFTP95Ms        int64   `json:"ttft_p95_ms"`
-	TTFTP99Ms        int64   `json:"ttft_p99_ms"`
-	TotalP50Ms       int64   `json:"total_p50_ms"`
-	TotalP95Ms       int64   `json:"total_p95_ms"`
-	TotalP99Ms       int64   `json:"total_p99_ms"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
+	TotalRequests    int64            `json:"total_requests"`
+	SuccessCount     int64            `json:"success_count"`
+	ErrorCount       int64            `json:"error_count"`
+	SuccessRate      float64          `json:"success_rate"`
+	TTFTP50Ms        int64            `json:"ttft_p50_ms"`
+	TTFTP95Ms        int64            `json:"ttft_p95_ms"`
+	TTFTP99Ms        int64            `json:"ttft_p99_ms"`
+	TotalP50Ms       int64            `json:"total_p50_ms"`
+	TotalP95Ms       int64            `json:"total_p95_ms"`
+	TotalP99Ms       int64            `json:"total_p99_ms"`
+	PromptTokens     int64            `json:"prompt_tokens"`
+	CompletionTokens int64            `json:"completion_tokens"`
+	TotalTokens      int64            `json:"total_tokens"`
+	ByModel          []ModelUsageStat `json:"by_model"`
 }
 
 // MetricsSeriesPoint aggregates requests into a time bucket.
@@ -256,6 +264,44 @@ func (s *Store) MetricsOverview(from, to int64) (MetricsOverview, error) {
 	}
 	if err := s.scanDurations("total_ms", from, to, &out.TotalP50Ms, &out.TotalP95Ms, &out.TotalP99Ms); err != nil {
 		return out, err
+	}
+	byModel, err := s.scanModelStats(where, args)
+	if err != nil {
+		return out, err
+	}
+	out.ByModel = byModel
+	return out, nil
+}
+
+func (s *Store) scanModelStats(where string, args []any) ([]ModelUsageStat, error) {
+	modelWhere := where
+	if modelWhere == "" {
+		modelWhere = " WHERE TRIM(model) != ''"
+	} else {
+		modelWhere += " AND TRIM(model) != ''"
+	}
+	rows, err := s.db.Query(
+		`SELECT LOWER(TRIM(model)) AS m, COUNT(*), COALESCE(SUM(total_tokens), 0)
+		 FROM request_logs`+modelWhere+`
+		 GROUP BY m
+		 ORDER BY COUNT(*) DESC, m ASC
+		 LIMIT 20`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ModelUsageStat, 0)
+	for rows.Next() {
+		var stat ModelUsageStat
+		if err := rows.Scan(&stat.Model, &stat.RequestCount, &stat.TotalTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, stat)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

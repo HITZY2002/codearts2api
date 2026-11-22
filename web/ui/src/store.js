@@ -6,14 +6,13 @@ import { apiKey, loading, loggedIn, request, setKey } from './api'
 export { apiKey, loading, loggedIn, request, setKey }
 
 function defaultMetrics() {
-  return { total_requests: 0, success_rate: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, ttft_p99_ms: 0, total_tokens: 0, error_count: 0 }
+  return { total_requests: 0, success_rate: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, ttft_p99_ms: 0, total_tokens: 0, error_count: 0, by_model: [] }
 }
 
 export const overview = ref(null)
 export const metrics = ref(defaultMetrics())
 export const series = ref([])
 export const logs = ref([])
-export const dashboardLogs = ref([])
 export const events = ref([])
 export const observabilityDisabled = ref(false)
 export const actionLoading = ref('')
@@ -107,21 +106,16 @@ export async function loadAll() {
     const activeLogFilterEntries = Object.entries(logFilters.value).filter(([, value]) => value !== null && value !== '')
     const filterQuery = new URLSearchParams(activeLogFilterEntries.map(([key, value]) => [key, String(value)]))
     const eventFilterQuery = new URLSearchParams(Object.entries(eventFilters.value).filter(([, value]) => value !== null && value !== '').map(([key, value]) => [key, String(value)]))
-    const needSeparateDashboardLogs = activeLogFilterEntries.length > 0 || logPage.value > 1
 
-    const requests = [
+    const results = await Promise.allSettled([
       request(`/admin/api/metrics/overview?${query}`),
       request(`/admin/api/metrics/series?${query}&interval=${interval}`),
       request(`/admin/api/logs?${query}&${filterQuery}&limit=${logPageSize.value}&offset=${(logPage.value - 1) * logPageSize.value}`),
       request(`/admin/api/events?${query}&${eventFilterQuery}&limit=${eventPageSize.value}&offset=${(eventPage.value - 1) * eventPageSize.value}`)
-    ]
-    if (needSeparateDashboardLogs) {
-      requests.push(request(`/admin/api/logs?${query}&limit=200&offset=0`))
-    }
-    const results = await Promise.allSettled(requests)
+    ])
     if (seq !== loadSeq) return
 
-    const [metricsRes, seriesRes, logsRes, eventsRes, dashLogsRes] = results
+    const [metricsRes, seriesRes, logsRes, eventsRes] = results
     const obsResults = results
     const disabled = obsResults.some(res =>
       res.status === 'rejected' &&
@@ -132,14 +126,16 @@ export async function loadAll() {
       metrics.value = defaultMetrics()
       series.value = []
       logs.value = []
-      dashboardLogs.value = []
       logTotal.value = 0
       events.value = []
       eventTotal.value = 0
     } else {
       let needPageClampReload = false
       if (metricsRes.status === 'fulfilled') {
-        metrics.value = metricsRes.value?.metrics || defaultMetrics()
+        metrics.value = { ...defaultMetrics(), ...(metricsRes.value?.metrics || {}) }
+        for (const item of metrics.value.by_model || []) {
+          if (item?.model) seenOptionValues.value.logs.model.add(String(item.model))
+        }
       }
       if (seriesRes.status === 'fulfilled') {
         series.value = seriesRes.value?.items || []
@@ -153,14 +149,6 @@ export async function loadAll() {
           logPage.value = maxLogPage
           needPageClampReload = true
         }
-      }
-      if (needSeparateDashboardLogs) {
-        if (dashLogsRes?.status === 'fulfilled') {
-          dashboardLogs.value = dashLogsRes.value?.items || []
-          collectSeenOptions('logs', dashboardLogs.value, ['model', 'account_uid', 'error_type'])
-        }
-      } else if (logsRes.status === 'fulfilled') {
-        dashboardLogs.value = logs.value
       }
       if (eventsRes.status === 'fulfilled') {
         events.value = eventsRes.value?.items || []
@@ -218,7 +206,6 @@ export function logout() {
   metrics.value = defaultMetrics()
   series.value = []
   logs.value = []
-  dashboardLogs.value = []
   logTotal.value = 0
   events.value = []
   eventTotal.value = 0

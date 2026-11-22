@@ -245,6 +245,16 @@ func (a *Auth) SetPath(p string) {
 	a.mu.Unlock()
 }
 
+// PathSnapshot 返回当前凭证文件路径（并发安全快照）。
+func (a *Auth) PathSnapshot() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.path
+}
+
 // LoadDir 加载 auths 目录下全部 codearts-*.json。
 func LoadDir(dir string) ([]*Auth, error) {
 	entries, err := os.ReadDir(dir)

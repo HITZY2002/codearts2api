@@ -8,7 +8,7 @@ import UiCard from '../components/ui/UiCard.vue'
 import UiSegmented from '../components/ui/UiSegmented.vue'
 import UiStatTile from '../components/ui/UiStatTile.vue'
 import {
-  actionFeedback, actionLoading, dashboardLogs, metrics, observabilityDisabled,
+  actionFeedback, actionLoading, metrics, observabilityDisabled,
   range, rangeOptions, reloadDashboard, runAction, series
 } from '../store'
 import { CHART_PALETTE, formatNumber } from '../utils'
@@ -52,22 +52,16 @@ const errorRateText = computed(() => {
   return `错误率 ${((metrics.value.error_count / total) * 100).toFixed(1)}%`
 })
 
-// 模型调用占比（基于当前时间范围内未筛选样本，不受日志页筛选/翻页污染）
+// 模型调用占比（后端 SQL 全周期 GROUP BY model 聚合，100% 精准）
 const modelStats = computed(() => {
-  const counts = new Map()
-  for (const row of dashboardLogs.value) {
-    if (row.model) counts.set(row.model, (counts.get(row.model) || 0) + 1)
-  }
-  const total = [...counts.values()].reduce((sum, n) => sum + n, 0) || 1
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([model, count], index) => ({
-      model,
-      count,
-      share: count / total,
-      color: CHART_PALETTE[index % CHART_PALETTE.length]
-    }))
+  const rows = (metrics.value.by_model || []).filter(item => item?.model && item.request_count > 0)
+  const total = rows.reduce((sum, item) => sum + item.request_count, 0) || 1
+  return rows.slice(0, 6).map((item, index) => ({
+    model: item.model,
+    count: item.request_count,
+    share: item.request_count / total,
+    color: CHART_PALETTE[index % CHART_PALETTE.length]
+  }))
 })
 
 const donutItems = computed(() =>
@@ -78,7 +72,9 @@ const donutItems = computed(() =>
     color: m.color
   }))
 )
-const sampleTotal = computed(() => modelStats.value.reduce((sum, m) => sum + m.count, 0))
+const modelCallTotal = computed(() =>
+  (metrics.value.by_model || []).reduce((sum, item) => sum + (item?.request_count || 0), 0)
+)
 
 // ---- Token 消耗趋势 ----
 const trendLabels = computed(() =>
@@ -209,10 +205,10 @@ const latencyChart = computed(() => ({
           </span>
           <span class="health-sep" />
           <span class="health-chip">成功率 <span class="v" :class="successTone">{{ (metrics.success_rate * 100).toFixed(2) }}%</span></span>
-          <span class="health-chip">P99 延迟 <span class="v">{{ metrics.ttft_p99_ms ?? '—' }} ms</span></span>
+          <span class="health-chip">P99 延迟 <span class="v">{{ metrics.total_requests ? `${metrics.ttft_p99_ms} ms` : '—' }}</span></span>
         </div>
         <div v-if="modelStats.length" class="health-models">
-          <span v-for="m in modelStats" :key="m.model" class="model-chip" :title="`最近一页日志中 ${m.model} 占 ${m.count} 次`">
+          <span v-for="m in modelStats" :key="m.model" class="model-chip" :title="`统计周期内 ${m.model} 共调用 ${formatNumber(m.count)} 次`">
             <span class="dot" :style="{ background: m.color }" />
             {{ m.model }}
             <span class="pct">{{ (m.share * 100).toFixed(1) }}%</span>
@@ -252,8 +248,8 @@ const latencyChart = computed(() => ({
         <DonutChart
           v-if="distTab === 'models'"
           :items="donutItems"
-          center-label="近页样本"
-          :center-value="formatNumber(sampleTotal)"
+          center-label="周期调用"
+          :center-value="formatNumber(modelCallTotal)"
         />
 
         <template v-else>
