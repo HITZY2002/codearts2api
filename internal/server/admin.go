@@ -21,7 +21,8 @@ func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
 	models := h.modelList()
 	ids := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		ids = append(ids, map[string]any{"id": m["id"]})
+		benefit, _ := m["benefit"].(bool)
+		ids = append(ids, map[string]any{"id": m["id"], "benefit": benefit})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "codearts2api",

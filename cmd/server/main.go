@@ -195,17 +195,33 @@ func loginConfig(cfg *Config) upstream.LoginConfig {
 }
 
 func settingsFromConfig(cfg Config) server.Settings {
+	// config.json 缺省的字段回退 DefaultSettings，避免零值进入设置
+	// （历史问题：queue 字段缺省时设置页显示 0，保存会被范围校验拒绝）。
 	settings := server.DefaultSettings()
-	settings.DefaultModel = cfg.DefaultModel
-	settings.MaxConcurrent = cfg.MaxConcurrent
-	settings.QueueRetrySeconds = cfg.QueueRetrySeconds
-	settings.QueueMaxAttempts = cfg.QueueMaxAttempts
+	if cfg.DefaultModel != "" {
+		settings.DefaultModel = cfg.DefaultModel
+	}
+	if cfg.MaxConcurrent > 0 {
+		settings.MaxConcurrent = cfg.MaxConcurrent
+	}
+	if cfg.QueueRetrySeconds > 0 {
+		settings.QueueRetrySeconds = cfg.QueueRetrySeconds
+	}
+	if cfg.QueueMaxAttempts > 0 {
+		settings.QueueMaxAttempts = cfg.QueueMaxAttempts
+	}
 	settings.BenefitAutoClaim = cfg.BenefitAutoClaim
 	settings.CreditsAutoClaim = cfg.CreditsAutoClaim
 	settings.WatchEnabled = cfg.Watch.Enabled
-	settings.PollMinutes = cfg.Watch.PollMinutes
-	settings.RefreshSkewMinutes = cfg.Watch.RefreshSkewM
-	settings.KeepaliveIntervalMinutes = cfg.Watch.KeepaliveInterval
+	if cfg.Watch.PollMinutes > 0 {
+		settings.PollMinutes = cfg.Watch.PollMinutes
+	}
+	if cfg.Watch.RefreshSkewM > 0 {
+		settings.RefreshSkewMinutes = cfg.Watch.RefreshSkewM
+	}
+	if cfg.Watch.KeepaliveInterval > 0 {
+		settings.KeepaliveIntervalMinutes = cfg.Watch.KeepaliveInterval
+	}
 	settings.KeepaliveWindowMinutes = int(poolConfigKeepaliveWindow(cfg).Minutes())
 	return settings
 }

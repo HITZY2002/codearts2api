@@ -443,7 +443,7 @@ func CanonicalModel(id string) string {
 	if exact, ok := lookupKnownModel(id); ok {
 		return exact
 	}
-	switch id {
+	switch strings.ToLower(id) {
 	case "snap-chat", "glm-5.2":
 		return "GLM-5.2"
 	case "glm-5.1":
