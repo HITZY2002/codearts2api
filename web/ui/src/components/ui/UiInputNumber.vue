@@ -14,10 +14,11 @@ const display = computed(() => (model.value == null ? '' : String(model.value)))
 
 function commit(event) {
   const raw = event.target.value.trim()
-  let value = raw === '' ? null : Number(raw)
-  if (value != null && Number.isNaN(value)) value = model.value
-  if (value != null) value = Math.min(props.max, Math.max(props.min, Math.round(value)))
-  event.target.value = value == null ? '' : String(value)
+  const fallback = typeof model.value === 'number' && !Number.isNaN(model.value) ? model.value : props.min
+  let value = raw === '' ? fallback : Number(raw)
+  if (Number.isNaN(value)) value = fallback
+  value = Math.min(props.max, Math.max(props.min, Math.round(value)))
+  event.target.value = String(value)
   model.value = value
 }
 </script>

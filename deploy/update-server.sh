@@ -51,33 +51,35 @@ start_binary() {
 # running_new_pid 输出已加载新二进制的进程 pid（按 /proc/<pid>/exe 校验）。
 running_new_pid() {
 	local pid exe
-	for pid in $(pgrep -f '(^|/)codearts2api-linux-amd64$' || true); do
+	while IFS= read -r pid; do
+		[[ -z "${pid}" ]] && continue
 		exe="$(sha256sum "/proc/${pid}/exe" 2>/dev/null | awk '{print $1}' || true)"
 		if [[ "${exe}" == "${actual_sha256}" ]]; then
 			printf '%s' "${pid}"
 			return 0
 		fi
-	done
+	done < <(pgrep -f '(^|/)codearts2api-linux-amd64([[:space:]]|$)' || true)
 	return 1
 }
 
-old_pids="$(pgrep -f '(^|/)codearts2api-linux-amd64$' || true)"
-if [[ -n "${old_pids}" ]]; then
-	kill -TERM ${old_pids}
+mapfile -t old_pids < <(pgrep -f '(^|/)codearts2api-linux-amd64([[:space:]]|$)' || true)
+if (( ${#old_pids[@]} > 0 )); then
+	kill -TERM "${old_pids[@]}" 2>/dev/null || true
+	remaining=()
 	for _ in $(seq 1 20); do
-		running=""
-		for pid in ${old_pids}; do
-			if kill -0 "${pid}" 2>/dev/null; then
-				running="${running} ${pid}"
+		remaining=()
+		for pid in "${old_pids[@]}"; do
+			if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+				remaining+=("${pid}")
 			fi
 		done
-		if [[ -z "${running}" ]]; then
+		if (( ${#remaining[@]} == 0 )); then
 			break
 		fi
 		sleep 0.5
 	done
-	if [[ -n "${running:-}" ]]; then
-		kill -KILL ${running}
+	if (( ${#remaining[@]} > 0 )); then
+		kill -KILL "${remaining[@]}" 2>/dev/null || true
 	fi
 fi
 
@@ -95,10 +97,14 @@ if [[ -z "${new_pid}" ]]; then
 	sleep 2
 	new_pid="$(cat "${pid_file}")"
 	if ! kill -0 "${new_pid}" 2>/dev/null; then
-		printf 'new process failed to start; restoring %s\n' "${backup}" >&2
-		mv "${backup}" "${current}"
-		start_binary
-		sleep 2
+		if [[ -f "${backup}" ]]; then
+			printf 'new process failed to start; restoring %s\n' "${backup}" >&2
+			mv "${backup}" "${current}"
+			start_binary
+			sleep 2
+		else
+			printf 'new process failed to start; no backup available to restore\n' >&2
+		fi
 		exit 1
 	fi
 else

@@ -1,5 +1,9 @@
 auths
 data
+bin
+config.json
+.env
 .git
 *.exe
 web/ui/node_modules
+internal/server/webui/dist

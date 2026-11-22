@@ -293,23 +293,22 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	if acct == nil {
 		return nil, fmt.Errorf("account required for model fetch")
 	}
+	tok, ak, sk := acct.Credentials()
 	cred := SignCredential{
-		AccessKeyID:     acct.AccessKeyID,
-		SecretAccessKey: acct.SecretAccessKey,
-		SecurityToken:   acct.CloudDragonTok,
+		AccessKeyID:     ak,
+		SecretAccessKey: sk,
+		SecurityToken:   tok,
 	}
-	accountID := acct.UserID
+	accountID := acct.UserIDSnapshot()
 	var sets [][]ModelInfo
 	if infos, err := c.fetchAgentModels(cred); err != nil {
 		Log("agent models: %v", err)
 	} else {
 		sets = append(sets, infos)
 	}
-	builtinOK := false
 	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
-		builtinOK = true
 		sets = append(sets, infos)
 	}
 	benefitOK := false
@@ -323,8 +322,8 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
-	setAccountModels(accountID, out, builtinOK && !benefitOK)
+	// 福利来源失败但其他来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
+	setAccountModels(accountID, out, !benefitOK)
 	return out, nil
 }
 

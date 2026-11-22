@@ -22,6 +22,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("load: %v", err)
 	}
+	if len(auths) == 0 {
+		log.Fatalf("no accounts found in %s", *authDir)
+	}
 	a := auths[0]
 	cred := upstream.SignCredential{
 		AccessKeyID: a.AccessKeyID, SecretAccessKey: a.SecretAccessKey, SecurityToken: a.CloudDragonTok,

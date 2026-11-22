@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -143,6 +144,13 @@ type Handler struct {
 	convDirty        bool
 	convFlushPending bool
 	convFileMu       sync.Mutex
+
+	// 目录惰性发现按账号 UID 去重（singleflight），防止并发请求重复打上游 FetchModels。
+	catalogFlightMu sync.Mutex
+	catalogFlight   map[string]chan struct{}
+
+	// 串行化设置写盘与内存热应用，防止并发 POST /admin/api/settings 导致磁盘与运行时分叉。
+	settingsMu sync.Mutex
 }
 
 // runtimeTuning 读取可热更新的请求参数快照。
@@ -165,6 +173,9 @@ func (h *Handler) watchInfoSnapshot() map[string]any {
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
+	if cfg.Telemetry != nil && cfg.ObservabilityRetentionDays <= 0 {
+		cfg.ObservabilityRetentionDays = 30
+	}
 	if cfg.Settings == nil {
 		cfg.Settings = newSettingsStore("", fallbackSettings(cfg))
 	}
@@ -205,17 +216,19 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
-		convAcct: map[string]conversationBinding{},
-		turnIDs:  map[string]turnIDBinding{},
+		convAcct:      map[string]conversationBinding{},
+		turnIDs:       map[string]turnIDBinding{},
+		catalogFlight: map[string]chan struct{}{},
 	}
 	h.loadConversations()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withTelemetry(h.withAuth(h.chatCompletions)))
-	h.mux.HandleFunc("GET /v1/models", h.withTelemetry(h.withAuth(h.models)))
+	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// WorkBuddy 风格控制台（页面不鉴权，API 走 Bearer）
 	h.mux.HandleFunc("GET /{$}", h.servePanel)
 	h.mux.HandleFunc("GET /admin", h.servePanel)
+	h.mux.HandleFunc("GET /admin/", h.servePanel)
 	h.mux.HandleFunc("GET /panel", h.servePanel)
 	h.mux.HandleFunc("GET /panel/", h.servePanel)
 	h.mux.HandleFunc("GET /assets/", h.servePanelAssets)
@@ -302,6 +315,7 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
 	if code == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("<h3>登录失败：缺少 code</h3><p>请回到 WebUI 重新发起登录。</p>"))
@@ -337,12 +351,12 @@ func (h *Handler) oauthCallback(w http.ResponseWriter, r *http.Request) {
 				"并确保从生成到完成授权期间服务没有重启。</p>"
 		}
 		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("<h3>换取凭证失败：" + lastErr.Error() + "</h3>" + hint))
+		_, _ = w.Write([]byte("<h3>换取凭证失败：" + html.EscapeString(lastErr.Error()) + "</h3>" + hint))
 		return
 	}
 	if err := h.saveLoginResult(tok, sess.Verifier, sess.DPoPPrivateKey); err != nil {
 		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("<h3>保存账号失败：" + err.Error() + "</h3>"))
+		_, _ = w.Write([]byte("<h3>保存账号失败：" + html.EscapeString(err.Error()) + "</h3>"))
 		return
 	}
 	h.oauth.complete(sess.ID)
@@ -394,6 +408,7 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 			if domain != "" {
 				a.DomainID = domain
 			}
+			tok.UserID, tok.UserName, tok.DomainID = a.UserID, a.UserName, a.DomainID
 		}
 	}
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
@@ -403,6 +418,7 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 		// 刚登录的账号先不探测：用户很可能马上就要用，探测占用的上游会话
 		// 槽位释放很慢，会把第一个真实请求挤到排队。
 		noteTraffic(a.UserID)
+		invalidateDynamicModelsCache()
 		log.Printf("webui login success user_id=%s name=%s", a.UserID, a.UserName)
 	} else {
 		log.Printf("webui login saved user_id=%s name=%s (pool add failed)", a.UserID, a.UserName)
@@ -634,6 +650,15 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	return out
 }
 
+// invalidateDynamicModelsCache 在新增账号或重载 auths 后清除模型缓存（含失败负缓存）。
+func invalidateDynamicModelsCache() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+}
+
 // fetchDynamicModels 刷新各账号模型目录并返回合并后的展示列表，缓存 1h。
 //
 // 目录按账号存放（限时福利按账号授予，账号之间不能互相污染），因此这里逐个健康
@@ -657,34 +682,14 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		if acct == nil || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
-		authz := acct.AuthSnapshot()
-		if authz == nil {
+		if acct.AuthSnapshot() == nil {
 			continue
 		}
-		if !upstream.AccountCatalogStale(acct.UID) {
-			if infos, ok := upstream.AccountModels(acct.UID); ok {
-				sets = append(sets, infos)
-				continue
-			}
+		if upstream.AccountCatalogStale(acct.UID) {
+			h.fetchAccountCatalogOnce(acct)
 		}
-		infos, err := h.cfg.Upstream.FetchModels(authz) // 成功即写入该账号目录
-		if err != nil {
-			log.Printf("model discovery failed for account %s: %v", acct.Name, err)
-			if h.cfg.Telemetry != nil {
-				_ = h.cfg.Telemetry.RecordEvent("model_discovery_failed", "error", acct.UID, "", "model discovery failed", nil)
-			}
-			continue
-		}
-		if len(infos) == 0 {
-			log.Printf("model discovery returned no models for account %s", acct.Name)
-			if h.cfg.Telemetry != nil {
-				_ = h.cfg.Telemetry.RecordEvent("model_discovery_empty", "warn", acct.UID, "", "model discovery returned no models", nil)
-			}
-			continue
-		}
-		sets = append(sets, infos)
-		if h.cfg.Telemetry != nil {
-			_ = h.cfg.Telemetry.RecordEvent("model_discovery_succeeded", "info", acct.UID, "", "models discovered", map[string]any{"model_count": len(infos)})
+		if infos, ok := upstream.AccountModels(acct.UID); ok && len(infos) > 0 {
+			sets = append(sets, infos)
 		}
 	}
 	infos := upstream.MergeModels(sets...)
@@ -725,41 +730,88 @@ func (h *Handler) pickAccount(tried map[string]bool, model string) *pool.Account
 	return h.cfg.Pool.PickExcluding(tried)
 }
 
-// pickByCatalog 在已发现目录的健康账号里挑第一个能服务该模型的。
+// pickByCatalog 在已发现目录的健康账号里按并发利用率最低者优先挑能服务该模型的。
 func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.Account {
-	for _, acct := range h.cfg.Pool.Accounts() {
-		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
-			continue
+	return h.cfg.Pool.PickWhere(tried, func(acct *pool.Account) bool {
+		models, known := upstream.AccountModels(acct.UID)
+		if !known || !catalogHas(models, wantLower) {
+			return false
 		}
-		if models, known := upstream.AccountModels(acct.UID); known && catalogHas(models, wantLower) {
-			if st, _ := modelAvailability(acct.UID, wantLower); st == availUnusable {
-				continue // 该账号实测调不通这个模型，别选它
-			}
-			return acct
-		}
-	}
-	return nil
+		st, _ := modelAvailability(acct.UID, wantLower)
+		return st != availUnusable // 该账号实测调不通这个模型，别选它
+	})
 }
 
 // discoverMissingCatalogs 为「目录未知或已过期」的健康账号补一次模型发现。
 //
-// 只在聊天挑号失败时调用（不是热路径），且有 CatalogTTL 与失败退避兜底：
-// 刚发现过的账号不会被重复打，上游某一路挂了也不会每次请求都空等超时。
+// 只在聊天挑号失败时调用（不是热路径）：
+//   - 按账号 UID 做 singleflight 去重，避免并发请求重复拉取同一账号目录；
+//   - 单次请求路径最多同步补 1 个缺失目录，防止多账号叠加把首字延迟放大到分钟级。
 func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
-		authz := acct.AuthSnapshot()
-		if authz == nil {
+		if acct.AuthSnapshot() == nil {
 			continue
 		}
 		if !upstream.AccountCatalogStale(acct.UID) {
 			continue
 		}
-		if _, err := h.cfg.Upstream.FetchModels(authz); err != nil {
-			log.Printf("lazy model discovery failed for account %s: %v", acct.Name, err)
+		h.fetchAccountCatalogOnce(acct)
+		return
+	}
+}
+
+// fetchAccountCatalogOnce 对同一账号的目录发现做 in-flight 去重。
+func (h *Handler) fetchAccountCatalogOnce(acct *pool.Account) {
+	if acct == nil || acct.UID == "" {
+		return
+	}
+	h.catalogFlightMu.Lock()
+	if h.catalogFlight == nil {
+		h.catalogFlight = map[string]chan struct{}{}
+	}
+	if ch, running := h.catalogFlight[acct.UID]; running {
+		h.catalogFlightMu.Unlock()
+		<-ch
+		return
+	}
+	done := make(chan struct{})
+	h.catalogFlight[acct.UID] = done
+	h.catalogFlightMu.Unlock()
+
+	defer func() {
+		h.catalogFlightMu.Lock()
+		delete(h.catalogFlight, acct.UID)
+		h.catalogFlightMu.Unlock()
+		close(done)
+	}()
+
+	if !upstream.AccountCatalogStale(acct.UID) {
+		return
+	}
+	authz := acct.AuthSnapshot()
+	if authz == nil {
+		return
+	}
+	infos, err := h.cfg.Upstream.FetchModels(authz)
+	if err != nil {
+		log.Printf("model discovery failed for account %s: %v", acct.Name, err)
+		if h.cfg.Telemetry != nil {
+			_ = h.cfg.Telemetry.RecordEvent("model_discovery_failed", "error", acct.UID, "", "model discovery failed", nil)
 		}
+		return
+	}
+	if len(infos) == 0 {
+		log.Printf("model discovery returned no models for account %s", acct.Name)
+		if h.cfg.Telemetry != nil {
+			_ = h.cfg.Telemetry.RecordEvent("model_discovery_empty", "warn", acct.UID, "", "model discovery returned no models", nil)
+		}
+		return
+	}
+	if h.cfg.Telemetry != nil {
+		_ = h.cfg.Telemetry.RecordEvent("model_discovery_succeeded", "info", acct.UID, "", "models discovered", map[string]any{"model_count": len(infos)})
 	}
 }
 
@@ -885,16 +937,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[acct.Name] = true
 
+		acctUserName := acct.UserNameSnapshot()
 		if rec != nil {
 			rec.record.AccountUID = acct.UID
-			rec.record.AccountName = acct.UserName
+			rec.record.AccountName = acctUserName
 		}
 
 		// 阻塞等待并发槽位（上游单账号并发会话释放慢，串行最稳）。
-		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号。
+		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号；
+		// 客户端断开时排队立即放弃，不再空占 goroutine。
 		queueStart := time.Now()
-		if !h.cfg.Pool.AcquireLockWait(acct.Name, 180*time.Second) {
+		if !h.cfg.Pool.AcquireLockWaitCtx(r.Context(), acct.Name, 180*time.Second) {
+			if r.Context().Err() != nil {
+				// 客户端已断开：与上游错误路径同口径，不记账、不轮转；
+				// 503 对已断开的连接写不进去也无妨，但保证观测记录有明确终态。
+				if rec != nil {
+					rec.record.ErrorType = "client_cancelled"
+				}
+				writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
+				return
+			}
 			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
+			// 黏性账号排队失败即松开黏性：否则后续迭代会无视 tried 原地重选
+			// 同一账号，把 MaxRotate 全烧在一个饱和账号上，健康账号永远轮不到。
+			stickyAcct = ""
 			continue
 		}
 		lockHeld := true
@@ -908,14 +974,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rec.record.QueueWaitMs = time.Since(queueStart).Milliseconds()
 		}
 
-		ok, verr := h.cfg.Pool.Validate(acct)
+		ok, verr := h.cfg.Pool.ValidateContext(r.Context(), acct)
 		if verr == nil && !ok {
 			releaseLock()
+			stickyAcct = "" // 校验失败同样松开黏性，转入轮转
 			lastErr = errors.New("token invalid")
 			continue
 		}
 		if verr != nil {
 			releaseLock()
+			stickyAcct = ""
 			lastErr = verr
 			continue
 		}
@@ -962,7 +1030,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if rec != nil {
 				rec.record.Attempts++
 			}
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), msgs, "", cred, acctUserName, model, chatOpts, benefit)
 			if serr == nil && rec != nil {
 				rec.record.UpstreamMsgID = msgID
 			}
@@ -971,7 +1039,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			var ae *upstream.ApiError
 			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && authz.Refresh() != "" {
-				if rerr := h.cfg.Pool.RefreshToken(acct.Name); rerr == nil {
+				if rerr := h.cfg.Pool.RefreshTokenContext(r.Context(), acct.Name); rerr == nil {
 					authz = acct.AuthSnapshot()
 					token, accessKeyID, secretAccessKey = authz.Credentials()
 					cred = upstream.SignCredential{
@@ -993,10 +1061,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-time.After(queueRetryDelay):
 				case <-r.Context().Done():
+					if rec != nil {
+						rec.record.ErrorType = "client_cancelled"
+					}
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
 				}
-				if !h.cfg.Pool.AcquireLockWait(acct.Name, h.cfg.QueueReacquireTimeout) {
+				if !h.cfg.Pool.AcquireLockWaitCtx(r.Context(), acct.Name, h.cfg.QueueReacquireTimeout) {
 					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
 					break
 				}
@@ -1036,10 +1107,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
 			}
-			if rec != nil {
-				rec.record.ErrorType = "model_access"
-			}
 			if modelDenied {
+				if rec != nil {
+					rec.record.ErrorType = "model_access"
+				}
 				modelAccessErr = serr
 				stickyAcct = ""
 				continue
@@ -1051,6 +1122,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					"model "+model+" is not available: "+truncateMsg(serr.Error(), 200))
 				return
 			}
+			// 失败即松开黏性（modelDenied 分支上方同理）：黏性只在账号健康且
+			// 上一次尝试成功时延续，失败后与普通轮转一视同仁，避免把剩余的
+			// MaxRotate 次数全部重试在同一个刚失败的账号上。
+			stickyAcct = ""
 			continue
 		}
 		noteTraffic(acct.UID)
@@ -1118,7 +1193,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if streamedComp.CreditUsage == nil && streamedComp.Finish != "tool_calls" {
 					streamedComp.CreditUsage = fetchCreditUsage()
 				}
-				applyCompletionMetrics(rec, msgs, streamedComp)
+				applyCompletionMetrics(rec, msgs, streamedComp, streamedComp.Finish)
 			}
 			return
 		}
@@ -1159,7 +1234,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if comp.CreditUsage == nil && finish != "tool_calls" {
 			comp.CreditUsage = fetchCreditUsage()
 		}
-		applyCompletionMetrics(rec, msgs, comp)
+		applyCompletionMetrics(rec, msgs, comp, finish)
 		return
 	}
 	if lastErr == nil && modelAccessErr != nil {
@@ -1182,13 +1257,17 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 	out := make([]upstream.ChatMessage, 0, len(req.Messages))
 	for i, m := range req.Messages {
 		switch m.Role {
-		case "system", "user":
+		case "system", "developer", "user":
+			role := m.Role
+			if role == "developer" {
+				role = "system"
+			}
 			var content any = m.Text
 			if len(m.ContentParts) > 0 {
 				// 多模态分片数组原样透传（官方 v2 接受 OpenAI content 形态）。
 				content = m.ContentParts
 			}
-			out = append(out, upstream.ChatMessage{Role: m.Role, Content: content})
+			out = append(out, upstream.ChatMessage{Role: role, Content: content})
 		case "assistant":
 			reasoning := m.ReasoningContent
 			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
@@ -1457,8 +1536,9 @@ func isQueueLimitError(err *upstream.ApiError) bool {
 }
 
 func truncateMsg(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n])
 	}
 	return s
 }

@@ -49,6 +49,8 @@ func (h *Handler) adminLogs(w http.ResponseWriter, r *http.Request) {
 		stream = &streamValue
 	}
 	statusCode, _ := strconv.Atoi(query.Get("status_code"))
+	limit := clampQueryLimit(intParam(r, "limit", 100))
+	offset := clampQueryOffset(intParam(r, "offset", 0))
 	items, total, err := h.cfg.Telemetry.ListRequests(telemetry.RequestFilter{
 		From:       from,
 		To:         to,
@@ -57,8 +59,8 @@ func (h *Handler) adminLogs(w http.ResponseWriter, r *http.Request) {
 		Model:      query.Get("model"),
 		AccountUID: query.Get("account_uid"),
 		ErrorType:  query.Get("error_type"),
-		Limit:      intParam(r, "limit", 100),
-		Offset:     intParam(r, "offset", 0),
+		Limit:      limit,
+		Offset:     offset,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
@@ -66,7 +68,7 @@ func (h *Handler) adminLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "items": items, "total": total,
-		"limit": intParam(r, "limit", 100), "offset": intParam(r, "offset", 0),
+		"limit": limit, "offset": offset,
 	})
 }
 
@@ -88,6 +90,8 @@ func (h *Handler) adminEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
+	limit := clampQueryLimit(intParam(r, "limit", 100))
+	offset := clampQueryOffset(intParam(r, "offset", 0))
 	items, total, err := h.cfg.Telemetry.ListEvents(telemetry.EventFilter{
 		From:       from,
 		To:         to,
@@ -95,8 +99,8 @@ func (h *Handler) adminEvents(w http.ResponseWriter, r *http.Request) {
 		Level:      query.Get("level"),
 		AccountUID: query.Get("account_uid"),
 		Model:      query.Get("model"),
-		Limit:      intParam(r, "limit", 100),
-		Offset:     intParam(r, "offset", 0),
+		Limit:      limit,
+		Offset:     offset,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
@@ -104,8 +108,25 @@ func (h *Handler) adminEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "items": items, "total": total,
-		"limit": intParam(r, "limit", 100), "offset": intParam(r, "offset", 0),
+		"limit": limit, "offset": offset,
 	})
+}
+
+func clampQueryLimit(v int) int {
+	if v <= 0 {
+		return 50
+	}
+	if v > 500 {
+		return 500
+	}
+	return v
+}
+
+func clampQueryOffset(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 func (h *Handler) adminMetricsOverview(w http.ResponseWriter, r *http.Request) {

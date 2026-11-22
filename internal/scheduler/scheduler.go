@@ -152,7 +152,9 @@ func (s *Scheduler) Tick(ctx context.Context) {
 		if !cfg.Pool.Enabled(acct.Name) {
 			continue
 		}
-		ok, _ := cfg.Pool.Validate(acct)
+		valCtx, valCancel := context.WithTimeout(ctx, 30*time.Second)
+		ok, _ := cfg.Pool.ValidateContext(valCtx, acct)
+		valCancel()
 		if ok {
 			authz := acct.AuthSnapshot()
 			remaining := authz.Remaining().Round(time.Minute)
@@ -160,7 +162,10 @@ func (s *Scheduler) Tick(ctx context.Context) {
 
 			// ticket 登录不返回 refresh_token；这种账号跳过无意义的周期刷新。
 			if authz.Refresh() != "" {
-				if err := cfg.Pool.CheckAndRefreshTokenWithin(acct.Name, cfg.RefreshSkew); err != nil {
+				refreshCtx, refreshCancel := context.WithTimeout(ctx, 30*time.Second)
+				err := cfg.Pool.CheckAndRefreshTokenWithinContext(refreshCtx, acct.Name, cfg.RefreshSkew)
+				refreshCancel()
+				if err != nil {
 					log.Printf("proactive refresh failed account=%s err=%v", acct.Name, err)
 				} else if remaining <= cfg.RefreshSkew {
 					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,

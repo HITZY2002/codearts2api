@@ -175,9 +175,14 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 }
 
 // IsCheckinCampaign reports whether a campaign belongs to daily check-in or onboarding.
+//
+// 标题匹配不锁金额：官方活动金额已从 150 改为每日 1000 积分（2026-12-31 截止），
+// 再要求标题含 "150" 会在下一次金额改版后让签到静默失效（表现为
+// "无可领取的签到或新手活动"）。ID 34 保留为当前已知活动的精确兜底；
+// 误匹配的代价是安全的——无资格活动走 claimable/状态分支被跳过，不会重复领取。
 func IsCheckinCampaign(campaign CreditCampaign) bool {
 	title := strings.ToLower(strings.TrimSpace(campaign.Title))
-	return campaign.ID == 34 || (strings.Contains(title, "每日签到") && strings.Contains(title, "150"))
+	return campaign.ID == 34 || strings.Contains(title, "每日签到")
 }
 
 // FetchDailyCheckinStatus reads the current daily check-in status without writing.
@@ -230,12 +235,18 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		res.Message = "活动尚未开始"
 		return res
 	}
+	wasClaimed := false
 	switch res.Status {
 	case "CONFIRMED", "CONSUMED":
 		res.Message = "今日已签到"
 		return res
 	case "CLAIMED":
-		// 已到账但尚未确认；不得重复领取。
+		// 已到账但尚未确认；不得重复领取，仅补确认并填充活动积分额便于展示。
+		wasClaimed = true
+		res.Credits = campaign.PendingTotalAmount
+		if res.Credits <= 0 {
+			res.Credits = campaign.BenefitAmount
+		}
 	case "ELIGIBLE":
 		if !campaign.Claimable {
 			res.OK, res.Message = false, "暂不可领取，稍后重试"
@@ -268,9 +279,16 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 	}
 	res.Wrote = true
 	res.Status = "CONFIRMED"
-	res.Message = "已补确认"
-	if res.Credits > 0 {
-		res.Message = fmt.Sprintf("领取成功（%g 积分）", res.Credits)
+	if wasClaimed {
+		res.Message = "已补确认"
+		if res.Credits > 0 {
+			res.Message = fmt.Sprintf("已补确认（%g 积分）", res.Credits)
+		}
+	} else {
+		res.Message = "领取成功"
+		if res.Credits > 0 {
+			res.Message = fmt.Sprintf("领取成功（%g 积分）", res.Credits)
+		}
 	}
 	return res
 }

@@ -38,21 +38,26 @@ func main() {
 	}
 
 	refreshed := 0
+	skipped := 0
+	failed := 0
 	for _, acct := range p.Accounts() {
 		need := *force || acct.Auth.ExpiringSoon(30*time.Minute) || acct.Auth.Expired()
 		if !need {
 			fmt.Printf("%s (%s): token ok, remaining=%s, skip\n",
 				acct.Name, acct.UserName, acct.Auth.Remaining().Round(time.Minute))
+			skipped++
 			continue
 		}
 		if acct.Auth.Refresh() == "" {
 			fmt.Printf("%s (%s): no refresh_token, need re-login\n", acct.Name, acct.UserName)
+			failed++
 			continue
 		}
 
 		// 使用 pool 的 RefreshToken 方法
 		if err := p.RefreshToken(acct.Name); err != nil {
 			fmt.Printf("%s (%s): refresh error: %v\n", acct.Name, acct.UserName, err)
+			failed++
 			continue
 		}
 		fmt.Printf("%s (%s): refreshed, expires=%s\n",
@@ -60,10 +65,10 @@ func main() {
 		refreshed++
 	}
 
-	fmt.Printf("\ndone, refreshed=%d/%d\n", refreshed, len(auths))
+	fmt.Printf("\ndone, refreshed=%d skipped=%d failed=%d total=%d\n", refreshed, skipped, failed, len(auths))
 
-	// 退出码：如果全部成功则 0，否则 1
-	if refreshed < len(auths) {
+	// 退出码：无失败账号则 0，否则 1
+	if failed > 0 {
 		os.Exit(1)
 	}
 }

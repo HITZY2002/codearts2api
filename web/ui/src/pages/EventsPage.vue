@@ -1,5 +1,6 @@
 <script setup>
 import { computed, h } from 'vue'
+import UiAlert from '../components/ui/UiAlert.vue'
 import UiButton from '../components/ui/UiButton.vue'
 import UiCard from '../components/ui/UiCard.vue'
 import UiDataTable from '../components/ui/UiDataTable.vue'
@@ -7,12 +8,12 @@ import UiSelect from '../components/ui/UiSelect.vue'
 import UiTag from '../components/ui/UiTag.vue'
 import {
   changeEventPage, changeEventPageSize, detailOpen, eventFilters, eventPage,
-  eventPageSize, eventTotal, events, filterOptions, loading, reloadEvents, selectedLog
+  eventPageSize, eventTotal, events, filterOptions, loading, observabilityDisabled, reloadEvents, selectedLog
 } from '../store'
 import { eventKindLabel, eventLevelLabel, formatNumber, formatTime } from '../utils'
 
 function openDetail(row) {
-  selectedLog.value = { ...row, request_id: `事件 #${row.id}`, event: true }
+  selectedLog.value = { ...row }
   detailOpen.value = true
 }
 
@@ -24,7 +25,13 @@ function resetFilters() {
   reloadEvents()
 }
 
-const levelOptions = ['info', 'warn', 'error'].map(value => ({ label: value, value }))
+const levelOptions = ['info', 'warn', 'error'].map(value => ({ label: eventLevelLabel(value), value }))
+const kindOptions = computed(() =>
+  filterOptions('kind', events.value, eventFilters.value.kind).map(opt => ({
+    value: opt.value,
+    label: eventKindLabel(opt.value)
+  }))
+)
 
 const eventColumns = [
   { title: '时间', key: 'created_at', width: 150, render: row => h('span', { class: 'num' }, formatTime(row.created_at)) },
@@ -33,7 +40,8 @@ const eventColumns = [
     render: row => h(UiTag, { type: row.level === 'error' ? 'error' : row.level === 'warn' ? 'warning' : 'info' }, { default: () => eventLevelLabel(row.level) })
   },
   { title: '类型', key: 'kind', minWidth: 150, render: row => h('span', { class: 'truncate-cell', title: row.kind || '' }, eventKindLabel(row.kind)) },
-  { title: '账号', key: 'account_uid', minWidth: 150, render: row => h('span', { class: 'truncate-cell', title: row.account_uid || '' }, row.account_uid || '—') },
+  { title: '账号', key: 'account_uid', minWidth: 140, render: row => h('span', { class: 'truncate-cell', title: row.account_uid || '' }, row.account_uid || '—') },
+  { title: '模型', key: 'model', minWidth: 130, render: row => h('span', { class: 'truncate-cell', title: row.model || '' }, row.model || '—') },
   { title: '消息', key: 'message', minWidth: 220, className: 'wrap-cell' },
   {
     title: '数据', key: 'data', width: 72, fixed: 'right',
@@ -48,19 +56,22 @@ const eventColumns = [
       <template #header-extra>
         <UiTag type="primary">{{ formatNumber(eventTotal) }}</UiTag>
       </template>
+      <div v-if="observabilityDisabled" style="padding: 14px 18px 0">
+        <UiAlert type="info">当前服务端已关闭可观测数据库（observability.enabled = false），系统事件不可用。</UiAlert>
+      </div>
       <div class="filters-bar">
         <div class="filters-bar-left">
           <UiSelect v-model="eventFilters.level" clearable size="sm" placeholder="级别" :options="levelOptions" @update:model-value="reloadEvents" />
-          <UiSelect v-model="eventFilters.kind" clearable filterable size="sm" placeholder="类型" :options="filterOptions('kind', events)" @update:model-value="reloadEvents" />
-          <UiSelect v-model="eventFilters.account_uid" clearable filterable size="sm" placeholder="账号" :options="filterOptions('account_uid', events)" @update:model-value="reloadEvents" />
-          <UiSelect v-model="eventFilters.model" clearable filterable size="sm" placeholder="模型" :options="filterOptions('model', events)" @update:model-value="reloadEvents" />
+          <UiSelect v-model="eventFilters.kind" clearable filterable size="sm" placeholder="类型" :options="kindOptions" @update:model-value="reloadEvents" />
+          <UiSelect v-model="eventFilters.account_uid" clearable filterable size="sm" placeholder="账号" :options="filterOptions('account_uid', events, eventFilters.account_uid)" @update:model-value="reloadEvents" />
+          <UiSelect v-model="eventFilters.model" clearable filterable size="sm" placeholder="模型" :options="filterOptions('model', events, eventFilters.model)" @update:model-value="reloadEvents" />
         </div>
         <div v-if="hasActiveFilters" class="filters-bar-right">
           <UiButton size="xs" variant="ghost" @click="resetFilters">重置筛选</UiButton>
         </div>
       </div>
       <UiDataTable
-        :columns="eventColumns" :data="events" :loading="loading" :scroll-x="820"
+        :columns="eventColumns" :data="events" :loading="loading" :scroll-x="950"
         :row-key="row => row.id"
         :pagination="{ page: eventPage, pageSize: eventPageSize, itemCount: eventTotal, onUpdatePage: changeEventPage, onUpdatePageSize: changeEventPageSize }"
       />

@@ -21,8 +21,10 @@ export function formatDuration(value) {
 // token_remaining 是 Go duration 字符串（如 "119h59m0s"，Token 有效期剩余），转人话。
 export function formatRemaining(value) {
   if (!value) return '—'
-  const m = /^((\d+)h)?((\d+)m)?((\d+(?:\.\d+)?)s)?$/.exec(String(value))
-  if (!m) return String(value)
+  const raw = String(value).trim()
+  if (raw.startsWith('-')) return '已过期'
+  const m = /^((\d+)h)?((\d+)m)?((\d+(?:\.\d+)?)s)?$/.exec(raw)
+  if (!m) return raw
   const hours = Number(m[2] || 0)
   const minutes = Number(m[4] || 0)
   const seconds = Math.round(Number(m[6] || 0))

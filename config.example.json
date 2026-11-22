@@ -6,7 +6,7 @@
   "listen": ":7866",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
-  "default_model": "snap-chat",
+  "default_model": "glm-5.2",
   "oauth_callback_host": "",
   "cooldown": {
     "soft_rate": "60s",
@@ -16,7 +16,9 @@
   "benefit_auto_claim": true,    // 模型发现时自动领取限时福利（幂等；关闭则福利模型调用必然失败）
   "credits_auto_claim": true,    // watchdog 自动领取每日签到/新手活动积分；与模型 Token 福利独立
   // "login_client_id": "codearts-agent",  // WebUI 登录用 OAuth client；留空自动沿用已有账号的取值
-  "max_concurrent": 5,           // 单账号最大并发数（默认 5）
+  "max_concurrent": 1,           // 单账号最大并发数（默认 1，最稳避免撞上游 3 会话上限）
+  "queue_retry_seconds": 10,     // 上游排队限流时的重试间隔秒数（默认 10）
+  "queue_max_attempts": 30,      // 上游排队限流时的最大尝试次数（默认 30）
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {
     "enabled": true,

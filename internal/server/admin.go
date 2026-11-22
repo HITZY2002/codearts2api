@@ -91,9 +91,11 @@ func (h *Handler) adminCreditBalances(w http.ResponseWriter, r *http.Request) {
 	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
 	targets := make([]string, 0)
 	if uid != "" {
-		if h.cfg.Pool.Get(uid) != nil {
-			targets = append(targets, uid)
+		if h.cfg.Pool.Get(uid) == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+			return
 		}
+		targets = append(targets, uid)
 	} else {
 		for _, account := range h.cfg.Pool.List() {
 			if accountUID, ok := account["uid"].(string); ok && accountUID != "" {
@@ -119,8 +121,8 @@ func (h *Handler) adminCreditBalances(w http.ResponseWriter, r *http.Request) {
 			if account == nil {
 				result.Message = "no account"
 			} else {
-				result.AccountName = account.UserName
-				ok, err := h.cfg.Pool.Validate(account)
+				result.AccountName = account.UserNameSnapshot()
+				ok, err := h.cfg.Pool.ValidateContext(r.Context(), account)
 				switch {
 				case err != nil:
 					result.Message = err.Error()
@@ -188,6 +190,10 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
 		return
 	}
+	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
 	targets := h.pickTargets(body.UID)
 	results := make([]actionResult, 0, len(targets))
 	var mu sync.Mutex
@@ -204,7 +210,7 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 			res := actionResult{UID: uid}
 			if acct == nil {
 				res.Message = "no account"
-			} else if ok, err := h.cfg.Pool.Validate(acct); err != nil {
+			} else if ok, err := h.cfg.Pool.ValidateContext(r.Context(), acct); err != nil {
 				res.Message = err.Error()
 			} else if !ok {
 				res.Message = "token invalid"
@@ -281,9 +287,11 @@ func (h *Handler) adminCheckinStatuses(w http.ResponseWriter, r *http.Request) {
 	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
 	targets := make([]string, 0)
 	if uid != "" {
-		if h.cfg.Pool.Get(uid) != nil {
-			targets = append(targets, uid)
+		if h.cfg.Pool.Get(uid) == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+			return
 		}
+		targets = append(targets, uid)
 	} else {
 		for _, account := range h.cfg.Pool.List() {
 			if accountUID, ok := account["uid"].(string); ok && accountUID != "" {
@@ -317,7 +325,7 @@ func (h *Handler) adminCheckinStatuses(w http.ResponseWriter, r *http.Request) {
 					results[index] = result
 					return
 				}
-				ok, err := h.cfg.Pool.Validate(account)
+				ok, err := h.cfg.Pool.ValidateContext(r.Context(), account)
 				if err != nil {
 					result.Message = err.Error()
 					results[index] = result
@@ -390,29 +398,26 @@ func checkinCampaignStatusMessage(status string) string {
 	}
 }
 
-// adminKeepalive 刷新即将过期的 token。
+// adminKeepalive 校验/续期并发送一次轻量保活请求推进保活心跳。
 func (h *Handler) adminKeepalive(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
 		return
 	}
+	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
 	targets := h.pickTargets(body.UID)
 	results := make([]actionResult, 0, len(targets))
 	for _, uid := range targets {
-		acct := h.cfg.Pool.Get(uid)
 		res := actionResult{UID: uid}
-		if acct == nil {
-			res.Message = "no account"
-			results = append(results, res)
-			continue
-		}
-		// Validate 内部会在临近过期时自动 Refresh
-		ok, verr := h.cfg.Pool.Validate(acct)
-		if verr != nil {
-			res.Message = verr.Error()
-		} else if !ok {
-			res.Message = "token invalid"
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		kerr := h.cfg.Pool.Keepalive(ctx, uid)
+		cancel()
+		if kerr != nil {
+			res.Message = kerr.Error()
 		} else {
 			res.OK = true
 			res.Message = "refreshed/validated"
@@ -435,6 +440,7 @@ func (h *Handler) adminReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.cfg.Pool.SyncToDir(auths)
+	invalidateDynamicModelsCache()
 	total, healthy, _, _, _ := h.cfg.Pool.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "message": "已重载 auths", "loaded": len(auths), "total": total, "healthy": healthy,
@@ -464,7 +470,9 @@ func (h *Handler) adminDisable(w http.ResponseWriter, r *http.Request) {
 	if reason == "" {
 		reason = "manual disable"
 	}
-	if !h.cfg.Pool.Disable(body.UID, reason) {
+	// 手动禁用：刷新成功不得解除（否则 watchdog/余额查询的 Validate 会把
+	// 手动下线的账号静默复活），仅 Enable 显式解禁。
+	if !h.cfg.Pool.DisableManual(body.UID, reason) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
 		return
 	}

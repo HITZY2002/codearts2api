@@ -248,13 +248,17 @@ func (h *Handler) adminSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
 		return
 	}
+	h.settingsMu.Lock()
 	if err := h.cfg.Settings.Update(settings); err != nil {
+		h.settingsMu.Unlock()
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": err.Error()})
 		return
 	}
-	h.applySettings(h.cfg.Settings.Get())
+	saved := h.cfg.Settings.Get()
+	h.applySettings(saved)
+	h.settingsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "message": "设置已保存并生效", "settings": h.cfg.Settings.Get(),
+		"ok": true, "message": "设置已保存并生效", "settings": saved,
 	})
 }
 
@@ -274,6 +278,7 @@ func (h *Handler) applySettings(settings Settings) {
 		watch["poll_minutes"] = settings.PollMinutes
 		watch["refresh_skew_minutes"] = settings.RefreshSkewMinutes
 		watch["keepalive_interval"] = settings.KeepaliveIntervalMinutes
+		watch["keepalive_window"] = fmt.Sprintf("%dm", settings.KeepaliveWindowMinutes)
 		watch["max_concurrent"] = settings.MaxConcurrent
 		h.cfg.WatchInfo = watch
 	}

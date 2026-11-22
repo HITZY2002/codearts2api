@@ -6,7 +6,7 @@ BINDIR := bin
 all: linux
 
 panel:
-	cd web/ui && npm ci && npm run build
+	cd web/ui && ([ -d node_modules ] || npm ci) && npm run build
 
 linux:
 	$(MAKE) panel
@@ -33,4 +33,4 @@ docker:
 	docker compose up -d --build
 
 clean:
-	rm -rf $(BINDIR) data
+	rm -rf $(BINDIR)

@@ -47,10 +47,10 @@ curl http://127.0.0.1:7866/healthz
 curl http://127.0.0.1:7866/v1/models -H "Authorization: Bearer $CA2A_API_KEY"
 curl -X POST http://127.0.0.1:7866/v1/chat/completions \
   -H "Authorization: Bearer $CA2A_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"snap-chat","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。
+浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：包含数据看板、请求日志、系统事件、模型列表（支持一键隐藏/恢复）、账号池管理（OAuth 登录/余额/批量签到/启用禁用/清冷却/重载）与运行设置。
 面板登录态随 API Key 持久化（仅鉴权失败会清除；网络抖动保留登录，刷新即可恢复）。
 多轮语义由完整 `messages` 承载（上游 V2 不保留服务端上下文）。body 里传
 `conversation_id` 或请求头 `X-Codearts-Chat-Id: <id>` 可锁定同一账号续接（黏性路由），
@@ -134,7 +134,7 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 ### 观测与可视化面板
 
 WebUI 为 Vue 3 轻量自绘控制台（new-api 风格：顶栏 + 分组侧边栏 + 数据看板），
-全部组件与图表手写，零第三方 UI/图表依赖，产物约 161KB（gzip 传输约 56KB，
+全部组件与图表手写，零第三方 UI/图表依赖，产物约 190KB（gzip 传输约 65KB，
 旧版 Naive UI + ECharts 方案为 1.26MB / 387KB）。服务端对静态资源做运行时 gzip
 并按内容哈希长缓存（`immutable`）。内置亮色/暗色/跟随系统三种主题，桌面端侧边栏
 可折叠、移动端为抽屉导航。默认将请求元数据、系统事件和账号快照写入
@@ -172,14 +172,20 @@ Token 用量、账号健康和最近事件。
 ## 部署（systemd / Docker）
 
 ```bash
-sudo mkdir -p /opt/codearts2api && sudo cp -r bin config.example.json auths /opt/codearts2api/
+# systemd（请按实际运行用户调整 ubuntu）
+sudo mkdir -p /opt/codearts2api/auths /opt/codearts2api/data
+sudo cp -r bin config.example.json /opt/codearts2api/
+sudo cp -n config.example.json /opt/codearts2api/config.json
+sudo cp -r auths/. /opt/codearts2api/auths/ 2>/dev/null || true
+sudo chown -R ubuntu:ubuntu /opt/codearts2api
 sudo cp deploy/codearts2api.service /etc/systemd/system/
-# 编辑 /opt/codearts2api/.env 写 CA2A_API_KEY，改好 config.json
+# 编辑 /opt/codearts2api/.env 写 CA2A_API_KEY（或写入 config.json）
 sudo systemctl daemon-reload && sudo systemctl enable --now codearts2api
 
 # 或 Docker
 export CA2A_API_KEY=你的随机密钥
-mkdir -p auths data
+cp -n config.example.json config.json
+mkdir -p auths data && sudo chown -R 10001:10001 auths data
 docker compose up -d --build
 ```
 
@@ -199,7 +205,9 @@ docker compose up -d --build
 | `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
 | `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
+| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `1` |
+| `CA2A_QUEUE_RETRY_SECONDS` | 排队重试间隔（秒） | `10` |
+| `CA2A_QUEUE_MAX_ATTEMPTS` | 排队最大尝试次数 | `30` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
@@ -247,10 +255,11 @@ internal/auth/     auth 文件读写
 internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
 internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
 internal/scheduler/ token 续期看门狗（新增保活机制）
-internal/server/   OpenAI 兼容路由
+internal/telemetry/ SQLite 观测库（请求元数据/系统事件/账号快照）
+internal/server/   OpenAI 兼容路由与 Admin API
 web/ui/           WebUI 源码（Vue 3 自绘组件 + 手写 SVG 图表）
 internal/server/webui/dist/ 内嵌 WebUI 构建产物
-deploy/            systemd unit 样例
+deploy/            systemd unit 样例与部署脚本（update-server.sh）
 docs/              逆向过程与接口清单
 ```
 

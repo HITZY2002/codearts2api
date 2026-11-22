@@ -46,6 +46,7 @@ type Account struct {
 	coolUntil          time.Time
 	coolKind           CoolKind
 	disabled           bool
+	manualDisabled     bool // 管理员手动禁用：token 刷新成功不得解除，仅 Enable 显式解禁
 	disabledReason     string
 	lastErr            string
 	activeConcurrent   int       // 当前活跃并发请求数
@@ -161,6 +162,13 @@ func (a *Account) AuthSnapshot() *auth.Auth {
 	return a.Auth
 }
 
+// UserNameSnapshot returns the current user display name under the account lock.
+func (a *Account) UserNameSnapshot() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.UserName
+}
+
 // Get 按名字取账号。
 func (p *Pool) Get(name string) *Account {
 	p.mu.Lock()
@@ -175,24 +183,19 @@ func (p *Pool) Get(name string) *Account {
 
 // AddAccount 动态添加账号（WebUI 登录成功后调用）。
 func (p *Pool) AddAccount(a *auth.Auth) *Account {
-	acct := &Account{
-		Name:              a.UserID,
-		UID:               a.UserID,
-		UserName:          a.UserName,
-		Auth:              a,
-		Client:            upstream.New(p.cfg.UpstreamTimeout),
-		maxConcurrent:     p.cfg.MaxConcurrent,
-		keepaliveLastPing: time.Now(),
-	}
+	uid := a.UserIDSnapshot()
 	p.mu.Lock()
-	for i, existing := range p.accounts {
-		if existing.Name == acct.Name {
+	upstreamTimeout := p.cfg.UpstreamTimeout
+	maxConcurrent := p.cfg.MaxConcurrent
+	for _, existing := range p.accounts {
+		if existing.Name == uid {
 			existing.mu.Lock()
 			existing.Auth = a
 			existing.UserName = a.UserName
-			existing.maxConcurrent = p.cfg.MaxConcurrent
+			existing.maxConcurrent = maxConcurrent
 			existing.lastValidated = time.Time{}
 			existing.disabled = false
+			existing.manualDisabled = false
 			existing.disabledReason = ""
 			existing.lastErr = ""
 			existing.mu.Unlock()
@@ -200,12 +203,20 @@ func (p *Pool) AddAccount(a *auth.Auth) *Account {
 			p.saveState()
 			return existing
 		}
-		p.accounts[i] = existing
+	}
+	acct := &Account{
+		Name:              uid,
+		UID:               uid,
+		UserName:          a.UserName,
+		Auth:              a,
+		Client:            upstream.New(upstreamTimeout),
+		maxConcurrent:     maxConcurrent,
+		keepaliveLastPing: time.Now(),
 	}
 	p.accounts = append(p.accounts, acct)
 	p.mu.Unlock()
 	p.saveState()
-	log.Printf("pool account added name=%s uid=%s", acct.Name, a.UserID)
+	log.Printf("pool account added name=%s uid=%s", acct.Name, uid)
 	return acct
 }
 
@@ -226,6 +237,11 @@ func (p *Pool) List() []map[string]any {
 		if reason == "" {
 			reason = a.lastErr
 		}
+		var checkinCopy *CheckinStatus
+		if a.checkin != nil {
+			cp := *a.checkin
+			checkinCopy = &cp
+		}
 		out = append(out, map[string]any{
 			"name":              a.Name,
 			"uid":               a.UID,
@@ -233,8 +249,9 @@ func (p *Pool) List() []map[string]any {
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
 			"credits":           int64(0), // 保留旧字段；未查询真实余额
-			"checkin":           a.checkin,
+			"checkin":           checkinCopy,
 			"disabled":          a.disabled,
+			"manual_disabled":   a.manualDisabled,
 			"cooling":           cooling,
 			"until":             until,
 			"err_count":         a.errCount,
@@ -280,6 +297,7 @@ func (p *Pool) Enable(name string) bool {
 		if a.Name == name || a.UID == name {
 			a.mu.Lock()
 			a.disabled = false
+			a.manualDisabled = false
 			a.disabledReason = ""
 			a.lastErr = ""
 			a.mu.Unlock()
@@ -352,13 +370,20 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 最低者优先，让同时进来的新会话摊开到整个账号池，而不是全挤在配置序第一个
 // 账号上排队；利用率相同保持配置顺序。槽位排队与错误轮转仍由调用方兜底。
 func (p *Pool) PickExcluding(tried map[string]bool) *Account {
+	return p.PickWhere(tried, nil)
+}
+
+// PickWhere 在满足 match 条件的健康账号里按并发利用率最低者优先挑选。
+// match 为 nil 时不附加过滤，等价于 PickExcluding。
+func (p *Pool) PickWhere(tried map[string]bool, match func(*Account) bool) *Account {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	accounts := append([]*Account(nil), p.accounts...)
+	p.mu.Unlock()
 	now := time.Now()
 	var best *Account
 	bestUtil := 0.0
-	for _, a := range p.accounts {
-		if tried != nil && tried[a.Name] {
+	for _, a := range accounts {
+		if a == nil || (tried != nil && tried[a.Name]) {
 			continue
 		}
 		a.mu.Lock()
@@ -371,6 +396,9 @@ func (p *Pool) PickExcluding(tried map[string]bool) *Account {
 		if !healthy {
 			continue
 		}
+		if match != nil && !match(a) {
+			continue
+		}
 		if best == nil || util < bestUtil {
 			best, bestUtil = a, util
 		}
@@ -380,20 +408,28 @@ func (p *Pool) PickExcluding(tried map[string]bool) *Account {
 
 // Validate 校验并（必要时）自动刷新 token。带 5 分钟缓存。
 func (p *Pool) Validate(a *Account) (bool, error) {
+	return p.ValidateContext(context.Background(), a)
+}
+
+// ValidateContext 在给定上下文超时约束内校验并按需续期账号 token。
+func (p *Pool) ValidateContext(ctx context.Context, a *Account) (bool, error) {
+	p.mu.Lock()
+	refreshSkew := p.cfg.RefreshSkew
+	p.mu.Unlock()
+
+	authz := a.AuthSnapshot()
 	a.mu.Lock()
-	if time.Since(a.lastValidated) < 5*time.Minute && !a.disabled {
+	if time.Since(a.lastValidated) < 5*time.Minute && !a.disabled && !authz.Expired() && !authz.ExpiringSoon(refreshSkew) {
 		ok := true
 		a.mu.Unlock()
 		return ok, nil
 	}
 	a.mu.Unlock()
-
-	authz := a.AuthSnapshot()
 	if authz.Expired() && authz.Refresh() == "" {
 		p.Disable(a.Name, "token expired; re-login required")
 		return false, nil
 	}
-	if authz.ExpiringSoon(p.cfg.RefreshSkew) || authz.Expired() {
+	if authz.ExpiringSoon(refreshSkew) || authz.Expired() {
 		if authz.Refresh() == "" {
 			// 没有 refresh_token（华为云 ticket 通道不返回），不立即 disable，
 			// 未过期时只打告警；到期后由上面的分支明确标记为需重新登录。
@@ -404,7 +440,7 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 			a.mu.Unlock()
 			return true, nil
 		}
-		if err := p.RefreshToken(a.Name); err != nil {
+		if err := p.refreshToken(ctx, a.Name, false, refreshSkew); err != nil {
 			var expired *upstream.RefreshTokenExpiredError
 			if errors.As(err, &expired) {
 				p.Disable(a.Name, "refresh_token expired; re-login required")
@@ -445,22 +481,36 @@ func (p *Pool) Cooldown(name string, kind CoolKind, dur time.Duration, reason st
 // NoteError 累计错误。
 func (p *Pool) NoteError(name string, threshold int, cooldown time.Duration) {
 	p.mu.Lock()
+	found := false
+	cooled := false
+	errCount := 0
 	for _, a := range p.accounts {
 		if a.Name != name {
 			continue
 		}
+		found = true
 		a.mu.Lock()
 		a.errCount++
+		errCount = a.errCount
 		if a.errCount >= threshold {
 			a.coolUntil = time.Now().Add(cooldown)
+			a.coolKind = CoolErr
 			a.lastErr = "consecutive errors"
+			cooled = true
 		}
 		a.mu.Unlock()
 	}
 	p.mu.Unlock()
+	if !found {
+		return
+	}
 	p.saveState()
 	if p.cfg.Telemetry != nil {
-		_ = p.cfg.Telemetry.RecordEvent("pool_note_error", "warn", name, "", "consecutive errors", nil)
+		msg := fmt.Sprintf("error count %d/%d", errCount, threshold)
+		if cooled {
+			msg = "consecutive errors; cooldown triggered"
+		}
+		_ = p.cfg.Telemetry.RecordEvent("pool_note_error", "warn", name, "", msg, nil)
 	}
 }
 
@@ -477,12 +527,12 @@ func (p *Pool) NoteSuccess(name string) {
 	}
 }
 
-// Disable 禁用账号。
+// Disable 禁用账号（自动禁用：401/凭证失效等；刷新成功后自动解禁）。
 func (p *Pool) Disable(name, reason string) bool {
 	p.mu.Lock()
 	found := false
 	for _, a := range p.accounts {
-		if a.Name == name {
+		if a.Name == name || a.UID == name {
 			a.mu.Lock()
 			a.disabled = true
 			a.disabledReason = reason
@@ -493,7 +543,34 @@ func (p *Pool) Disable(name, reason string) bool {
 		}
 	}
 	p.mu.Unlock()
-	p.saveState()
+	if found {
+		p.saveState()
+	}
+	return found
+}
+
+// DisableManual 管理员手动禁用：与自动禁用区分，token 刷新成功不会解除，
+// 只有 Enable 显式解禁（否则 watchdog/余额查询路径的 Validate 会把手动禁用
+// 静默复活）。
+func (p *Pool) DisableManual(name, reason string) bool {
+	p.mu.Lock()
+	found := false
+	for _, a := range p.accounts {
+		if a.Name == name || a.UID == name {
+			a.mu.Lock()
+			a.disabled = true
+			a.manualDisabled = true
+			a.disabledReason = reason
+			a.lastErr = reason
+			a.mu.Unlock()
+			log.Printf("pool disable account=%s reason=%s (manual)", name, reason)
+			found = true
+		}
+	}
+	p.mu.Unlock()
+	if found {
+		p.saveState()
+	}
 	return found
 }
 
@@ -586,6 +663,13 @@ func (p *Pool) ReleaseLock(name string) {
 // 高并发请求在此排队等待槽位释放，而非立即失败跳号。
 // timeout=0 时等价于非阻塞 AcquireLock。
 func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
+	return p.AcquireLockWaitCtx(context.Background(), name, timeout)
+}
+
+// AcquireLockWaitCtx 同 AcquireLockWait，但同时响应 ctx 取消：客户端断开时
+// 排队请求立即放弃，不再空占 goroutine 与等待时长（轮询重试路径原本就通过
+// select r.Context().Done 处理取消，这里让首次排队也具备同一语义）。
+func (p *Pool) AcquireLockWaitCtx(ctx context.Context, name string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
 		p.mu.Lock()
@@ -614,8 +698,12 @@ func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
 		if timeout <= 0 || time.Now().After(deadline) {
 			return false
 		}
-		// 避免忙轮询：每次 100ms 重试。
-		time.Sleep(100 * time.Millisecond)
+		// 避免忙轮询：每次 100ms 重试；ctx 取消立即放弃。
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 
@@ -655,6 +743,11 @@ func (p *Pool) PingKeepalive(name string) {
 // 此前该配置从未生效：原实现硬编码 1 小时阈值，调度器传进来的 RefreshSkew
 // 只出现在日志里，README 写的「提前刷新时间」实际不起作用。
 func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error {
+	return p.CheckAndRefreshTokenWithinContext(context.Background(), name, skew)
+}
+
+// CheckAndRefreshTokenWithinContext 在给定上下文超时内按需提前刷新 token。
+func (p *Pool) CheckAndRefreshTokenWithinContext(ctx context.Context, name string, skew time.Duration) error {
 	if skew <= 0 {
 		skew = time.Hour
 	}
@@ -684,12 +777,24 @@ func (p *Pool) CheckAndRefreshTokenWithin(name string, skew time.Duration) error
 	}
 	log.Printf("pool proactive refresh account=%s remaining=%s skew=%s",
 		name, remaining.Round(time.Minute), skew)
-	return p.RefreshToken(name)
+	return p.refreshToken(ctx, name, false, skew)
 }
 
-// RefreshToken 手动刷新指定账号的 token。
+// RefreshToken 手动刷新指定账号的 token（强制刷新，不受剩余有效期跳过）。
 func (p *Pool) RefreshToken(name string) error {
+	return p.refreshToken(context.Background(), name, true, 0)
+}
+
+// RefreshTokenContext 在给定上下文超时/取消约束下强制刷新指定账号的 token。
+func (p *Pool) RefreshTokenContext(ctx context.Context, name string) error {
+	return p.refreshToken(ctx, name, true, 0)
+}
+
+// refreshToken 在 refreshMu 保护下执行刷新；非强制模式会在锁内复查剩余有效期，
+// 避免并发 Validate / 主动刷新穿透后重复请求 STS。
+func (p *Pool) refreshToken(ctx context.Context, name string, force bool, skew time.Duration) error {
 	p.mu.Lock()
+	loginCfg := p.cfg.LoginConfig
 	var acct *Account
 	for _, a := range p.accounts {
 		if a.Name == name {
@@ -705,6 +810,12 @@ func (p *Pool) RefreshToken(name string) error {
 	defer acct.refreshMu.Unlock()
 
 	authz := acct.AuthSnapshot()
+	if !force && !authz.Expired() && (skew <= 0 || authz.Remaining() > skew) {
+		acct.mu.Lock()
+		acct.lastValidated = time.Now()
+		acct.mu.Unlock()
+		return nil
+	}
 	refreshToken := authz.Refresh()
 	if refreshToken == "" {
 		return fmt.Errorf("no refresh_token available")
@@ -714,7 +825,8 @@ func (p *Pool) RefreshToken(name string) error {
 		return fmt.Errorf("no DPoP private key available; re-login required")
 	}
 
-	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
+	loginCfg.ClientID = authz.ClientIDOr(loginCfg.ClientID)
+	resp, err := acct.Client.RefreshToken(ctx, loginCfg, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
 	if err != nil {
 		p.notifyEvent("token_refresh_failed", "error", name, err.Error())
 		return fmt.Errorf("refresh failed: %w", err)
@@ -730,9 +842,13 @@ func (p *Pool) RefreshToken(name string) error {
 		return fmt.Errorf("save token: %w", err)
 	}
 	acct.mu.Lock()
-	acct.disabled = false
-	acct.disabledReason = ""
-	acct.lastErr = ""
+	// 刷新成功只解除自动禁用（401/凭证失效的自愈路径）；管理员手动禁用
+	// 不受影响，避免下一次保活/余额查询把手动下线的账号静默复活。
+	if !acct.manualDisabled {
+		acct.disabled = false
+		acct.disabledReason = ""
+		acct.lastErr = ""
+	}
 	acct.lastValidated = time.Now()
 	acct.mu.Unlock()
 	log.Printf("pool token refreshed manually account=%s", name)
@@ -753,6 +869,7 @@ func (p *Pool) loadState() {
 		ErrCount           int            `json:"err_count"`
 		CoolUntil          time.Time      `json:"cool_until"`
 		Disabled           bool           `json:"disabled"`
+		ManualDisabled     bool           `json:"manual_disabled,omitempty"`
 		Reason             string         `json:"reason"`
 		LastErr            string         `json:"last_error"`
 		CheckinAttemptedAt time.Time      `json:"checkin_attempted_at,omitempty"`
@@ -769,6 +886,7 @@ func (p *Pool) loadState() {
 				a.errCount = s.ErrCount
 				a.coolUntil = s.CoolUntil
 				a.disabled = s.Disabled
+				a.manualDisabled = s.ManualDisabled
 				a.disabledReason = s.Reason
 				a.lastErr = s.LastErr
 				a.checkinAttemptedAt = s.CheckinAttemptedAt
@@ -793,6 +911,7 @@ func (p *Pool) saveState() {
 		ErrCount           int            `json:"err_count"`
 		CoolUntil          time.Time      `json:"cool_until"`
 		Disabled           bool           `json:"disabled"`
+		ManualDisabled     bool           `json:"manual_disabled,omitempty"`
 		Reason             string         `json:"reason"`
 		LastErr            string         `json:"last_error"`
 		CheckinAttemptedAt time.Time      `json:"checkin_attempted_at,omitempty"`
@@ -811,6 +930,7 @@ func (p *Pool) saveState() {
 			ErrCount:           a.errCount,
 			CoolUntil:          a.coolUntil,
 			Disabled:           a.disabled,
+			ManualDisabled:     a.manualDisabled,
 			Reason:             a.disabledReason,
 			LastErr:            a.lastErr,
 			CheckinAttemptedAt: a.checkinAttemptedAt,

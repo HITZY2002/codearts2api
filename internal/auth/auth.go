@@ -112,9 +112,23 @@ func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, co
 	return a
 }
 
+// UserIDSnapshot 返回 user_id（并发安全快照）。
+func (a *Auth) UserIDSnapshot() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.UserID
+}
+
 // FileName 返回 auth 文件名。
 func (a *Auth) FileName() string {
-	id := strings.ReplaceAll(a.UserID, string(filepath.Separator), "_")
+	id := a.UserIDSnapshot()
+	id = strings.ReplaceAll(id, "/", "_")
+	id = strings.ReplaceAll(id, "\\", "_")
+	id = strings.ReplaceAll(id, "..", "_")
+	id = strings.ReplaceAll(id, string(filepath.Separator), "_")
 	if id == "" {
 		id = "unknown"
 	}
@@ -225,7 +239,11 @@ func (a *Auth) Save() error {
 }
 
 // SetPath 设置文件路径（LoadDir 内部调用）。
-func (a *Auth) SetPath(p string) { a.path = p }
+func (a *Auth) SetPath(p string) {
+	a.mu.Lock()
+	a.path = p
+	a.mu.Unlock()
+}
 
 // LoadDir 加载 auths 目录下全部 codearts-*.json。
 func LoadDir(dir string) ([]*Auth, error) {
@@ -266,8 +284,11 @@ func SaveNew(dir string, a *Auth) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	a.path = filepath.Join(dir, a.FileName())
-	return a.Save()
+	target := filepath.Join(dir, a.FileName())
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.path = target
+	return saveLocked(a.path, a)
 }
 
 func saveLocked(path string, v any) error {

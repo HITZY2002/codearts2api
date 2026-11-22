@@ -177,26 +177,64 @@ func hasStreamOutput(data []byte) bool {
 	if len(data) == 0 {
 		return false
 	}
-	return bytes.Contains(data, []byte(`"content":`)) ||
-		bytes.Contains(data, []byte(`"reasoning_content":`)) ||
-		bytes.Contains(data, []byte(`"tool_calls":`))
+	return hasNonEmptyJSONField(data, []byte(`"content":`)) ||
+		hasNonEmptyJSONField(data, []byte(`"reasoning_content":`)) ||
+		hasNonEmptyJSONField(data, []byte(`"tool_calls":`))
+}
+
+func hasNonEmptyJSONField(data, key []byte) bool {
+	for offset := 0; offset < len(data); {
+		idx := bytes.Index(data[offset:], key)
+		if idx < 0 {
+			return false
+		}
+		rest := bytes.TrimLeft(data[offset+idx+len(key):], " \t")
+		if len(rest) > 0 &&
+			!bytes.HasPrefix(rest, []byte(`""`)) &&
+			!bytes.HasPrefix(rest, []byte(`null`)) &&
+			!bytes.HasPrefix(rest, []byte(`[]`)) {
+			return true
+		}
+		offset += idx + len(key)
+	}
+	return false
+}
+
+func isTrustedProxyPeer(host string) bool {
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+func sanitizeClientIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if len(s) > 64 {
+		s = s[:64]
+	}
+	return s
 }
 
 func clientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if idx := strings.Index(forwarded, ","); idx >= 0 {
-			forwarded = forwarded[:idx]
-		}
-		return strings.TrimSpace(forwarded)
-	}
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		return strings.TrimSpace(realIP)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
+	if isTrustedProxyPeer(host) {
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			if idx := strings.Index(forwarded, ","); idx >= 0 {
+				forwarded = forwarded[:idx]
+			}
+			if ip := sanitizeClientIP(forwarded); ip != "" {
+				return ip
+			}
+		}
+		if realIP := sanitizeClientIP(r.Header.Get("X-Real-IP")); realIP != "" {
+			return realIP
+		}
+	}
+	return sanitizeClientIP(host)
 }
 
 func numericMapValue(data map[string]any, key string) int64 {
@@ -234,11 +272,16 @@ func creditUsageFromMap(data map[string]any) *upstream.CreditUsage {
 	}
 }
 
-func applyCompletionMetrics(rec *requestRecorder, msgs []upstream.ChatMessage, comp *upstream.RawCompletion) {
+func applyCompletionMetrics(rec *requestRecorder, msgs []upstream.ChatMessage, comp *upstream.RawCompletion, finish string) {
 	if rec == nil || comp == nil {
 		return
 	}
-	rec.finishReason = comp.Finish
+	rec.record.ErrorType = ""
+	if finish != "" {
+		rec.finishReason = finish
+	} else {
+		rec.finishReason = comp.Finish
+	}
 	usage := usageEstimate(msgs, comp)
 	rec.record.PromptTokens = numericMapValue(usage, "prompt_tokens")
 	rec.record.CompletionTokens = numericMapValue(usage, "completion_tokens")
