@@ -26,6 +26,8 @@ const creditError = ref('')
 const accountSearch = ref('')
 const accountActionLoading = ref({})
 const accountActionFeedback = ref({})
+const pendingDeleteUID = ref('')
+let deleteConfirmTimer = null
 const reloadLoading = ref(false)
 const poolFeedback = ref(null) // { type: 'success' | 'error', message: string }
 
@@ -145,10 +147,48 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function askDeleteAccount(uid) {
+  pendingDeleteUID.value = uid
+  clearTimeout(deleteConfirmTimer)
+  deleteConfirmTimer = setTimeout(() => {
+    if (pendingDeleteUID.value === uid) pendingDeleteUID.value = ''
+  }, 6000)
+}
+
+function cancelDeleteAccount() {
+  pendingDeleteUID.value = ''
+  clearTimeout(deleteConfirmTimer)
+}
+
+async function confirmDeleteAccount(account) {
+  const uid = account.uid
+  cancelDeleteAccount()
+  accountActionLoading.value = { ...accountActionLoading.value, [uid]: 'delete' }
+  poolFeedback.value = null
+  try {
+    const result = await request('/admin/api/accounts/delete', {
+      method: 'POST',
+      body: JSON.stringify({ uid })
+    })
+    poolFeedback.value = {
+      type: 'success',
+      message: result.message || `已删除账号 ${account.nickname || uid}`
+    }
+    await afterMutation()
+  } catch (error) {
+    poolFeedback.value = { type: 'error', message: `删除失败：${error.message}` }
+  } finally {
+    const next = { ...accountActionLoading.value }
+    delete next[uid]
+    accountActionLoading.value = next
+  }
+}
+
 let unmounted = false
 onBeforeUnmount(() => {
   unmounted = true
   oauthSession.value = null
+  clearTimeout(deleteConfirmTimer)
 })
 
 async function pollAccountLogin(sessionID) {
@@ -349,10 +389,11 @@ const accountColumns = [
       : '—'
   },
   {
-    title: '操作', key: 'actions', width: 280, fixed: 'right',
+    title: '操作', key: 'actions', width: 320, fixed: 'right',
     render: row => {
       const loadingAction = accountActionLoading.value[row.uid]
       const feedback = accountActionFeedback.value[row.uid]
+      const confirmingDelete = pendingDeleteUID.value === row.uid
       const btns = [
         h(UiButton, {
           size: 'xs', variant: 'outline',
@@ -390,11 +431,33 @@ const accountColumns = [
         }, { default: () => '启用' }))
       } else {
         btns.push(h(UiButton, {
-          size: 'xs', variant: 'danger',
+          size: 'xs', variant: 'outline',
           loading: loadingAction === 'disable',
           disabled: Boolean(loadingAction) && loadingAction !== 'disable',
           onClick: () => runAccountAction(row, 'disable')
         }, { default: () => '禁用' }))
+      }
+      if (confirmingDelete) {
+        btns.push(
+          h(UiButton, {
+            size: 'xs', variant: 'danger',
+            loading: loadingAction === 'delete',
+            disabled: Boolean(loadingAction) && loadingAction !== 'delete',
+            onClick: () => confirmDeleteAccount(row)
+          }, { default: () => '确认删除' }),
+          h(UiButton, {
+            size: 'xs', variant: 'ghost',
+            disabled: Boolean(loadingAction),
+            onClick: cancelDeleteAccount
+          }, { default: () => '取消' })
+        )
+      } else {
+        btns.push(h(UiButton, {
+          size: 'xs', variant: 'danger',
+          loading: loadingAction === 'delete',
+          disabled: Boolean(loadingAction) && loadingAction !== 'delete',
+          onClick: () => askDeleteAccount(row.uid)
+        }, { default: () => '删除' }))
       }
       return h('div', { class: 'account-actions' }, [
         h('div', { class: 'row' }, btns),
@@ -465,7 +528,7 @@ onMounted(() => {
       </div>
 
       <UiDataTable
-        :columns="accountColumns" :data="filteredAccounts" :loading="loading" :scroll-x="1220"
+        :columns="accountColumns" :data="filteredAccounts" :loading="loading" :scroll-x="1280"
         :row-key="row => row.uid"
       />
     </UiCard>

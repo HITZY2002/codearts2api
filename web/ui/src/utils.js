@@ -59,7 +59,8 @@ export const eventKindLabels = {
   model_probe_failed: '模型探测失败',
   model_probe_succeeded: '模型探测成功',
   token_refresh_failed: 'Token 刷新失败',
-  token_refreshed: 'Token 已刷新'
+  token_refreshed: 'Token 已刷新',
+  account_deleted: '删除账号'
 }
 
 export function eventKindLabel(kind) {

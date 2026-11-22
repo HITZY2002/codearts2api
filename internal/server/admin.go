@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -490,6 +492,48 @@ func (h *Handler) adminClearCooldown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已清冷却 " + body.UID})
+}
+
+func (h *Handler) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	body, err := readUIDBody(r)
+	if err != nil || body.UID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
+		return
+	}
+	acct, ok := h.cfg.Pool.Remove(body.UID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
+		return
+	}
+	fileRemoved := false
+	if h.cfg.AuthDir != "" {
+		authz := acct.AuthSnapshot()
+		target := authz.PathSnapshot()
+		if target == "" && authz != nil {
+			target = filepath.Join(h.cfg.AuthDir, authz.FileName())
+		}
+		if target != "" {
+			cleanDir := filepath.Clean(h.cfg.AuthDir)
+			cleanTarget := filepath.Clean(target)
+			if filepath.Dir(cleanTarget) == cleanDir {
+				if err := os.Remove(cleanTarget); err == nil {
+					fileRemoved = true
+				} else if !os.IsNotExist(err) {
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": "删除凭证文件失败: " + err.Error()})
+					return
+				}
+			}
+		}
+	}
+	invalidateDynamicModelsCache()
+	if h.cfg.Telemetry != nil {
+		_ = h.cfg.Telemetry.RecordEvent("account_deleted", "info", acct.UID, "", "account deleted via admin api", nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"message":      "已删除账号 " + acct.UID,
+		"file_removed": fileRemoved,
+	})
 }
 
 func (h *Handler) pickTargets(uid string) []string {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -168,5 +169,66 @@ func TestAdminKeepaliveCallsUpstreamPing(t *testing.T) {
 	}
 	if !pinged {
 		t.Fatal("POST /admin/api/keepalive did not perform upstream keepalive ping")
+	}
+}
+
+func TestMetricsOverviewByModelAndAccountDelete(t *testing.T) {
+	store, err := telemetry.Open(filepath.Join(t.TempDir(), "obs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UnixMilli()
+	_ = store.RecordRequest(telemetry.RequestLog{RequestID: "m1", CreatedAt: now, Endpoint: "/v1/chat/completions", Method: "POST", StatusCode: 200, Model: "GLM-5.2", TotalTokens: 100})
+	_ = store.RecordRequest(telemetry.RequestLog{RequestID: "m2", CreatedAt: now, Endpoint: "/v1/chat/completions", Method: "POST", StatusCode: 200, Model: "glm-5.2", TotalTokens: 200})
+	_ = store.RecordRequest(telemetry.RequestLog{RequestID: "m3", CreatedAt: now, Endpoint: "/v1/chat/completions", Method: "POST", StatusCode: 200, Model: "deepseek-r1", TotalTokens: 50})
+	_ = store.Flush()
+
+	ov, err := store.MetricsOverview(now-60000, now+60000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ov.ByModel) != 2 {
+		t.Fatalf("expected 2 grouped models, got %#v", ov.ByModel)
+	}
+	if ov.ByModel[0].Model != "glm-5.2" || ov.ByModel[0].RequestCount != 2 || ov.ByModel[0].TotalTokens != 300 {
+		t.Fatalf("unexpected top model stat: %#v", ov.ByModel[0])
+	}
+	if ov.ByModel[1].Model != "deepseek-r1" || ov.ByModel[1].RequestCount != 1 {
+		t.Fatalf("unexpected second model stat: %#v", ov.ByModel[1])
+	}
+
+	// Test POST /admin/api/accounts/delete removes account from pool and deletes credential file.
+	authDir := t.TempDir()
+	a := auth.New("uid-del", "tester", "dom", "tok", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	if err := auth.SaveNew(authDir, a); err != nil {
+		t.Fatal(err)
+	}
+	credPath := a.PathSnapshot()
+	p, err := pool.New([]*auth.Auth{a}, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{Pool: p, AuthDir: authDir, APIKey: testHandlerAPIKey, Telemetry: store})
+
+	// Deleting unknown account -> 404
+	rec404 := httptest.NewRecorder()
+	h.ServeHTTP(rec404, authenticatedTestRequest(http.MethodPost, "/admin/api/accounts/delete", bytes.NewBufferString(`{"uid":"nonexistent"}`)))
+	if rec404.Code != http.StatusNotFound {
+		t.Fatalf("delete nonexistent status=%d want 404", rec404.Code)
+	}
+
+	// Deleting real account -> 200, pool empty, file gone
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authenticatedTestRequest(http.MethodPost, "/admin/api/accounts/delete", bytes.NewBufferString(`{"uid":"uid-del"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if p.Get("uid-del") != nil || len(p.Accounts()) != 0 {
+		t.Fatalf("account still in pool after delete")
+	}
+	if _, err := os.Stat(credPath); !os.IsNotExist(err) {
+		t.Fatalf("credential file %s was not removed: err=%v", credPath, err)
 	}
 }
