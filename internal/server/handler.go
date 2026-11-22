@@ -473,6 +473,9 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
 	entries := modelEntries(h.fetchDynamicModels())
+	// 面板设置：是否返回福利模型，以及要隐藏的特定模型。
+	returnBenefit, hidden := h.modelListFilters()
+	entries = filterModelEntries(entries, returnBenefit, hidden)
 	// 过滤掉「已知不可用」的模型：这些条目在客户端点开就是 404 / benefit not
 	// found，列出来只会误导。必须作用在最终条目上——静态兜底表也会补位，
 	// 只在动态结果上过滤会让被下架的模型又从静态表冒出来。
@@ -493,6 +496,60 @@ func (h *Handler) modelList() []map[string]any {
 	// （首次请求返回的是「发现结果」，之后才收敛到「真实可用」。）
 	h.probeUnknownAsync()
 	return entries
+}
+
+// modelListFilters 从面板设置读取 /v1/models 的返回内容控制。
+func (h *Handler) modelListFilters() (returnBenefit bool, hidden map[string]struct{}) {
+	returnBenefit = true
+	hidden = map[string]struct{}{}
+	if h.cfg.Settings == nil {
+		return
+	}
+	settings := h.cfg.Settings.Get()
+	returnBenefit = settings.ModelsReturnBenefit
+	for _, token := range strings.Split(settings.ModelsHidden, ",") {
+		token = strings.TrimSpace(token)
+		if token != "" {
+			hidden[token] = struct{}{}
+		}
+	}
+	return returnBenefit, hidden
+}
+
+// filterModelEntries 按面板设置过滤 /v1/models 条目：
+//   - returnBenefit=false：去掉带 benefit 标记的限时福利模型
+//   - hidden：要隐藏的模型 ID 集合，大小写不敏感匹配
+func filterModelEntries(entries []map[string]any, returnBenefit bool, hidden map[string]struct{}) []map[string]any {
+	if returnBenefit && len(hidden) == 0 {
+		return entries
+	}
+	effectiveHidden := make(map[string]struct{}, len(hidden)*2)
+	for token := range hidden {
+		effectiveHidden[token] = struct{}{}
+		effectiveHidden[strings.ToLower(token)] = struct{}{}
+	}
+	hidden = effectiveHidden
+	kept := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		if id == "" {
+			kept = append(kept, e)
+			continue
+		}
+		if _, ok := hidden[id]; ok {
+			continue
+		}
+		if _, ok := hidden[strings.ToLower(id)]; ok {
+			continue
+		}
+		if !returnBenefit {
+			if benefit, _ := e["benefit"].(bool); benefit {
+				continue
+			}
+		}
+		kept = append(kept, e)
+	}
+	return kept
 }
 
 // probeUnknownAsync 后台探测「还没有结论」的模型，不阻塞请求。
@@ -538,22 +595,23 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 
 // modelEntries 把账号模型目录 + 静态兜底包装成 OpenAI /v1/models 条目。
 //
-// 上游模型 ID 区分大小写：既列精确 ID（GLM-5.2），也补一条小写别名（glm-5.2，
-// 老客户端习惯用小写），聊天时由 CanonicalModel 归一回精确 ID。
+// /v1/models 统一只返回全小写、去重后的模型 ID；客户端传入大写或混合大小写时，
+// 聊天链路会先通过大小写不敏感匹配 / CanonicalModel 自动归一回上游精确 ID。
 // 静态表只在动态目录缺失该 ID 时补位，顺序固定（动态已排序，静态按表序）。
 func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos)+len(staticModels))
 	seen := map[string]bool{}
 	add := func(id string, ctx, maxOut int64, benefit bool) {
-		if id == "" || seen[id] {
+		lower := strings.ToLower(strings.TrimSpace(id))
+		if lower == "" || seen[lower] {
 			return
 		}
-		seen[id] = true
+		seen[lower] = true
 		if ctx == 0 {
 			ctx = 131072 // 兜底
 		}
 		entry := map[string]any{
-			"id":             id,
+			"id":             lower,
 			"object":         "model",
 			"created":        1753600000,
 			"owned_by":       "codearts",
@@ -567,18 +625,11 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 		}
 		out = append(out, entry)
 	}
-	// addAlias 精确 ID + 就近补一条小写别名（已是小写则跳过）。
-	addAlias := func(id string, ctx, maxOut int64, benefit bool) {
-		add(id, ctx, maxOut, benefit)
-		if lower := strings.ToLower(id); lower != id {
-			add(lower, ctx, maxOut, benefit)
-		}
-	}
 	for _, mi := range infos {
-		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+		add(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
 	}
 	for _, sm := range staticModels {
-		addAlias(sm.ID, sm.ContextWindow, 0, sm.Benefit)
+		add(sm.ID, sm.ContextWindow, 0, sm.Benefit)
 	}
 	return out
 }

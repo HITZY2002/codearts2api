@@ -26,6 +26,9 @@ type Settings struct {
 	RefreshSkewMinutes       int    `json:"refresh_skew_minutes"`
 	KeepaliveIntervalMinutes int    `json:"keepalive_interval_minutes"`
 	KeepaliveWindowMinutes   int    `json:"keepalive_window_minutes"`
+	// /v1/models 返回内容控制：福利模型是否列出，以及要隐藏的模型 ID。
+	ModelsReturnBenefit bool   `json:"models_return_benefit"`
+	ModelsHidden        string `json:"models_hidden"`
 }
 
 type settingsSnapshot struct {
@@ -54,6 +57,8 @@ func DefaultSettings() Settings {
 		RefreshSkewMinutes:       30,
 		KeepaliveIntervalMinutes: 15,
 		KeepaliveWindowMinutes:   10,
+		ModelsReturnBenefit:      true,
+		ModelsHidden:             "",
 	}
 }
 
@@ -73,6 +78,18 @@ func OpenSettings(path string, fallback Settings) (*SettingsStore, error) {
 	var loaded Settings
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
+	}
+	// 旧版本 settings.json 没有 models_* 字段：缺失时回退默认值，
+	// 避免升级后布尔零值（false）静默关闭福利模型的返回。
+	var present map[string]any
+	if err := json.Unmarshal(raw, &present); err == nil {
+		defaults := DefaultSettings()
+		if _, ok := present["models_return_benefit"]; !ok {
+			loaded.ModelsReturnBenefit = defaults.ModelsReturnBenefit
+		}
+		if _, ok := present["models_hidden"]; !ok {
+			loaded.ModelsHidden = defaults.ModelsHidden
+		}
 	}
 	if err := validateSettings(loaded); err != nil {
 		return nil, err
@@ -127,6 +144,9 @@ func validateSettings(s Settings) error {
 	}
 	if len(s.DefaultModel) > 200 {
 		return fmt.Errorf("默认模型过长")
+	}
+	if len(s.ModelsHidden) > 2000 {
+		return fmt.Errorf("隐藏模型列表过长")
 	}
 	if err := validateRange("单账号并发上限", s.MaxConcurrent, 1, 10); err != nil {
 		return err
