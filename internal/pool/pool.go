@@ -312,7 +312,7 @@ func (p *Pool) Enable(name string) bool {
 	return found
 }
 
-// ClearCooldown 清冷却。
+// ClearCooldown 清冷却并重置连续错误计数。
 func (p *Pool) ClearCooldown(name string) bool {
 	p.mu.Lock()
 	found := false
@@ -321,6 +321,8 @@ func (p *Pool) ClearCooldown(name string) bool {
 			a.mu.Lock()
 			a.coolUntil = time.Time{}
 			a.coolKind = CoolSoft
+			a.errCount = 0
+			a.lastErr = ""
 			a.mu.Unlock()
 			found = true
 			break
@@ -331,6 +333,29 @@ func (p *Pool) ClearCooldown(name string) bool {
 		p.saveState()
 	}
 	return found
+}
+
+// ClearAllCooldowns 清除全部处于冷却或有错误计数的账号状态，返回受影响账号数。
+func (p *Pool) ClearAllCooldowns() int {
+	p.mu.Lock()
+	now := time.Now()
+	cleared := 0
+	for _, a := range p.accounts {
+		a.mu.Lock()
+		if now.Before(a.coolUntil) || a.errCount > 0 {
+			a.coolUntil = time.Time{}
+			a.coolKind = CoolSoft
+			a.errCount = 0
+			a.lastErr = ""
+			cleared++
+		}
+		a.mu.Unlock()
+	}
+	p.mu.Unlock()
+	if cleared > 0 {
+		p.saveState()
+	}
+	return cleared
 }
 
 // SyncToDir 用磁盘 auths 全量对齐。

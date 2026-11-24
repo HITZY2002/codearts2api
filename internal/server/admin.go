@@ -483,8 +483,15 @@ func (h *Handler) adminDisable(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) adminClearCooldown(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
-	if err != nil || body.UID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "uid required"})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
+		return
+	}
+	if body.UID == "" {
+		cleared := h.cfg.Pool.ClearAllCooldowns()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "cleared": cleared, "message": "已清除全部冷却（" + itoa(cleared) + " 个账号）",
+		})
 		return
 	}
 	if !h.cfg.Pool.ClearCooldown(body.UID) {

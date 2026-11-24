@@ -1514,7 +1514,10 @@ func isParamInvalidError(err error) bool {
 		return false
 	}
 	low := strings.ToLower(message)
-	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
+	return strings.Contains(low, "inferhub.001001005") ||
+		strings.Contains(low, "inferhub.001001017") ||
+		strings.Contains(low, "request param is invalid") ||
+		strings.Contains(low, "length over limit")
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

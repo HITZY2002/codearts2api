@@ -232,3 +232,50 @@ func TestMetricsOverviewByModelAndAccountDelete(t *testing.T) {
 		t.Fatalf("credential file %s was not removed: err=%v", credPath, err)
 	}
 }
+
+func TestClearCooldownResetsErrorsAndAllCooldownsAndParamLimitError(t *testing.T) {
+	// 1. InferHub.001001017.413 length over limit must be treated as client param invalid (no account cooldown).
+	if !isParamInvalidError(&upstream.ApiError{
+		Status:  502,
+		Code:    502,
+		Message: "InferHub.001001017.413 Function name [mcp__very_long_name] length over limit, maximum is 64",
+	}) {
+		t.Fatal("InferHub.001001017.413 length over limit should be classified as param invalid")
+	}
+
+	// 2. Single and bulk clear-cooldown must clear both cooldown and err_count.
+	a1 := auth.New("u-c1", "u1", "dom", "tok", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	a2 := auth.New("u-c2", "u2", "dom", "tok", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	p, err := pool.New([]*auth.Auth{a1, a2}, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.NoteError("u-c1", 2, 10*time.Minute)
+	p.NoteError("u-c1", 2, 10*time.Minute)
+	p.Cooldown("u-c2", pool.CoolErr, 10*time.Minute, "boom")
+
+	h := NewHandler(Config{Pool: p, APIKey: testHandlerAPIKey})
+
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, authenticatedTestRequest(http.MethodPost, "/admin/api/accounts/clear-cooldown", bytes.NewBufferString(`{"uid":"u-c1"}`)))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("single clear-cooldown status=%d body=%s", rec1.Code, rec1.Body.String())
+	}
+	if !p.Healthy("u-c1") {
+		t.Fatal("u-c1 should be healthy after clear-cooldown")
+	}
+	for _, st := range p.List() {
+		if st["uid"] == "u-c1" && st["err_count"].(int) != 0 {
+			t.Fatalf("u-c1 err_count=%v want 0", st["err_count"])
+		}
+	}
+
+	recAll := httptest.NewRecorder()
+	h.ServeHTTP(recAll, authenticatedTestRequest(http.MethodPost, "/admin/api/accounts/clear-cooldown", bytes.NewBufferString(`{}`)))
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("bulk clear-cooldown status=%d body=%s", recAll.Code, recAll.Body.String())
+	}
+	if !p.Healthy("u-c2") {
+		t.Fatal("u-c2 should be healthy after bulk clear-cooldown")
+	}
+}

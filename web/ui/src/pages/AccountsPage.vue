@@ -29,6 +29,7 @@ const accountActionFeedback = ref({})
 const pendingDeleteUID = ref('')
 let deleteConfirmTimer = null
 const reloadLoading = ref(false)
+const clearAllCooldownLoading = ref(false)
 const poolFeedback = ref(null) // { type: 'success' | 'error', message: string }
 
 // ---- OAuth 添加账号 ----
@@ -86,6 +87,24 @@ async function afterMutation() {
   await loadAll()
   creditLoaded.value = false
   await loadCreditBalances()
+}
+
+const coolingOrErrCount = computed(() =>
+  accountRows.value.filter(account => account.cooling || (account.err_count || 0) > 0).length
+)
+
+async function clearAllCooldowns() {
+  clearAllCooldownLoading.value = true
+  poolFeedback.value = null
+  try {
+    const result = await request('/admin/api/accounts/clear-cooldown', { method: 'POST', body: JSON.stringify({}) })
+    poolFeedback.value = { type: 'success', message: result.message || '已清除全部冷却' }
+    await afterMutation()
+  } catch (error) {
+    poolFeedback.value = { type: 'error', message: `清冷却失败：${error.message}` }
+  } finally {
+    clearAllCooldownLoading.value = false
+  }
 }
 
 async function reloadAccountsFromDisk() {
@@ -414,14 +433,14 @@ const accountColumns = [
           onClick: () => runAccountAction(row, 'keepalive')
         }, { default: () => '保活' })
       ]
-      if (row.cooling) {
-        btns.push(h(UiButton, {
-          size: 'xs', variant: 'outline',
-          loading: loadingAction === 'clearCooldown',
-          disabled: Boolean(loadingAction) && loadingAction !== 'clearCooldown',
-          onClick: () => runAccountAction(row, 'clearCooldown')
-        }, { default: () => '清冷却' }))
-      }
+      const canClearCooldown = Boolean(row.cooling || (row.err_count || 0) > 0)
+      btns.push(h(UiButton, {
+        size: 'xs', variant: row.cooling ? 'primary' : 'outline',
+        loading: loadingAction === 'clearCooldown',
+        disabled: !canClearCooldown || (Boolean(loadingAction) && loadingAction !== 'clearCooldown'),
+        title: row.cooling ? `解除冷却${row.until ? `（原到期 ${formatTime(row.until)}）` : ''}` : canClearCooldown ? '清零错误计数' : '当前未冷却',
+        onClick: () => runAccountAction(row, 'clearCooldown')
+      }, { default: () => '清冷却' }))
       if (row.disabled) {
         btns.push(h(UiButton, {
           size: 'xs', variant: 'primary',
@@ -481,6 +500,15 @@ onMounted(() => {
         <UiTag v-if="creditLoaded" type="success" :title="`总额 ${formatCredit(creditTotal.total_amount)}，已用 ${formatCredit(creditTotal.used_amount)}`">
           总剩余 {{ formatCredit(creditTotal.remaining_amount) }}
         </UiTag>
+        <UiButton
+          v-if="coolingOrErrCount > 0"
+          variant="outline"
+          size="sm"
+          :loading="clearAllCooldownLoading"
+          @click="clearAllCooldowns"
+        >
+          全部清冷却 ({{ coolingOrErrCount }})
+        </UiButton>
         <UiButton variant="outline" size="sm" @click="batchCheckinOpen = true">批量签到</UiButton>
         <UiButton variant="outline" size="sm" :loading="creditLoading" @click="loadCreditBalances">刷新余额</UiButton>
         <UiButton variant="outline" size="sm" :loading="reloadLoading" @click="reloadAccountsFromDisk">重载账号</UiButton>
