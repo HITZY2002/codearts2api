@@ -36,7 +36,7 @@ const kindOptions = computed(() =>
 const eventColumns = [
   { title: '时间', key: 'created_at', width: 150, render: row => h('span', { class: 'num' }, formatTime(row.created_at)) },
   {
-    title: '级别', key: 'level', width: 84,
+    title: '级别', key: 'level', width: 86, className: 'no-ellipsis',
     render: row => h(UiTag, { type: row.level === 'error' ? 'error' : row.level === 'warn' ? 'warning' : 'info' }, { default: () => eventLevelLabel(row.level) })
   },
   { title: '类型', key: 'kind', minWidth: 150, render: row => h('span', { class: 'truncate-cell', title: row.kind || '' }, eventKindLabel(row.kind)) },
@@ -44,7 +44,7 @@ const eventColumns = [
   { title: '模型', key: 'model', minWidth: 130, render: row => h('span', { class: 'truncate-cell', title: row.model || '' }, row.model || '—') },
   { title: '消息', key: 'message', minWidth: 220, className: 'wrap-cell' },
   {
-    title: '数据', key: 'data', width: 72, fixed: 'right',
+    title: '数据', key: 'data', width: 84, fixed: 'right', className: 'no-ellipsis',
     render: row => h(UiButton, { size: 'xs', variant: 'outline', onClick: () => openDetail(row) }, { default: () => '查看' })
   }
 ]

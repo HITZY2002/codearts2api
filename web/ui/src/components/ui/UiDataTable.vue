@@ -36,9 +36,11 @@ function colStyle(col) {
   return w != null ? { width: `${w}px` } : null
 }
 function cellClass(col) {
+  const cls = col.className || ''
   return {
     right: col.align === 'right',
-    wrap: col.className === 'wrap-cell' || (col.className || '').includes('wrap-cell'),
+    wrap: cls === 'wrap-cell' || cls.includes('wrap-cell'),
+    'no-ellipsis': cls.includes('no-ellipsis'),
     'is-fixed-right': col.fixed === 'right'
   }
 }

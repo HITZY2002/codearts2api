@@ -463,6 +463,7 @@ html.theme-dark .u-switch { background: #333745; }
 .u-table tbody tr:hover { background: var(--card-2); }
 .u-table tbody tr:last-child td { border-bottom: none; }
 .u-table td.wrap { white-space: normal; overflow-wrap: anywhere; }
+.u-table td.no-ellipsis, .u-table td.is-fixed-right { text-overflow: clip; }
 .u-table td.right, .u-table th.right { text-align: right; }
 .u-table .is-fixed-right {
   position: sticky; right: 0; z-index: 4;

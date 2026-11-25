@@ -39,8 +39,8 @@ const logColumns = [
   { title: '时间', key: 'created_at', width: 172, render: row => h('span', { class: 'num' }, formatTime(row.created_at)) },
   { title: '模型', key: 'model', minWidth: 150, render: row => h('span', { class: 'truncate-cell', title: row.model || '' }, row.model || '—') },
   { title: '账号', key: 'account_name', minWidth: 130, render: row => h('span', { class: 'truncate-cell', title: row.account_name || '' }, row.account_name || '—') },
-  { title: '流', key: 'stream', width: 78, render: row => h(UiTag, { type: row.stream ? 'info' : 'default' }, { default: () => (row.stream ? '流' : '非流') }) },
-  { title: '状态', key: 'status_code', width: 68, render: row => h(UiTag, { type: statusType(row.status_code) }, { default: () => String(row.status_code) }) },
+  { title: '流', key: 'stream', width: 78, className: 'no-ellipsis', render: row => h(UiTag, { type: row.stream ? 'info' : 'default' }, { default: () => (row.stream ? '流' : '非流') }) },
+  { title: '状态', key: 'status_code', width: 82, className: 'no-ellipsis', render: row => h(UiTag, { type: statusType(row.status_code) }, { default: () => String(row.status_code) }) },
   { title: 'TTFT', key: 'first_output_ms', width: 90, align: 'right', render: row => h('span', { class: 'num' }, row.first_output_ms == null ? '—' : formatDuration(row.first_output_ms)) },
   {
     title: '耗时', key: 'total_ms', width: 104,
@@ -54,7 +54,7 @@ const logColumns = [
   { title: '上游消息 ID', key: 'upstream_msg_id', minWidth: 170, render: row => h('span', { class: 'mono truncate-cell', title: row.upstream_msg_id || '' }, row.upstream_msg_id || '—') },
   { title: 'IP', key: 'client_ip', width: 118 },
   {
-    title: '详情', key: 'details', width: 66, fixed: 'right',
+    title: '详情', key: 'details', width: 84, fixed: 'right', className: 'no-ellipsis',
     render: row => h(UiButton, { size: 'xs', variant: 'outline', onClick: () => openDetail(row) }, { default: () => '查看' })
   }
 ]
@@ -82,7 +82,7 @@ const logColumns = [
         </div>
       </div>
       <UiDataTable
-        :columns="logColumns" :data="logs" :loading="loading" :scroll-x="1220"
+        :columns="logColumns" :data="logs" :loading="loading" :scroll-x="1260"
         :row-key="row => row.request_id"
         :pagination="{ page: logPage, pageSize: logPageSize, itemCount: logTotal, onUpdatePage: changeLogPage, onUpdatePageSize: changeLogPageSize }"
       />
