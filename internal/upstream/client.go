@@ -522,7 +522,11 @@ func chatBodyV2(messages []ChatMessage, model string, opts ChatOptions) map[stri
 		body["reasoning_effort"] = opts.ReasoningEffort
 	}
 	if opts.MaxTokens != nil {
-		body["max_tokens"] = *opts.MaxTokens
+		maxTokens := *opts.MaxTokens
+		if maxTokens > 65536 {
+			maxTokens = 65536
+		}
+		body["max_tokens"] = maxTokens
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature

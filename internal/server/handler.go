@@ -871,6 +871,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if affinity == "" {
 		affinity = r.Header.Get("X-Session-Id")
 	}
+	if affinity == "" {
+		affinity = r.Header.Get("Session-Id")
+	}
 	req.ConversationID = conversationIDFor(req, affinity)
 
 	toolsOn := toolsActive(req)

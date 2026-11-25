@@ -137,6 +137,46 @@ func TestParseChatRequest(t *testing.T) {
 	}
 }
 
+func TestParseChatRequestClampsMaxTokensTo64K(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{
+			name: "max_tokens_above_64k",
+			body: `{"model":"glm-5.2","max_tokens":131072,"messages":[{"role":"user","content":"hi"}]}`,
+			want: 65536,
+		},
+		{
+			name: "max_completion_tokens_above_64k",
+			body: `{"model":"glm-5.2","max_completion_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`,
+			want: 65536,
+		},
+		{
+			name: "max_tokens_exact_64k",
+			body: `{"model":"glm-5.2","max_tokens":65536,"messages":[{"role":"user","content":"hi"}]}`,
+			want: 65536,
+		},
+		{
+			name: "max_tokens_below_64k",
+			body: `{"model":"glm-5.2","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`,
+			want: 4096,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := parseChatRequest([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if req.MaxTokens == nil || *req.MaxTokens != tc.want {
+				t.Fatalf("MaxTokens=%v want %d", req.MaxTokens, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseChatRequestErrors(t *testing.T) {
 	if _, err := parseChatRequest([]byte(`{}`)); err == nil {
 		t.Fatal("expected error for empty messages")
@@ -216,6 +256,56 @@ func TestConversationIDDoesNotInferAffinityFromFirstMessage(t *testing.T) {
 	}
 	if conversationIDFor(one, "session-one") == conversationIDFor(two, "session-two") {
 		t.Fatal("explicit client sessions must not share a conversation ID")
+	}
+}
+
+func TestConversationIDStickyForAgentAndMultiTurnAndPromptCacheKey(t *testing.T) {
+	// 1. prompt_cache_key / session_id / metadata.session_id are recognized.
+	r1, err := parseChatRequest([]byte(`{"prompt_cache_key":"cache-abc","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil || r1.ConversationID != "cache-abc" {
+		t.Fatalf("prompt_cache_key not parsed: req=%+v err=%v", r1, err)
+	}
+	r2, err := parseChatRequest([]byte(`{"metadata":{"session_id":"meta-1"},"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil || r2.ConversationID != "meta-1" {
+		t.Fatalf("metadata.session_id not parsed: req=%+v err=%v", r2, err)
+	}
+
+	// 2. Tool-using Agent session (e.g., DeepSeek Harness behind NewAPI) gets stable ID from turn 1 across continuations.
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "bash"}}}
+	turn1 := &chatRequest{
+		Tools: tools,
+		Messages: []openAIMessage{
+			{Role: "system", Text: "system prompt v1"},
+			{Role: "user", Text: "fix bug in server"},
+		},
+	}
+	turn2 := &chatRequest{
+		Tools: tools,
+		Messages: []openAIMessage{
+			{Role: "system", Text: "system prompt v2 (updated timestamp)"},
+			{Role: "user", Text: "fix bug in server"},
+			{Role: "assistant", ToolCalls: []openAIToolCall{{ID: "call_1", Name: "bash", Arguments: `{}`}}},
+			{Role: "tool", ToolCallID: "call_1", Text: "ok"},
+		},
+	}
+	id1 := conversationIDFor(turn1, "")
+	id2 := conversationIDFor(turn2, "")
+	if !validChatID(id1) || id1 != id2 {
+		t.Fatalf("agent session conversation ID must be stable: id1=%q id2=%q", id1, id2)
+	}
+
+	// 3. Multi-turn chat without tools gets stable ID across follow-up turns.
+	mt1 := &chatRequest{Messages: []openAIMessage{
+		{Role: "user", Text: "explain go"},
+		{Role: "assistant", Text: "go is ..."},
+		{Role: "user", Text: "more details"},
+	}}
+	mt2 := &chatRequest{Messages: append(append([]openAIMessage{}, mt1.Messages...),
+		openAIMessage{Role: "assistant", Text: "more ..."},
+		openAIMessage{Role: "user", Text: "example"},
+	)}
+	if a, b := conversationIDFor(mt1, ""), conversationIDFor(mt2, ""); !validChatID(a) || a != b {
+		t.Fatalf("multi-turn conversation ID must be stable: a=%q b=%q", a, b)
 	}
 }
 

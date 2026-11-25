@@ -23,6 +23,13 @@ func TestUpstreamTurnKeyStableAcrossToolContinuation(t *testing.T) {
 		t.Fatalf("tool continuation changed turn key: %q != %q", got, k1)
 	}
 
+	// Dynamic system prompt mutation mid-turn must not rotate upstream_msg_id.
+	mutatedSys := append([]openAIMessage{}, continued...)
+	mutatedSys[0] = openAIMessage{Role: "system", Text: "sys updated at 20:19:00"}
+	if got := upstreamTurnKey(&chatRequest{Messages: mutatedSys}); got != k1 {
+		t.Fatalf("dynamic system prompt changed turn key: %q != %q", got, k1)
+	}
+
 	nextTurn := append(append([]openAIMessage{}, continued...), openAIMessage{Role: "user", Text: "follow-up"})
 	if got := upstreamTurnKey(&chatRequest{Messages: nextTurn}); got == k1 {
 		t.Fatalf("new user turn reused key %q", got)

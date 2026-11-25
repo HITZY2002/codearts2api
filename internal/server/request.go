@@ -54,6 +54,10 @@ type chatRequest struct {
 	ConversationID  string
 }
 
+// maxOutputTokens 上游 CodeArts 单次输出 token 上限（64K = 65536）。
+// 客户端传更大值时自动钳制到 64K，避免上游直接报参数超限错。
+const maxOutputTokens = 65536
+
 // parseChatRequest 解析并校验请求体。
 func parseChatRequest(body []byte) (*chatRequest, error) {
 	var raw struct {
@@ -68,6 +72,9 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		Temperature         *float64          `json:"temperature"`
 		TopP                *float64          `json:"top_p"`
 		ConversationID      string            `json:"conversation_id"`
+		SessionID           string            `json:"session_id"`
+		PromptCacheKey      string            `json:"prompt_cache_key"`
+		Metadata            map[string]any    `json:"metadata"`
 		Messages            []json.RawMessage `json:"messages"`
 		Tools               []map[string]any  `json:"tools"`
 		ToolChoice          json.RawMessage   `json:"tool_choice"`
@@ -78,6 +85,21 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	if len(raw.Messages) == 0 {
 		return nil, errors.New("messages is empty")
 	}
+	convID := strings.TrimSpace(raw.ConversationID)
+	if convID == "" {
+		convID = strings.TrimSpace(raw.SessionID)
+	}
+	if convID == "" {
+		convID = strings.TrimSpace(raw.PromptCacheKey)
+	}
+	if convID == "" && len(raw.Metadata) > 0 {
+		for _, k := range []string{"conversation_id", "session_id", "chat_id"} {
+			if v, ok := raw.Metadata[k].(string); ok && strings.TrimSpace(v) != "" {
+				convID = strings.TrimSpace(v)
+				break
+			}
+		}
+	}
 	req := &chatRequest{
 		Model:           raw.Model,
 		Stream:          raw.Stream,
@@ -86,7 +108,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		MaxTokens:       raw.MaxTokens,
 		Temperature:     raw.Temperature,
 		TopP:            raw.TopP,
-		ConversationID:  raw.ConversationID,
+		ConversationID:  convID,
 		Tools:           raw.Tools,
 		ToolChoice:      parseToolChoice(raw.ToolChoice),
 	}
@@ -95,6 +117,10 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	}
 	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
 		return nil, errors.New("max_tokens must be greater than 0")
+	}
+	if req.MaxTokens != nil && *req.MaxTokens > maxOutputTokens {
+		capped := maxOutputTokens
+		req.MaxTokens = &capped
 	}
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 		return nil, errors.New("temperature must be between 0 and 2")
@@ -352,7 +378,8 @@ func fingerprintOf(msgs []openAIMessage) string {
 
 // upstreamTurnKey identifies one logical user turn, not one HTTP request.
 // Tool continuations append assistant/tool messages after the latest user
-// message; hashing only through that user message keeps the turn stable.
+// message; hashing only non-system messages through that user message keeps
+// the turn stable even when an Agent harness mutates dynamic system prompts.
 func upstreamTurnKey(req *chatRequest) string {
 	if req == nil || len(req.Messages) == 0 {
 		return ""
@@ -367,16 +394,30 @@ func upstreamTurnKey(req *chatRequest) string {
 	if lastUser >= 0 {
 		prefix = req.Messages[:lastUser+1]
 	}
-	fp := fingerprintOf(prefix)
+	nonSystem := make([]openAIMessage, 0, len(prefix))
+	for _, m := range prefix {
+		if m.Role == "system" || m.Role == "developer" {
+			continue
+		}
+		nonSystem = append(nonSystem, m)
+	}
+	if len(nonSystem) == 0 {
+		nonSystem = prefix
+	}
+	fp := fingerprintOf(nonSystem)
 	if req.ConversationID != "" {
 		return req.ConversationID + ":" + fp
 	}
 	return fp
 }
 
-// conversationIDFor returns an explicit client conversation identity. Requests
-// without one get a fresh upstream chat ID in the handler, preventing two
-// unrelated conversations with the same first message from sharing state.
+// conversationIDFor returns a stable conversation identity for account affinity
+// and upstream x-ot-session-id derivation:
+//  1. Explicit client ID (conversation_id / session_id / prompt_cache_key / metadata / headers)
+//  2. Implicit session anchor for Agent (tools active) or multi-turn chats
+//     (has assistant/tool history), derived from the first user message so
+//     NewAPI/OpenAI clients without custom headers still keep sticky routing
+//     and stable prompt-cache sessions without colliding single-turn greetings.
 func conversationIDFor(req *chatRequest, headerValue string) string {
 	for _, explicit := range []string{req.ConversationID, headerValue} {
 		explicit = strings.TrimSpace(explicit)
@@ -389,5 +430,29 @@ func conversationIDFor(req *chatRequest, headerValue string) string {
 		sum := sha256.Sum256([]byte(explicit))
 		return hex.EncodeToString(sum[:16])
 	}
-	return ""
+	if req == nil || len(req.Messages) == 0 {
+		return ""
+	}
+	hasTools := len(req.Tools) > 0
+	hasHistory := false
+	var firstUser *openAIMessage
+	for i := range req.Messages {
+		m := &req.Messages[i]
+		if m.Role == "user" && firstUser == nil {
+			firstUser = m
+		}
+		if m.Role == "assistant" || m.Role == "tool" {
+			hasHistory = true
+		}
+	}
+	if firstUser == nil || (!hasTools && !hasHistory) {
+		return ""
+	}
+	anchor := "implicit-conv:" + canonical(*firstUser)
+	if hasTools {
+		// 区分带工具的主 Agent 会话与无工具的标题/摘要子请求。
+		anchor += "\x00tools"
+	}
+	sum := sha256.Sum256([]byte(anchor))
+	return hex.EncodeToString(sum[:16])
 }
